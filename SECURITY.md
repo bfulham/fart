@@ -2,7 +2,7 @@
 
 FART controls real lighting equipment and network protocols. Please avoid publishing a report that could create an immediate show-safety risk before maintainers have had a chance to investigate.
 
-Use GitHub's private vulnerability reporting feature when available. Include:
+Use the repository's [private vulnerability reporting page](https://github.com/bfulham/fart/security/advisories/new) when available. Include:
 
 - FART version
 - Operating system

@@ -2,6 +2,10 @@
 
 **Fixture Aiming and Remote Tracking**
 
+[![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
+[![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
+[![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
+
 FART is a Windows GUI application that receives live marker positions from OpenFollow over PosiStageNet, calculates the exact line of sight from one or more moving fixtures to the selected marker, and outputs 16-bit pan/tilt DMX.
 
 It supports:
@@ -21,7 +25,7 @@ It supports:
 
 ### Use the standalone Windows build
 
-Download `FART.exe` from the latest GitHub Actions artifact or release, then run it. Windows SmartScreen may warn because community builds are not code-signed.
+Download `FART-Windows-x64.zip` from the [latest release](https://github.com/bfulham/fart/releases/latest), extract `FART.exe`, then run it. Windows SmartScreen may warn because community builds are not code-signed.
 
 ### Run from source
 
@@ -157,9 +161,9 @@ Run the tests:
 py -3 -m unittest discover -s tests -v
 ```
 
-The included GitHub Actions workflow tests the application, builds `FART.exe` on Windows, and uploads a ZIP artifact. Tagged builds beginning with `v` can also be attached to a GitHub release.
+The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application, builds `FART.exe` on Windows, and uploads a ZIP artifact. Pushing a tag beginning with `v` creates or updates a GitHub release automatically.
 
-Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests can be submitted through [GitHub Issues](https://github.com/bfulham/fart/issues).
 
 ## Licence
 

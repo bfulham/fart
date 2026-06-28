@@ -4,6 +4,8 @@ Thanks for helping improve FART.
 
 ## Before opening an issue
 
+Use the [bug report](https://github.com/bfulham/fart/issues/new?template=bug_report.yml) or [feature request](https://github.com/bfulham/fart/issues/new?template=feature_request.yml) form.
+
 - Confirm you are using the newest version.
 - For tracking problems, include the PSN status counters shown in the Run tab.
 - For fixture problems, include the exact fixture model, mode, patch address, and relevant DMX chart.

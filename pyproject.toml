@@ -24,6 +24,12 @@ classifiers = [
   "Topic :: Multimedia :: Sound/Audio",
 ]
 
+[project.urls]
+Homepage = "https://github.com/bfulham/fart"
+Repository = "https://github.com/bfulham/fart"
+Issues = "https://github.com/bfulham/fart/issues"
+Changelog = "https://github.com/bfulham/fart/blob/main/CHANGELOG.md"
+
 [project.scripts]
 fart-followspot = "fart:main"
 
