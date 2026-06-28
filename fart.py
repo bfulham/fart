@@ -1,0 +1,1506 @@
+#!/usr/bin/env python3
+"""FART - Fixture Aiming and Remote Tracking.
+
+A single-file Windows GUI that receives OpenFollow PosiStageNet (PSN) tracker
+positions, calculates the exact line of sight from one or more moving fixtures
+to the selected marker, and outputs DMX using ENTTEC Open DMX USB, Art-Net, or
+sACN. Intensity can come from the manual UI, a configurable OSC value, or an
+Art-Net input channel.
+
+FART is experimental show-control software. It is not a safety-rated tracking
+or motion-control system.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import queue
+import socket
+import struct
+import sys
+import threading
+import time
+import tkinter as tk
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from tkinter import ttk, messagebox, filedialog
+
+APP_VERSION = "0.4.0"
+APP_SHORT_NAME = "FART"
+APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
+APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
+WINDOW_TITLE = f"{APP_NAME} — {APP_LONG_NAME}"
+CONFIG_FILE = Path(os.getenv("APPDATA", Path.home())) / "FART.json"
+LEGACY_CONFIG_FILE = Path(os.getenv("APPDATA", Path.home())) / "OpenFollowFollowspot.json"
+
+try:
+    import serial
+    import serial.tools.list_ports
+except Exception:
+    serial = None
+
+try:
+    from pythonosc.dispatcher import Dispatcher
+    from pythonosc.osc_server import ThreadingOSCUDPServer
+except Exception:
+    Dispatcher = None
+    ThreadingOSCUDPServer = None
+
+try:
+    from sacn import sACNsender
+except Exception:
+    sACNsender = None
+
+
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def wrap180(v): return (v + 180.0) % 360.0 - 180.0
+def norm360(v): return v % 360.0
+
+def dmx16(frac):
+    n = round(clamp(frac, 0.0, 1.0) * 65535)
+    return (n >> 8) & 255, n & 255
+
+
+@dataclass
+class FixtureConfig:
+    name: str = "Light 1"
+    enabled: bool = True
+
+    # Optical centre / pan-tilt pivot in OpenFollow world coordinates.
+    x: float = 0.0
+    y: float = -8.0
+    z: float = 5.0
+
+    # World bearing/elevation represented by physical fixture angle zero.
+    pan_zero_bearing: float = 0.0
+    tilt_zero_elevation: float = 0.0
+    pan_direction: int = 1
+    tilt_direction: int = 1
+    pan_offset: float = 0.0
+    tilt_offset: float = 0.0
+
+    pan_min: float = -270.0
+    pan_max: float = 270.0
+    tilt_min: float = -135.0
+    tilt_max: float = 135.0
+
+    # Absolute DMX slots within the selected output universe. Zero disables.
+    pan_coarse: int = 1
+    pan_fine: int = 2
+    tilt_coarse: int = 3
+    tilt_fine: int = 4
+    dimmer: int = 5
+    dimmer_fine: int = 0
+    shutter: int = 0
+    shutter_open: int = 255
+    intensity_scale: float = 1.0
+
+
+@dataclass
+class Settings:
+    marker_id: int = 1
+    psn_multicast: str = "236.10.10.10"
+    psn_port: int = 56565
+    psn_interface: str = "0.0.0.0"
+
+    fader_mode: str = "Manual"
+    manual_fader: float = 0.0
+    osc_fader_port: int = 9000
+    osc_fader_address: str = "/openfollow/1/xyzf"
+    osc_fader_arg: int = 3
+    osc_fader_min: float = 0.0
+    osc_fader_max: float = 1.0
+    artnet_input_universe: int = 0
+    artnet_input_channel: int = 1
+
+    output: str = "Open DMX"
+    serial_port: str = "COM3"
+    artnet_ip: str = "255.255.255.255"
+    universe: int = 0
+    refresh_hz: int = 30
+    timeout_s: float = 0.5
+    smoothing: float = 0.12
+
+    fixtures: list[FixtureConfig] = field(default_factory=lambda: [FixtureConfig()])
+
+
+class Tracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.xyz = (0.0, 0.0, 0.0, 0.0)
+    def update(self, x, y, z):
+        with self.lock:
+            self.xyz = (float(x), float(y), float(z), time.monotonic())
+    def get(self):
+        with self.lock:
+            return self.xyz
+
+
+class FaderState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.value = 0.0
+        self.updated = 0.0
+    def update(self, value):
+        with self.lock:
+            self.value = clamp(float(value), 0.0, 1.0)
+            self.updated = time.monotonic()
+    def get(self):
+        with self.lock:
+            return self.value, self.updated
+
+
+def _chunks(data, start, length):
+    end = min(len(data), start + length)
+    pos = start
+    while pos + 4 <= end:
+        raw = struct.unpack_from('<I', data, pos)[0]
+        cid = raw & 0xFFFF
+        data_len = (raw >> 16) & 0x7FFF
+        sub = bool(raw & 0x80000000)
+        body = pos + 4
+        body_end = body + data_len
+        if body_end > end:
+            break
+        yield cid, sub, body, data_len
+        pos = body_end
+
+
+class PSNReceiver:
+    DATA_PACKET = 0x6755
+    DATA_TRACKER_LIST = 0x0001
+    DATA_TRACKER_POS = 0x0000
+
+    def __init__(self, group, port, interface, marker, tracker, log, on_discovered=None):
+        self.group, self.port, self.interface = group, port, interface
+        self.marker, self.tracker, self.log = marker, tracker, log
+        self.on_discovered = on_discovered
+        self.discovered = set()
+        self.sock = None
+        self.stop_evt = threading.Event()
+        self.packet_count = 0
+        self.data_packet_count = 0
+        self.selected_tracker_count = 0
+        self.position_count = 0
+        self.last_packet_time = 0.0
+        self.last_position_time = 0.0
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('', self.port))
+        iface = self.interface.strip() or '0.0.0.0'
+        membership = socket.inet_aton(self.group) + socket.inet_aton(iface)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        self.sock.settimeout(0.3)
+        threading.Thread(target=self._loop, daemon=True).start()
+        self.log(f'Listening for PSN tracker {self.marker} on {self.group}:{self.port} via {iface}')
+
+    def _loop(self):
+        while not self.stop_evt.is_set():
+            try:
+                data, _ = self.sock.recvfrom(65535)
+                self._decode(data)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                self.log('PSN decode error: ' + str(e))
+
+    def _decode(self, data):
+        self.packet_count += 1
+        self.last_packet_time = time.monotonic()
+        if len(data) < 4:
+            return
+        raw = struct.unpack_from('<I', data, 0)[0]
+        root_id = raw & 0xFFFF
+        root_len = (raw >> 16) & 0x7FFF
+        if root_id != self.DATA_PACKET:
+            return
+        self.data_packet_count += 1
+        for cid, sub, body, length in _chunks(data, 4, root_len):
+            if cid != self.DATA_TRACKER_LIST or not sub:
+                continue
+            for tracker_id, tracker_sub, t_body, t_len in _chunks(data, body, length):
+                if not tracker_sub:
+                    continue
+                if tracker_id not in self.discovered:
+                    self.discovered.add(tracker_id)
+                    if self.on_discovered:
+                        self.on_discovered(tracker_id)
+                if tracker_id != self.marker:
+                    continue
+                self.selected_tracker_count += 1
+                for field_id, field_sub, f_body, f_len in _chunks(data, t_body, t_len):
+                    # OpenFollow uses pypsn. pypsn sets the high flag bit on
+                    # leaf chunks as well as container chunks, including the
+                    # 12-byte position chunk. Do not reject position merely
+                    # because that flag is set.
+                    if field_id == self.DATA_TRACKER_POS and f_len >= 12:
+                        x, y, z = struct.unpack_from('<fff', data, f_body)
+                        self.tracker.update(x, y, z)
+                        self.position_count += 1
+                        self.last_position_time = time.monotonic()
+                        if self.position_count == 1:
+                            self.log(f'PSN position received for tracker {self.marker}: {x:.3f}, {y:.3f}, {z:.3f}')
+                        break
+
+    def stats(self):
+        return {
+            'packets': self.packet_count,
+            'data_packets': self.data_packet_count,
+            'selected_tracker': self.selected_tracker_count,
+            'positions': self.position_count,
+            'last_packet_age': (time.monotonic() - self.last_packet_time) if self.last_packet_time else None,
+            'last_position_age': (time.monotonic() - self.last_position_time) if self.last_position_time else None,
+        }
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+
+
+class OSCFaderReceiver:
+    def __init__(self, port, address, arg_index, input_min, input_max, fader, log):
+        self.port, self.address, self.arg_index = port, address, arg_index
+        self.input_min, self.input_max = input_min, input_max
+        self.fader, self.log, self.server = fader, log, None
+    def start(self):
+        if Dispatcher is None:
+            raise RuntimeError('python-osc is missing')
+        if self.input_max == self.input_min:
+            raise ValueError('OSC fader maximum must differ from minimum')
+        d = Dispatcher()
+        d.map(self.address, self._message)
+        self.server = ThreadingOSCUDPServer(('0.0.0.0', self.port), d)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.log(f'OSC fader: {self.address}, argument {self.arg_index}, UDP {self.port}')
+    def _message(self, address, *args):
+        try:
+            raw = float(args[self.arg_index])
+            value = (raw - self.input_min) / (self.input_max - self.input_min)
+            self.fader.update(value)
+        except (IndexError, TypeError, ValueError):
+            return
+    def stop(self):
+        if self.server:
+            self.server.shutdown(); self.server.server_close()
+
+
+class ArtNetFaderReceiver:
+    def __init__(self, universe, channel, fader, log):
+        self.universe, self.channel, self.fader, self.log = universe, channel, fader, log
+        self.sock = None
+        self.stop_evt = threading.Event()
+    def start(self):
+        if not 1 <= self.channel <= 512:
+            raise ValueError('Art-Net input channel must be 1–512')
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('', 6454))
+        self.sock.settimeout(0.3)
+        threading.Thread(target=self._loop, daemon=True).start()
+        self.log(f'Art-Net fader: universe {self.universe}, channel {self.channel}')
+    def _loop(self):
+        while not self.stop_evt.is_set():
+            try:
+                data, _ = self.sock.recvfrom(2048)
+                if len(data) < 18 or data[:8] != b'Art-Net\x00':
+                    continue
+                if struct.unpack_from('<H', data, 8)[0] != 0x5000:
+                    continue
+                universe = struct.unpack_from('<H', data, 14)[0]
+                length = struct.unpack_from('>H', data, 16)[0]
+                if universe == self.universe and self.channel <= length and 18 + length <= len(data):
+                    self.fader.update(data[18 + self.channel - 1] / 255.0)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    def stop(self):
+        self.stop_evt.set()
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+
+
+class Output:
+    def send(self, frame): pass
+    def close(self): pass
+
+
+class OpenDMX(Output):
+    """ENTTEC Open DMX USB via FTDI VCP.
+
+    Open DMX is an unbuffered adapter. The PC must generate BREAK, MAB and all
+    513 serial slots continuously. Timing is therefore best-effort under Windows,
+    but this is the standard VCP approach and is adequate for a rudimentary tool.
+    """
+    def __init__(self, port):
+        if serial is None: raise RuntimeError("pyserial is missing")
+        self.s = serial.Serial(port=port, baudrate=250000, bytesize=8,
+                               parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO,
+                               timeout=0, write_timeout=0.25)
+    def send(self, frame):
+        # DMX512-A minimum BREAK 88 us and MAB 8 us. Windows scheduling is not
+        # microsecond deterministic, so use conservative values.
+        self.s.break_condition = True
+        time.sleep(0.00012)
+        self.s.break_condition = False
+        time.sleep(0.000012)
+        self.s.write(b"\x00" + frame)
+    def close(self):
+        try: self.s.break_condition = True; time.sleep(0.02); self.s.close()
+        except Exception: pass
+
+
+class ArtNet(Output):
+    def __init__(self, ip, universe):
+        self.ip, self.u = ip, universe
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    def send(self, frame):
+        hdr = (b"Art-Net\x00" + struct.pack("<H",0x5000) + struct.pack(">H",14) +
+               bytes((0,0)) + struct.pack("<H",self.u) + struct.pack(">H",512))
+        self.s.sendto(hdr + frame, (self.ip,6454))
+    def close(self): self.s.close()
+
+
+class SACN(Output):
+    """ANSI E1.31/sACN multicast output using the ``sacn`` package.
+
+    The package exposes active universes through ``sender[universe]``.  The
+    previous implementation called a non-existent ``get_output`` method and
+    also left multicast disabled, which made startup fail whenever sACN was
+    selected.
+    """
+    def __init__(self, universe, fps=30):
+        if sACNsender is None:
+            raise RuntimeError("sacn is missing")
+        if not 1 <= int(universe) <= 63999:
+            raise ValueError("sACN universe must be between 1 and 63999")
+
+        self.u = int(universe)
+        self.s = sACNsender(source_name=APP_NAME, fps=max(1, min(100, int(fps))))
+        try:
+            self.s.start()
+            self.s.activate_output(self.u)
+            self.out = self.s[self.u]
+            self.out.multicast = True
+            self.out.dmx_data = tuple([0] * 512)
+        except Exception:
+            try:
+                self.s.stop()
+            except Exception:
+                pass
+            raise
+
+    def send(self, frame):
+        if len(frame) != 512:
+            raise ValueError("sACN output frame must contain exactly 512 channels")
+        self.out.dmx_data = tuple(frame)
+
+    def close(self):
+        try:
+            self.s.stop()
+        except Exception:
+            pass
+
+
+
+def calculate_aim(fixture: FixtureConfig, x, y, z, previous_pan=None):
+    """Calculate the exact line from one fixture optical centre to the marker.
+
+    World axes: +X right, +Y away/upstage, +Z up. Bearing 0 points +Y and
+    increases toward +X. Elevation 0 is horizontal and positive is up.
+    """
+    dx, dy, dz = x - fixture.x, y - fixture.y, z - fixture.z
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if distance < 1e-6:
+        raise ValueError("Marker is at the fixture optical centre")
+
+    bearing = math.degrees(math.atan2(dx, dy))
+    elevation = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
+
+    base_pan = wrap180(bearing - fixture.pan_zero_bearing) * fixture.pan_direction + fixture.pan_offset
+    tilt = (elevation - fixture.tilt_zero_elevation) * fixture.tilt_direction + fixture.tilt_offset
+
+    # A fixture with more than 360 degrees of pan has several mechanically
+    # equivalent ways to point at the same bearing. Prefer the one nearest its
+    # previous angle so it does not unexpectedly spin through the long path.
+    candidates = [base_pan + 360 * k for k in range(-3, 4)]
+    valid = [p for p in candidates if fixture.pan_min <= p <= fixture.pan_max]
+    if valid:
+        reference = previous_pan if previous_pan is not None else (fixture.pan_min + fixture.pan_max) / 2.0
+        pan = min(valid, key=lambda p: abs(p - reference))
+    else:
+        # Keep the nearest equivalent angle; the caller will clamp it and show
+        # a limit warning rather than silently selecting an unrelated heading.
+        reference = previous_pan if previous_pan is not None else (fixture.pan_min + fixture.pan_max) / 2.0
+        pan = min(candidates, key=lambda p: abs(p - reference))
+
+    return bearing, elevation, pan, tilt, distance
+
+
+def fixture_channels(fixture: FixtureConfig):
+    return {
+        'pan coarse': fixture.pan_coarse,
+        'pan fine': fixture.pan_fine,
+        'tilt coarse': fixture.tilt_coarse,
+        'tilt fine': fixture.tilt_fine,
+        'dimmer': fixture.dimmer,
+        'dimmer fine': fixture.dimmer_fine,
+        'shutter': fixture.shutter,
+    }
+
+
+def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout):
+    plim = clamp(pan, fixture.pan_min, fixture.pan_max)
+    tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
+    pan_fraction = (plim - fixture.pan_min) / (fixture.pan_max - fixture.pan_min)
+    tilt_fraction = (tlim - fixture.tilt_min) / (fixture.tilt_max - fixture.tilt_min)
+    pc, pf = dmx16(pan_fraction)
+    tc, tf = dmx16(tilt_fraction)
+
+    intensity = 0.0 if blackout else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
+    dc, df = dmx16(intensity)
+    values = [
+        (fixture.pan_coarse, pc),
+        (fixture.pan_fine, pf),
+        (fixture.tilt_coarse, tc),
+        (fixture.tilt_fine, tf),
+        (fixture.dimmer, dc),
+    ]
+    if fixture.dimmer_fine:
+        values.append((fixture.dimmer_fine, df))
+    if fixture.shutter:
+        values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
+
+    for channel, value in values:
+        if 1 <= channel <= 512:
+            frame[channel - 1] = int(clamp(value, 0, 255))
+
+    return {
+        'pan': pan,
+        'tilt': tilt,
+        'pan_dmx_angle': plim,
+        'tilt_dmx_angle': tlim,
+        'pan_limit': not math.isclose(pan, plim, abs_tol=1e-9),
+        'tilt_limit': not math.isclose(tilt, tlim, abs_tol=1e-9),
+    }
+
+
+class App(tk.Tk):
+    GENERAL_TYPES = {
+        'marker_id': int,
+        'psn_multicast': str,
+        'psn_port': int,
+        'psn_interface': str,
+        'fader_mode': str,
+        'manual_fader': float,
+        'osc_fader_port': int,
+        'osc_fader_address': str,
+        'osc_fader_arg': int,
+        'osc_fader_min': float,
+        'osc_fader_max': float,
+        'artnet_input_universe': int,
+        'artnet_input_channel': int,
+        'output': str,
+        'serial_port': str,
+        'artnet_ip': str,
+        'universe': int,
+        'refresh_hz': int,
+        'timeout_s': float,
+        'smoothing': float,
+    }
+
+    FIXTURE_TYPES = {
+        'name': str,
+        'enabled': bool,
+        'x': float,
+        'y': float,
+        'z': float,
+        'pan_zero_bearing': float,
+        'tilt_zero_elevation': float,
+        'pan_direction': int,
+        'tilt_direction': int,
+        'pan_offset': float,
+        'tilt_offset': float,
+        'pan_min': float,
+        'pan_max': float,
+        'tilt_min': float,
+        'tilt_max': float,
+        'pan_coarse': int,
+        'pan_fine': int,
+        'tilt_coarse': int,
+        'tilt_fine': int,
+        'dimmer': int,
+        'dimmer_fine': int,
+        'shutter': int,
+        'shutter_open': int,
+        'intensity_scale': float,
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.title(WINDOW_TITLE)
+        self.geometry('1120x780')
+        self.minsize(1000, 700)
+
+        self.settings = self.load_settings()
+        self.tracker = Tracker()
+        self.fader = FaderState()
+        self.running = False
+        self.psn = None
+        self.psn_scanner = None
+        self.fader_input = None
+        self.output = None
+        self.worker = None
+        self.stop_evt = threading.Event()
+        self.logs = queue.Queue()
+        self.psn_discovered = queue.Queue()
+        self.psn_tracker_ids = set()
+        self.manual_fader_value = self.settings.manual_fader
+        self.vars = {}
+        self.light_vars = {}
+        self.selected_light_index = 0
+        self.loading_light_editor = False
+        self.live = None
+
+        self.build_ui()
+        self.populate()
+        self.after(100, self.ui_tick)
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
+
+    def load_settings(self):
+        source_path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
+        try:
+            data = json.loads(source_path.read_text())
+        except Exception:
+            return Settings()
+
+        try:
+            fixtures_data = data.get('fixtures')
+            fixtures = []
+            if isinstance(fixtures_data, list):
+                for item in fixtures_data:
+                    if isinstance(item, dict):
+                        filtered = {k: v for k, v in item.items() if k in FixtureConfig.__dataclass_fields__}
+                        fixtures.append(FixtureConfig(**filtered))
+
+            # Migrate all pre-0.3 single-light settings automatically.
+            if not fixtures:
+                old_map = {
+                    'fixture_x': 'x', 'fixture_y': 'y', 'fixture_z': 'z',
+                    'pan_zero_bearing': 'pan_zero_bearing',
+                    'tilt_zero_elevation': 'tilt_zero_elevation',
+                    'pan_direction': 'pan_direction', 'tilt_direction': 'tilt_direction',
+                    'pan_offset': 'pan_offset', 'tilt_offset': 'tilt_offset',
+                    'pan_min': 'pan_min', 'pan_max': 'pan_max',
+                    'tilt_min': 'tilt_min', 'tilt_max': 'tilt_max',
+                    'pan_coarse': 'pan_coarse', 'pan_fine': 'pan_fine',
+                    'tilt_coarse': 'tilt_coarse', 'tilt_fine': 'tilt_fine',
+                    'dimmer': 'dimmer', 'shutter': 'shutter',
+                    'shutter_open': 'shutter_open',
+                }
+                migrated = {'name': 'Light 1'}
+                for old, new in old_map.items():
+                    if old in data:
+                        migrated[new] = data[old]
+                fixtures = [FixtureConfig(**migrated)]
+
+            general = {
+                k: v for k, v in data.items()
+                if k in Settings.__dataclass_fields__ and k != 'fixtures'
+            }
+            settings = Settings(**general, fixtures=fixtures)
+
+            # Preserve existing users' settings when upgrading from the old
+            # OpenFollow Followspot name. The legacy file is left untouched.
+            if source_path == LEGACY_CONFIG_FILE and not CONFIG_FILE.exists():
+                try:
+                    CONFIG_FILE.write_text(json.dumps(asdict(settings), indent=2))
+                except Exception:
+                    pass
+            return settings
+        except Exception:
+            return Settings()
+
+    def log(self, message):
+        self.logs.put(f"{time.strftime('%H:%M:%S')}  {message}")
+
+    def var(self, name, typ=str):
+        variable = {str: tk.StringVar, int: tk.IntVar, float: tk.DoubleVar, bool: tk.BooleanVar}[typ]()
+        self.vars[name] = variable
+        return variable
+
+    def light_var(self, name, typ=str):
+        variable = {str: tk.StringVar, int: tk.IntVar, float: tk.DoubleVar, bool: tk.BooleanVar}[typ]()
+        self.light_vars[name] = variable
+        return variable
+
+    def add_entry(self, parent, row, label, name, typ=float, width=12, column=0):
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky='w', padx=4, pady=3)
+        ttk.Entry(parent, textvariable=self.var(name, typ), width=width).grid(
+            row=row, column=column + 1, sticky='ew', padx=4, pady=3
+        )
+
+    def add_light_entry(self, parent, row, label, name, typ=float, width=12, column=0):
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky='w', padx=4, pady=3)
+        ttk.Entry(parent, textvariable=self.light_var(name, typ), width=width).grid(
+            row=row, column=column + 1, sticky='ew', padx=4, pady=3
+        )
+
+    def build_ui(self):
+        header = ttk.Frame(self)
+        header.pack(fill='x', padx=12, pady=(10, 0))
+        ttk.Label(header, text='FART', font=('Segoe UI', 20, 'bold')).pack(side='left')
+        ttk.Label(
+            header, text='  Fixture Aiming and Remote Tracking',
+            font=('Segoe UI', 11)
+        ).pack(side='left', anchor='s', pady=(0, 4))
+        ttk.Label(header, text=f'v{APP_VERSION}').pack(side='right', anchor='s', pady=(0, 4))
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill='both', expand=True, padx=8, pady=8)
+        run_tab = ttk.Frame(notebook)
+        lights_tab = ttk.Frame(notebook)
+        io_tab = ttk.Frame(notebook)
+        calibration_tab = ttk.Frame(notebook)
+        notebook.add(run_tab, text='Run')
+        notebook.add(lights_tab, text='Lights')
+        notebook.add(io_tab, text='I/O')
+        notebook.add(calibration_tab, text='Calibration')
+
+        # Run tab
+        connection = ttk.LabelFrame(run_tab, text='Tracking and output')
+        connection.pack(side='left', fill='y', padx=8, pady=8)
+        ttk.Label(connection, text='PSN tracker').grid(row=0, column=0, sticky='w', padx=4, pady=3)
+        self.psn_tracker_combo = ttk.Combobox(connection, textvariable=self.var('marker_id', int), width=16)
+        self.psn_tracker_combo.grid(row=0, column=1, sticky='ew', padx=4, pady=3)
+        self.add_entry(connection, 1, 'PSN multicast', 'psn_multicast', str, 18)
+        self.add_entry(connection, 2, 'PSN UDP port', 'psn_port', int)
+        self.add_entry(connection, 3, 'PSN interface IP', 'psn_interface', str, 18)
+        ttk.Button(connection, text='Auto-detect PSN trackers', command=self.scan_psn).grid(
+            row=4, column=0, columnspan=2, sticky='ew', padx=4, pady=4
+        )
+        self.psn_detect_label = ttk.Label(connection, text='No scan run', justify='left')
+        self.psn_detect_label.grid(row=5, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 4))
+        ttk.Label(connection, text='Fader source').grid(row=6, column=0, sticky='w', padx=4, pady=3)
+        self.fader_mode_combo = ttk.Combobox(
+            connection, textvariable=self.var('fader_mode'),
+            values=['Manual', 'OSC', 'Art-Net Input'], state='readonly', width=16
+        )
+        self.fader_mode_combo.grid(row=6, column=1, padx=4)
+        self.fader_mode_combo.bind('<<ComboboxSelected>>', lambda _e: self.update_fader_mode())
+        ttk.Label(connection, text='Output').grid(row=7, column=0, sticky='w', padx=4, pady=3)
+        ttk.Combobox(
+            connection, textvariable=self.var('output'),
+            values=['Open DMX', 'Art-Net', 'sACN'], state='readonly', width=16
+        ).grid(row=7, column=1, padx=4)
+        self.add_entry(connection, 8, 'Refresh Hz', 'refresh_hz', int)
+        self.add_entry(connection, 9, 'Tracking timeout', 'timeout_s', float)
+        self.add_entry(connection, 10, 'Smoothing 0–0.95', 'smoothing', float)
+        self.start_btn = ttk.Button(connection, text='START — DIMMER LOCKED', command=self.start)
+        self.start_btn.grid(row=12, column=0, columnspan=2, sticky='ew', padx=4, pady=(15, 4))
+        self.arm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(connection, text='Arm all light dimmers', variable=self.arm_var).grid(
+            row=13, column=0, columnspan=2, sticky='w', padx=4, pady=4
+        )
+        ttk.Button(connection, text='STOP / BLACKOUT ALL', command=self.stop).grid(
+            row=14, column=0, columnspan=2, sticky='ew', padx=4, pady=4
+        )
+
+        run_right = ttk.Frame(run_tab)
+        run_right.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        status = ttk.LabelFrame(run_right, text='Live status')
+        status.pack(fill='x')
+        self.status_labels = {}
+        status_keys = ['PSN', 'XYZ', 'Selected light', 'Fixture angles', 'DMX angles', 'Distance', 'Fader', 'Lights', 'State']
+        for row, key in enumerate(status_keys):
+            ttk.Label(status, text=key + ':').grid(row=row, column=0, sticky='e', padx=5, pady=3)
+            label = ttk.Label(status, text='—', font=('Segoe UI', 10, 'bold'))
+            label.grid(row=row, column=1, sticky='w', padx=5)
+            self.status_labels[key] = label
+
+        fader_box = ttk.LabelFrame(run_right, text='Manual fader')
+        fader_box.pack(fill='x', pady=(8, 0))
+        self.manual_scale_var = tk.DoubleVar(value=self.settings.manual_fader * 100.0)
+        self.manual_scale = ttk.Scale(
+            fader_box, from_=0, to=100, variable=self.manual_scale_var, command=self.manual_changed
+        )
+        self.manual_scale.pack(side='left', fill='x', expand=True, padx=8, pady=8)
+        self.manual_value_label = ttk.Label(fader_box, text='0.0%', width=8)
+        self.manual_value_label.pack(side='left', padx=8)
+
+        log_frame = ttk.LabelFrame(run_right, text='Log')
+        log_frame.pack(fill='both', expand=True, pady=(8, 0))
+        self.logbox = tk.Text(log_frame, height=14, state='disabled')
+        self.logbox.pack(fill='both', expand=True)
+
+        # Lights tab
+        list_frame = ttk.LabelFrame(lights_tab, text='Lights in output universe')
+        list_frame.pack(side='left', fill='y', padx=8, pady=8)
+        self.light_tree = ttk.Treeview(
+            list_frame, columns=('enabled', 'position', 'channels'), show='tree headings',
+            selectmode='browse', height=22
+        )
+        self.light_tree.heading('#0', text='Name')
+        self.light_tree.heading('enabled', text='On')
+        self.light_tree.heading('position', text='Position X,Y,Z')
+        self.light_tree.heading('channels', text='Pan/Tilt')
+        self.light_tree.column('#0', width=130)
+        self.light_tree.column('enabled', width=40, anchor='center')
+        self.light_tree.column('position', width=145)
+        self.light_tree.column('channels', width=90)
+        self.light_tree.pack(fill='both', expand=True, padx=5, pady=5)
+        self.light_tree.bind('<<TreeviewSelect>>', self.light_selected)
+        buttons = ttk.Frame(list_frame)
+        buttons.pack(fill='x', padx=5, pady=(0, 5))
+        ttk.Button(buttons, text='Add', command=self.add_light).pack(side='left', fill='x', expand=True)
+        ttk.Button(buttons, text='Duplicate', command=self.duplicate_light).pack(side='left', fill='x', expand=True, padx=3)
+        ttk.Button(buttons, text='Remove', command=self.remove_light).pack(side='left', fill='x', expand=True)
+
+        editor = ttk.LabelFrame(lights_tab, text='Selected light')
+        editor.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        editor_notebook = ttk.Notebook(editor)
+        editor_notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        geometry_page = ttk.Frame(editor_notebook)
+        dmx_page = ttk.Frame(editor_notebook)
+        editor_notebook.add(geometry_page, text='Geometry and calibration')
+        editor_notebook.add(dmx_page, text='DMX channels')
+
+        identity = ttk.LabelFrame(geometry_page, text='Light')
+        identity.pack(side='left', fill='y', padx=6, pady=6)
+        self.add_light_entry(identity, 0, 'Name', 'name', str, 18)
+        ttk.Checkbutton(identity, text='Enabled', variable=self.light_var('enabled', bool)).grid(
+            row=1, column=0, columnspan=2, sticky='w', padx=4, pady=4
+        )
+        self.add_light_entry(identity, 2, 'Optical centre X', 'x')
+        self.add_light_entry(identity, 3, 'Optical centre Y', 'y')
+        self.add_light_entry(identity, 4, 'Optical centre Z', 'z')
+        self.add_light_entry(identity, 5, 'Intensity scale', 'intensity_scale')
+
+        mapping = ttk.LabelFrame(geometry_page, text='Physical angle mapping')
+        mapping.pack(side='left', fill='y', padx=6, pady=6)
+        self.add_light_entry(mapping, 0, 'Pan-zero bearing', 'pan_zero_bearing')
+        self.add_light_entry(mapping, 1, 'Tilt-zero elevation', 'tilt_zero_elevation')
+        self.add_light_entry(mapping, 2, 'Pan direction (+1/-1)', 'pan_direction', int)
+        self.add_light_entry(mapping, 3, 'Tilt direction (+1/-1)', 'tilt_direction', int)
+        self.add_light_entry(mapping, 4, 'Pan trim offset', 'pan_offset')
+        self.add_light_entry(mapping, 5, 'Tilt trim offset', 'tilt_offset')
+
+        limits = ttk.LabelFrame(geometry_page, text='Personality angle range')
+        limits.pack(side='left', fill='y', padx=6, pady=6)
+        self.add_light_entry(limits, 0, 'Pan minimum', 'pan_min')
+        self.add_light_entry(limits, 1, 'Pan maximum', 'pan_max')
+        self.add_light_entry(limits, 2, 'Tilt minimum', 'tilt_min')
+        self.add_light_entry(limits, 3, 'Tilt maximum', 'tilt_max')
+
+        channels = ttk.LabelFrame(dmx_page, text='Absolute channels (1-based; 0 disables)')
+        channels.pack(side='left', fill='y', padx=8, pady=8)
+        channel_fields = [
+            ('Pan coarse', 'pan_coarse'), ('Pan fine', 'pan_fine'),
+            ('Tilt coarse', 'tilt_coarse'), ('Tilt fine', 'tilt_fine'),
+            ('Dimmer coarse', 'dimmer'), ('Dimmer fine', 'dimmer_fine'),
+            ('Shutter', 'shutter'), ('Shutter open value', 'shutter_open'),
+        ]
+        for row, (label, name) in enumerate(channel_fields):
+            self.add_light_entry(channels, row, label, name, int)
+        ttk.Label(
+            dmx_page,
+            text='All lights share the selected 512-channel output universe.\n'
+                 'The app rejects overlapping enabled channels so one light cannot overwrite another.',
+            justify='left'
+        ).pack(side='left', anchor='n', padx=12, pady=12)
+
+        editor_buttons = ttk.Frame(editor)
+        editor_buttons.pack(fill='x', padx=5, pady=(0, 5))
+        ttk.Button(editor_buttons, text='Apply selected light changes', command=self.apply_selected_light).pack(
+            side='left', padx=3
+        )
+        ttk.Button(editor_buttons, text='Save all settings', command=self.save).pack(side='left', padx=3)
+
+        # I/O tab
+        fader_settings = ttk.LabelFrame(io_tab, text='Fader input settings')
+        fader_settings.pack(side='left', fill='y', padx=8, pady=8)
+        self.add_entry(fader_settings, 0, 'OSC UDP port', 'osc_fader_port', int)
+        self.add_entry(fader_settings, 1, 'OSC address', 'osc_fader_address', str, 24)
+        self.add_entry(fader_settings, 2, 'OSC argument index', 'osc_fader_arg', int)
+        self.add_entry(fader_settings, 3, 'OSC input minimum', 'osc_fader_min', float)
+        self.add_entry(fader_settings, 4, 'OSC input maximum', 'osc_fader_max', float)
+        self.add_entry(fader_settings, 5, 'Art-Net input universe', 'artnet_input_universe', int)
+        self.add_entry(fader_settings, 6, 'Art-Net input channel', 'artnet_input_channel', int)
+        ttk.Label(
+            fader_settings, text='OSC argument index is zero-based.\nExample xyzf fader: index 3.', justify='left'
+        ).grid(row=7, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+
+        output_settings = ttk.LabelFrame(io_tab, text='Output connection')
+        output_settings.pack(side='left', fill='y', padx=8, pady=8)
+        ttk.Label(output_settings, text='Serial port').grid(row=0, column=0, sticky='w', padx=4, pady=3)
+        self.port_combo = ttk.Combobox(output_settings, textvariable=self.var('serial_port'), width=18)
+        self.port_combo.grid(row=0, column=1, padx=4)
+        ttk.Button(output_settings, text='Refresh ports', command=self.refresh_ports).grid(
+            row=1, column=0, columnspan=2, sticky='ew', padx=4, pady=3
+        )
+        self.add_entry(output_settings, 2, 'Art-Net target IP', 'artnet_ip', str, 18)
+        self.add_entry(output_settings, 3, 'Universe', 'universe', int)
+        ttk.Label(
+            output_settings,
+            text='Open DMX requires the FTDI Virtual COM Port driver.\n'
+                 'Art-Net universe is zero-based; sACN universe is one-based.',
+            justify='left'
+        ).grid(row=4, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+
+        # Calibration tab
+        calibration = ttk.LabelFrame(calibration_tab, text='Selected-light pointing verification')
+        calibration.pack(fill='x', padx=8, pady=8)
+        self.calibration_light_label = ttk.Label(calibration, text='Selected light: —', font=('Segoe UI', 11, 'bold'))
+        self.calibration_light_label.grid(row=0, column=0, columnspan=4, sticky='w', padx=8, pady=8)
+        ttk.Label(
+            calibration,
+            text='Keep the lamp/shutter closed. Put the marker at a known point, start output, and verify each light separately.\n'
+                 'The buttons below affect only the light selected on the Lights tab.',
+            justify='left'
+        ).grid(row=1, column=0, columnspan=4, sticky='w', padx=8, pady=8)
+        ttk.Button(calibration, text='Set current bearing as pan zero', command=self.cal_pan_zero).grid(
+            row=2, column=0, padx=5, pady=5
+        )
+        ttk.Button(calibration, text='Set current elevation as tilt zero', command=self.cal_tilt_zero).grid(
+            row=2, column=1, padx=5, pady=5
+        )
+        ttk.Button(calibration, text='Reverse pan direction', command=lambda: self.reverse_light('pan_direction')).grid(
+            row=2, column=2, padx=5, pady=5
+        )
+        ttk.Button(calibration, text='Reverse tilt direction', command=lambda: self.reverse_light('tilt_direction')).grid(
+            row=2, column=3, padx=5, pady=5
+        )
+        ttk.Button(calibration, text='Save settings', command=self.save).grid(
+            row=3, column=0, padx=5, pady=12, sticky='ew'
+        )
+        ttk.Button(calibration, text='Export settings', command=self.export).grid(
+            row=3, column=1, padx=5, pady=12, sticky='ew'
+        )
+        ttk.Label(
+            calibration_tab,
+            text='World convention: +X right, +Y away/upstage, +Z up. Bearing 0° is +Y; +90° is +X.',
+            justify='left'
+        ).pack(anchor='w', padx=12, pady=12)
+        self.refresh_ports()
+
+    def populate(self):
+        for name in self.GENERAL_TYPES:
+            if name == 'manual_fader':
+                continue
+            if name in self.vars:
+                self.vars[name].set(getattr(self.settings, name))
+        self.manual_scale_var.set(self.settings.manual_fader * 100.0)
+        self.manual_changed(self.manual_scale_var.get())
+        self.update_fader_mode()
+        self.rebuild_light_tree(select_index=0)
+
+    def _psn_discovered(self, tracker_id):
+        self.psn_discovered.put(int(tracker_id))
+
+    def scan_psn(self):
+        if self.psn_scanner:
+            try:
+                self.psn_scanner.stop()
+            except Exception:
+                pass
+            self.psn_scanner = None
+        try:
+            group = str(self.vars['psn_multicast'].get()).strip()
+            port = int(self.vars['psn_port'].get())
+            interface = str(self.vars['psn_interface'].get()).strip() or '0.0.0.0'
+            marker = int(self.vars['marker_id'].get())
+            self.psn_tracker_ids.clear()
+            self.psn_tracker_combo['values'] = []
+            self.psn_detect_label.configure(text='Listening for PSN…')
+            self.psn_scanner = PSNReceiver(
+                group, port, interface, marker, Tracker(), self.log, self._psn_discovered
+            )
+            self.psn_scanner.start()
+            self.after(4000, self.finish_psn_scan)
+        except Exception as exc:
+            self.psn_detect_label.configure(text='Detection failed')
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def finish_psn_scan(self):
+        if self.psn_scanner:
+            try:
+                self.psn_scanner.stop()
+            except Exception:
+                pass
+            self.psn_scanner = None
+        if self.psn_tracker_ids:
+            ids = sorted(self.psn_tracker_ids)
+            self.psn_tracker_combo['values'] = ids
+            self.psn_detect_label.configure(text='Found tracker IDs: ' + ', '.join(map(str, ids)))
+            try:
+                selected = int(self.vars['marker_id'].get())
+            except Exception:
+                selected = None
+            if selected not in self.psn_tracker_ids:
+                self.vars['marker_id'].set(ids[0])
+        else:
+            self.psn_detect_label.configure(text='No PSN trackers found')
+
+    def manual_changed(self, value):
+        self.manual_fader_value = clamp(float(value) / 100.0, 0.0, 1.0)
+        if hasattr(self, 'manual_value_label'):
+            self.manual_value_label.configure(text=f'{self.manual_fader_value * 100:.1f}%')
+        if self.settings.fader_mode == 'Manual':
+            self.fader.update(self.manual_fader_value)
+
+    def update_fader_mode(self):
+        mode = self.vars['fader_mode'].get() if 'fader_mode' in self.vars else 'Manual'
+        if hasattr(self, 'manual_scale'):
+            self.manual_scale.state(['!disabled'] if mode == 'Manual' else ['disabled'])
+
+    def rebuild_light_tree(self, select_index=None):
+        self.loading_light_editor = True
+        try:
+            for item in self.light_tree.get_children():
+                self.light_tree.delete(item)
+            for index, fixture in enumerate(self.settings.fixtures):
+                self.insert_or_update_light_row(index, fixture)
+            if not self.settings.fixtures:
+                self.settings.fixtures.append(FixtureConfig())
+                return self.rebuild_light_tree(0)
+            if select_index is None:
+                select_index = min(self.selected_light_index, len(self.settings.fixtures) - 1)
+            self.selected_light_index = max(0, min(select_index, len(self.settings.fixtures) - 1))
+            iid = str(self.selected_light_index)
+            self.light_tree.selection_set(iid)
+            self.light_tree.focus(iid)
+            self.load_light_editor(self.selected_light_index)
+        finally:
+            self.loading_light_editor = False
+
+    def insert_or_update_light_row(self, index, fixture):
+        iid = str(index)
+        position = f'{fixture.x:g}, {fixture.y:g}, {fixture.z:g}'
+        pan_tilt = f'{fixture.pan_coarse}/{fixture.tilt_coarse}'
+        values = ('Yes' if fixture.enabled else 'No', position, pan_tilt)
+        if self.light_tree.exists(iid):
+            self.light_tree.item(iid, text=fixture.name, values=values)
+        else:
+            self.light_tree.insert('', 'end', iid=iid, text=fixture.name, values=values)
+
+    def light_selected(self, _event=None):
+        if self.loading_light_editor:
+            return
+        selection = self.light_tree.selection()
+        if not selection:
+            return
+        try:
+            new_index = int(selection[0])
+        except ValueError:
+            return
+        old_index = self.selected_light_index
+        if new_index == old_index:
+            return
+        try:
+            edited = self.fixture_from_editor()
+            self.settings.fixtures[old_index] = edited
+            self.insert_or_update_light_row(old_index, edited)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            self.loading_light_editor = True
+            try:
+                self.light_tree.selection_set(str(old_index))
+                self.light_tree.focus(str(old_index))
+            finally:
+                self.loading_light_editor = False
+            return
+        self.selected_light_index = new_index
+        self.load_light_editor(new_index)
+
+    def load_light_editor(self, index):
+        if not 0 <= index < len(self.settings.fixtures):
+            return
+        fixture = self.settings.fixtures[index]
+        self.loading_light_editor = True
+        try:
+            for name in self.FIXTURE_TYPES:
+                self.light_vars[name].set(getattr(fixture, name))
+            self.calibration_light_label.configure(text=f'Selected light: {fixture.name}')
+        finally:
+            self.loading_light_editor = False
+
+    def fixture_from_editor(self):
+        values = {}
+        for name, typ in self.FIXTURE_TYPES.items():
+            raw = self.light_vars[name].get()
+            if typ is int:
+                raw = int(raw)
+            elif typ is float:
+                raw = float(raw)
+            elif typ is bool:
+                raw = bool(raw)
+            else:
+                raw = str(raw).strip()
+            values[name] = raw
+        fixture = FixtureConfig(**values)
+        self.validate_fixture(fixture)
+        return fixture
+
+    def validate_fixture(self, fixture):
+        if not fixture.name:
+            raise ValueError('Each light needs a name')
+        if fixture.pan_max <= fixture.pan_min or fixture.tilt_max <= fixture.tilt_min:
+            raise ValueError(f'{fixture.name}: angle maximum must be greater than minimum')
+        if fixture.pan_direction not in (-1, 1) or fixture.tilt_direction not in (-1, 1):
+            raise ValueError(f'{fixture.name}: pan and tilt directions must be +1 or -1')
+        if fixture.intensity_scale < 0:
+            raise ValueError(f'{fixture.name}: intensity scale cannot be negative')
+        if not 0 <= fixture.shutter_open <= 255:
+            raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
+        if fixture.enabled and (fixture.pan_coarse == 0 or fixture.tilt_coarse == 0):
+            raise ValueError(f'{fixture.name}: enabled lights require pan coarse and tilt coarse channels')
+        if fixture.pan_fine and not fixture.pan_coarse:
+            raise ValueError(f'{fixture.name}: pan fine requires pan coarse')
+        if fixture.tilt_fine and not fixture.tilt_coarse:
+            raise ValueError(f'{fixture.name}: tilt fine requires tilt coarse')
+        if fixture.dimmer_fine and not fixture.dimmer:
+            raise ValueError(f'{fixture.name}: dimmer fine requires dimmer coarse')
+        for label, channel in fixture_channels(fixture).items():
+            if not 0 <= channel <= 512:
+                raise ValueError(f'{fixture.name}: {label} channel must be 0–512')
+
+    def apply_selected_light(self, silent=False):
+        try:
+            fixture = self.fixture_from_editor()
+            self.settings.fixtures[self.selected_light_index] = fixture
+            self.insert_or_update_light_row(self.selected_light_index, fixture)
+            self.calibration_light_label.configure(text=f'Selected light: {fixture.name}')
+            if not silent:
+                self.log(f'Applied changes to {fixture.name}')
+            return True
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror(APP_NAME, str(exc))
+            return False
+
+    def add_light(self):
+        if not self.apply_selected_light(silent=True):
+            messagebox.showerror(APP_NAME, 'Fix the selected light settings before adding another light')
+            return
+        number = len(self.settings.fixtures) + 1
+        new_fixture = FixtureConfig(name=f'Light {number}')
+        # Put newly added defaults after the highest channel currently in use.
+        used = [ch for fixture in self.settings.fixtures for ch in fixture_channels(fixture).values() if ch > 0]
+        start = max(used, default=0) + 1
+        if start + 4 <= 512:
+            new_fixture.pan_coarse = start
+            new_fixture.pan_fine = start + 1
+            new_fixture.tilt_coarse = start + 2
+            new_fixture.tilt_fine = start + 3
+            new_fixture.dimmer = start + 4
+        else:
+            new_fixture.enabled = False
+            new_fixture.pan_coarse = new_fixture.pan_fine = 0
+            new_fixture.tilt_coarse = new_fixture.tilt_fine = 0
+            new_fixture.dimmer = 0
+        self.settings.fixtures.append(new_fixture)
+        self.rebuild_light_tree(len(self.settings.fixtures) - 1)
+
+    def duplicate_light(self):
+        if not self.apply_selected_light(silent=True):
+            return
+        source = self.settings.fixtures[self.selected_light_index]
+        copied = FixtureConfig(**asdict(source))
+        copied.name = source.name + ' copy'
+
+        # Preserve profile channel gaps. If pan is offset 18 in the source,
+        # it remains offset 18 relative to the duplicate's new start address.
+        source_channels = [ch for ch in fixture_channels(source).values() if ch > 0]
+        all_used = [
+            ch for fixture in self.settings.fixtures
+            for ch in fixture_channels(fixture).values() if ch > 0
+        ]
+        if source_channels:
+            shift = max(all_used, default=0) + 1 - min(source_channels)
+            shifted = {}
+            for field_name in ('pan_coarse', 'pan_fine', 'tilt_coarse', 'tilt_fine',
+                               'dimmer', 'dimmer_fine', 'shutter'):
+                channel = getattr(copied, field_name)
+                shifted[field_name] = channel + shift if channel > 0 else 0
+            if max(shifted.values(), default=0) <= 512:
+                for field_name, channel in shifted.items():
+                    setattr(copied, field_name, channel)
+            else:
+                copied.enabled = False
+        self.settings.fixtures.append(copied)
+        self.rebuild_light_tree(len(self.settings.fixtures) - 1)
+
+    def remove_light(self):
+        if len(self.settings.fixtures) <= 1:
+            messagebox.showerror(APP_NAME, 'At least one light must remain')
+            return
+        fixture = self.settings.fixtures[self.selected_light_index]
+        if not messagebox.askyesno(APP_NAME, f'Remove {fixture.name}?'):
+            return
+        del self.settings.fixtures[self.selected_light_index]
+        self.rebuild_light_tree(min(self.selected_light_index, len(self.settings.fixtures) - 1))
+
+    def collect(self):
+        if not self.apply_selected_light(silent=True):
+            raise ValueError('Fix the selected light settings before starting or saving')
+
+        values = {}
+        for name, typ in self.GENERAL_TYPES.items():
+            if name == 'manual_fader':
+                values[name] = self.manual_fader_value
+                continue
+            raw = self.vars[name].get()
+            if typ is int:
+                raw = int(raw)
+            elif typ is float:
+                raw = float(raw)
+            else:
+                raw = str(raw)
+            values[name] = raw
+        values['manual_fader'] = self.manual_fader_value
+
+        fixtures = [FixtureConfig(**asdict(fixture)) for fixture in self.settings.fixtures]
+        settings = Settings(**values, fixtures=fixtures)
+        if not 1 <= settings.refresh_hz <= 100:
+            raise ValueError('Refresh rate must be 1–100 Hz')
+        if settings.timeout_s <= 0:
+            raise ValueError('Tracking timeout must be greater than zero')
+        if not 0 <= settings.smoothing <= 0.95:
+            raise ValueError('Smoothing must be between 0 and 0.95')
+        if settings.osc_fader_arg < 0:
+            raise ValueError('OSC argument index cannot be negative')
+        if not 1 <= settings.artnet_input_channel <= 512:
+            raise ValueError('Art-Net input channel must be 1–512')
+        if settings.output == 'Art-Net' and not 0 <= settings.universe <= 32767:
+            raise ValueError('Art-Net universe must be between 0 and 32767')
+        if settings.output == 'sACN' and not 1 <= settings.universe <= 63999:
+            raise ValueError('sACN universe must be between 1 and 63999')
+        if not any(fixture.enabled for fixture in settings.fixtures):
+            raise ValueError('At least one light must be enabled')
+        for fixture in settings.fixtures:
+            self.validate_fixture(fixture)
+        self.validate_channel_conflicts(settings.fixtures)
+        return settings
+
+    def validate_channel_conflicts(self, fixtures):
+        owners = {}
+        for fixture in fixtures:
+            if not fixture.enabled:
+                continue
+            local = {}
+            for label, channel in fixture_channels(fixture).items():
+                if channel == 0:
+                    continue
+                if channel in local:
+                    raise ValueError(
+                        f'{fixture.name}: DMX channel {channel} is assigned to both {local[channel]} and {label}'
+                    )
+                local[channel] = label
+                if channel in owners:
+                    other_name, other_label = owners[channel]
+                    raise ValueError(
+                        f'DMX channel {channel} overlaps: {other_name} {other_label} and {fixture.name} {label}'
+                    )
+                owners[channel] = (fixture.name, label)
+
+    def save(self):
+        try:
+            self.settings = self.collect()
+            CONFIG_FILE.write_text(json.dumps(asdict(self.settings), indent=2))
+            self.log(f'Saved {CONFIG_FILE}')
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def export(self):
+        try:
+            path = filedialog.asksaveasfilename(initialfile='fart-settings.json', defaultextension='.json', filetypes=[('JSON', '*.json')])
+            if path:
+                Path(path).write_text(json.dumps(asdict(self.collect()), indent=2))
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def refresh_ports(self):
+        ports = [port.device for port in serial.tools.list_ports.comports()] if serial else []
+        if hasattr(self, 'port_combo'):
+            self.port_combo['values'] = ports
+
+    def reverse_light(self, name):
+        try:
+            self.light_vars[name].set(-int(self.light_vars[name].get()))
+            self.apply_selected_light()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def current_selected_aim(self):
+        if not self.apply_selected_light(silent=True):
+            raise ValueError('Selected light settings are invalid')
+        fixture = self.settings.fixtures[self.selected_light_index]
+        x, y, z, timestamp = self.tracker.get()
+        if timestamp == 0:
+            raise ValueError('No live PSN position has been received')
+        return fixture, calculate_aim(fixture, x, y, z)
+
+    def cal_pan_zero(self):
+        try:
+            fixture, (bearing, _elevation, _pan, _tilt, _distance) = self.current_selected_aim()
+            self.light_vars['pan_zero_bearing'].set(round(bearing, 3))
+            self.light_vars['pan_offset'].set(0.0)
+            self.apply_selected_light()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def cal_tilt_zero(self):
+        try:
+            fixture, (_bearing, elevation, _pan, _tilt, _distance) = self.current_selected_aim()
+            self.light_vars['tilt_zero_elevation'].set(round(elevation, 3))
+            self.light_vars['tilt_offset'].set(0.0)
+            self.apply_selected_light()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def make_output(self, settings):
+        if settings.output == 'Open DMX':
+            return OpenDMX(settings.serial_port)
+        if settings.output == 'Art-Net':
+            return ArtNet(settings.artnet_ip, settings.universe)
+        return SACN(settings.universe, settings.refresh_hz)
+
+    def make_fader_input(self, settings):
+        if settings.fader_mode == 'Manual':
+            self.fader.update(self.manual_fader_value)
+            return None
+        if settings.fader_mode == 'OSC':
+            return OSCFaderReceiver(
+                settings.osc_fader_port, settings.osc_fader_address, settings.osc_fader_arg,
+                settings.osc_fader_min, settings.osc_fader_max, self.fader, self.log
+            )
+        return ArtNetFaderReceiver(
+            settings.artnet_input_universe, settings.artnet_input_channel, self.fader, self.log
+        )
+
+    def start(self):
+        if self.running:
+            return
+        try:
+            self.settings = self.collect()
+            self.output = self.make_output(self.settings)
+            self.psn = PSNReceiver(
+                self.settings.psn_multicast, self.settings.psn_port, self.settings.psn_interface,
+                self.settings.marker_id, self.tracker, self.log, self._psn_discovered
+            )
+            self.psn.start()
+            self.fader_input = self.make_fader_input(self.settings)
+            if self.fader_input:
+                self.fader_input.start()
+            self.stop_evt.clear()
+            self.running = True
+            self.worker = threading.Thread(target=self.loop, daemon=True)
+            self.worker.start()
+            self.start_btn.configure(text='RUNNING')
+            count = sum(f.enabled for f in self.settings.fixtures)
+            self.log(f'FART started with {count} enabled light(s); dimmers remain locked until armed')
+        except Exception as exc:
+            if self.fader_input:
+                try:
+                    self.fader_input.stop()
+                except Exception:
+                    pass
+            if self.psn:
+                try:
+                    self.psn.stop()
+                except Exception:
+                    pass
+            if self.output:
+                try:
+                    self.output.close()
+                except Exception:
+                    pass
+            self.psn = self.fader_input = self.output = None
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def stop(self):
+        self.arm_var.set(False)
+        self.stop_evt.set()
+        self.running = False
+        if self.worker and self.worker is not threading.current_thread():
+            self.worker.join(timeout=1)
+        if self.psn:
+            try:
+                self.psn.stop()
+            except Exception:
+                pass
+        if self.fader_input:
+            try:
+                self.fader_input.stop()
+            except Exception:
+                pass
+        if self.output:
+            try:
+                self.output.send(bytes(512))
+                time.sleep(0.05)
+                self.output.close()
+            except Exception:
+                pass
+        self.psn = self.fader_input = self.output = None
+        self.start_btn.configure(text='START — DIMMER LOCKED')
+        self.log('Stopped and blacked out all lights')
+
+    def loop(self):
+        smooth_x = smooth_y = smooth_z = None
+        previous_pan = {}
+        try:
+            while not self.stop_evt.is_set():
+                cycle_start = time.monotonic()
+                settings = self.settings
+                x, y, z, tracker_time = self.tracker.get()
+                fader, _fader_time = self.fader.get()
+                smoothing = clamp(settings.smoothing, 0.0, 0.95)
+                alpha = 1.0 - smoothing
+                smooth_x = x if smooth_x is None else smooth_x + (x - smooth_x) * alpha
+                smooth_y = y if smooth_y is None else smooth_y + (y - smooth_y) * alpha
+                smooth_z = z if smooth_z is None else smooth_z + (z - smooth_z) * alpha
+                stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
+                blackout = stale or not self.arm_var.get()
+
+                frame = bytearray(512)
+                light_statuses = []
+                for index, fixture in enumerate(settings.fixtures):
+                    if not fixture.enabled:
+                        continue
+                    try:
+                        bearing, elevation, pan, tilt, distance = calculate_aim(
+                            fixture, smooth_x, smooth_y, smooth_z, previous_pan.get(index)
+                        )
+                        previous_pan[index] = pan
+                        status = write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout)
+                        status.update({
+                            'index': index,
+                            'name': fixture.name,
+                            'bearing': bearing,
+                            'elevation': elevation,
+                            'distance': distance,
+                        })
+                        light_statuses.append(status)
+                    except ValueError as exc:
+                        light_statuses.append({
+                            'index': index, 'name': fixture.name, 'error': str(exc),
+                            'pan_limit': False, 'tilt_limit': False,
+                        })
+
+                self.output.send(bytes(frame))
+                self.live = {
+                    'xyz': (smooth_x, smooth_y, smooth_z),
+                    'fader': fader,
+                    'blackout': blackout,
+                    'stale': stale,
+                    'lights': light_statuses,
+                }
+                sleep_time = 1.0 / max(1, settings.refresh_hz) - (time.monotonic() - cycle_start)
+                time.sleep(max(0.0, sleep_time))
+        except Exception as exc:
+            self.log('OUTPUT ERROR: ' + str(exc))
+            self.after(0, self.stop)
+
+    def ui_tick(self):
+        while True:
+            try:
+                message = self.logs.get_nowait()
+            except queue.Empty:
+                break
+            self.logbox.configure(state='normal')
+            self.logbox.insert('end', message + '\n')
+            self.logbox.see('end')
+            self.logbox.configure(state='disabled')
+
+        found_changed = False
+        while True:
+            try:
+                tracker_id = self.psn_discovered.get_nowait()
+            except queue.Empty:
+                break
+            if tracker_id not in self.psn_tracker_ids:
+                self.psn_tracker_ids.add(tracker_id)
+                found_changed = True
+        if found_changed:
+            ids = sorted(self.psn_tracker_ids)
+            self.psn_tracker_combo['values'] = ids
+            self.psn_detect_label.configure(text='Found tracker IDs: ' + ', '.join(map(str, ids)))
+
+        if self.psn:
+            stats = self.psn.stats()
+            packet_age = 'never' if stats['last_packet_age'] is None else f"{stats['last_packet_age']:.2f}s ago"
+            self.status_labels['PSN'].configure(
+                text=f"packets {stats['packets']}, data {stats['data_packets']}, "
+                     f"selected {stats['selected_tracker']}, positions {stats['positions']} ({packet_age})"
+            )
+        else:
+            self.status_labels['PSN'].configure(text='Stopped')
+
+        if self.live:
+            x, y, z = self.live['xyz']
+            lights = self.live['lights']
+            selected = next((item for item in lights if item.get('index') == self.selected_light_index), None)
+            if selected is None and lights:
+                selected = lights[0]
+            limits = sum(bool(item.get('pan_limit') or item.get('tilt_limit')) for item in lights)
+            values = {
+                'XYZ': f'{x:.3f}, {y:.3f}, {z:.3f}',
+                'Fader': f"{self.live['fader'] * 100:.1f}%",
+                'Lights': f'{len(lights)} enabled, {limits} at a limit',
+                'State': 'TRACKING LOST — BLACKOUT' if self.live['stale'] else (
+                    'LIVE' if not self.live['blackout'] else 'DIMMERS LOCKED'
+                ),
+            }
+            if selected and 'error' not in selected:
+                values.update({
+                    'Selected light': selected['name'],
+                    'Fixture angles': f"pan {selected['pan']:.2f}°, tilt {selected['tilt']:.2f}°",
+                    'DMX angles': (
+                        f"pan {selected['pan_dmx_angle']:.2f}°{' LIMIT' if selected['pan_limit'] else ''}, "
+                        f"tilt {selected['tilt_dmx_angle']:.2f}°{' LIMIT' if selected['tilt_limit'] else ''}"
+                    ),
+                    'Distance': f"{selected['distance']:.2f} m",
+                })
+            elif selected:
+                values.update({
+                    'Selected light': selected['name'],
+                    'Fixture angles': selected['error'],
+                    'DMX angles': '—',
+                    'Distance': '—',
+                })
+            else:
+                values.update({
+                    'Selected light': 'No enabled lights',
+                    'Fixture angles': '—', 'DMX angles': '—', 'Distance': '—',
+                })
+            for key, value in values.items():
+                self.status_labels[key].configure(text=value)
+
+        self.after(100, self.ui_tick)
+
+    def on_close(self):
+        if self.psn_scanner:
+            try:
+                self.psn_scanner.stop()
+            except Exception:
+                pass
+        self.stop()
+        self.save()
+        self.destroy()
+
+
+def main():
+    App().mainloop()
+
+
+if __name__ == '__main__':
+    main()

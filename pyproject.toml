@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fart-followspot"
+version = "0.4.0"
+description = "Fixture Aiming and Remote Tracking from OpenFollow PSN to DMX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Brady Fulham" }]
+dependencies = [
+  "python-osc>=1.9,<2",
+  "pyserial>=3.5,<4",
+  "sacn>=1.9,<2",
+]
+keywords = ["PSN", "PosiStageNet", "OpenFollow", "Art-Net", "sACN", "DMX", "followspot", "lighting"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.scripts]
+fart-followspot = "fart:main"
+
+[tool.setuptools]
+py-modules = ["fart"]
