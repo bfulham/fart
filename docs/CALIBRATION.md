@@ -5,7 +5,7 @@ Calibrate each fixture independently with its lamp disabled or shutter closed.
 1. Measure the fixture's pan/tilt pivot in the same coordinate system used by OpenFollow. Enter that as optical-centre X, Y, and Z.
 2. Enter the fixture personality's real pan and tilt ranges. A nominal 540° pan personality normally maps to `-270` through `+270`.
 3. Patch the exact fixture model and mode, then enter the absolute DMX slots for pan coarse/fine, tilt coarse/fine, dimmer, and optional shutter.
-4. Put the marker at a known point in front of the fixture. Start output while leaving **Arm all light dimmers** off.
+4. Assign the intended PSN marker to the selected light, then put that marker at a known point in front of the fixture. Start output while leaving **Arm all light dimmers** off.
 5. Use **Set current bearing as pan zero** and **Set current elevation as tilt zero** when the fixture is physically aimed at that marker.
 6. Move the marker stage left/right. Reverse pan direction if the fixture moves away from it.
 7. Move the marker vertically or change its distance. Reverse tilt direction if the fixture moves away from it.

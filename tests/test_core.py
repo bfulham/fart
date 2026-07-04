@@ -61,7 +61,7 @@ class GeometryTests(unittest.TestCase):
 
 class PSNTests(unittest.TestCase):
     def test_openfollow_flagged_position_leaf_is_decoded(self):
-        tracker_state = fart.Tracker()
+        tracker_state = fart.TrackerBank()
         discovered = []
         receiver = fart.PSNReceiver(
             '236.10.10.10', 56565, '0.0.0.0', 7,
@@ -73,13 +73,27 @@ class PSNTests(unittest.TestCase):
         packet = chunk(0x6755, tracker_list, sub=True)
 
         receiver._decode(packet)
-        x, y, z, timestamp = tracker_state.get()
+        x, y, z, timestamp = tracker_state.get(7)
         self.assertEqual(discovered, [7])
         self.assertAlmostEqual(x, 1.25, places=6)
         self.assertAlmostEqual(y, 2.5, places=6)
         self.assertAlmostEqual(z, 3.75, places=6)
         self.assertGreater(timestamp, 0.0)
         self.assertEqual(receiver.position_count, 1)
+
+    def test_multiple_tracker_positions_are_retained(self):
+        tracker_state = fart.TrackerBank()
+        receiver = fart.PSNReceiver(
+            '236.10.10.10', 56565, '0.0.0.0', 1,
+            tracker_state, lambda _message: None
+        )
+        tracker1 = chunk(1, chunk(0x0000, struct.pack('<fff', 1.0, 2.0, 3.0), sub=True), sub=True)
+        tracker2 = chunk(2, chunk(0x0000, struct.pack('<fff', 4.0, 5.0, 6.0), sub=True), sub=True)
+        packet = chunk(0x6755, chunk(0x0001, tracker1 + tracker2, sub=True), sub=True)
+        receiver._decode(packet)
+        self.assertEqual(tracker_state.get(1)[:3], (1.0, 2.0, 3.0))
+        self.assertEqual(tracker_state.get(2)[:3], (4.0, 5.0, 6.0))
+
 
 
 class ChannelTests(unittest.TestCase):

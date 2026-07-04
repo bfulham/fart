@@ -6,17 +6,18 @@
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
 
-FART is a Windows GUI application that receives live marker positions from OpenFollow over PosiStageNet, calculates the exact line of sight from one or more moving fixtures to the selected marker, and outputs 16-bit pan/tilt DMX.
+FART is a Windows GUI application that receives live marker positions from OpenFollow over PosiStageNet, calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX.
 
 It supports:
 
 - OpenFollow PSN position input with automatic tracker discovery
-- Multiple moving lights aimed at one marker
+- Per-light PSN marker selection, allowing different lights to follow different markers
 - Independent fixture position, calibration, limits, channel mapping, and intensity scaling
 - Manual, OSC, or Art-Net intensity input
 - ENTTEC Open DMX USB, Art-Net, and sACN output
 - 8-bit or 16-bit dimmer mapping
 - Tracking-loss blackout and explicit dimmer arming
+- Multi-light overview table and lightweight interactive 3D preview
 - Configuration import/export through JSON
 
 > **Safety warning:** FART is experimental software, not a safety-rated tracking or motion-control system. Test with shutters closed or lamps disabled, use conservative movement limits, and keep an operator able to remove DMX or power immediately. Never use it where unexpected movement or light output could injure people.
@@ -60,7 +61,7 @@ Typical OpenFollow PSN settings are:
 | UDP port | `56565` |
 | Interface | `0.0.0.0`, or the PC's IPv4 address on the OpenFollow network |
 
-Click **Auto-detect PSN trackers** to populate the tracker selector. During operation, the PSN status counters should continuously increase, especially `selected` and `positions`.
+Click **Auto-detect PSN trackers** to populate the default tracker selector and each light's marker selector. The default is used for newly added lights; every light can then be assigned independently. During operation, the PSN status counters should continuously increase.
 
 FART uses PSN for XYZ position only. Intensity is selected independently.
 
@@ -100,8 +101,9 @@ sACN uses multicast and universe numbering starts at `1`. Valid universes are `1
 
 ## Adding lights
 
-Every enabled fixture uses the same selected PSN marker but calculates its own aim from its configured optical centre. For each light configure:
+Every enabled fixture chooses its own PSN marker and calculates its own aim from its configured optical centre. Several lights can share one marker, or different groups can follow different markers. For each light configure:
 
+- PSN marker ID
 - Optical-centre/pan-tilt-pivot X, Y, and Z in OpenFollow coordinates
 - World bearing represented by physical pan zero
 - World elevation represented by physical tilt zero
@@ -113,6 +115,12 @@ Every enabled fixture uses the same selected PSN marker but calculates its own a
 Channel fields are **absolute DMX slots**, not fixture offsets. For a fixture starting at channel 101, an attribute at fixture offset 18 is absolute channel `118`.
 
 FART blocks startup if enabled fixtures overlap on any configured DMX channel.
+
+## Multi-light overview and 3D preview
+
+The **Overview** tab includes a live row for every enabled light, showing its assigned marker, marker XYZ, calculated pan/tilt, distance, and tracking state.
+
+The **3D preview** is intentionally lightweight and uses only Tkinter. It displays fixture positions, assigned PSN markers, and the calculated beam line between them. Drag with the left mouse button to orbit, use the mouse wheel to zoom, and use **Reset view** to return to the default camera. It is a diagnostic reference, not a photometric or fixture-body simulation.
 
 ## Coordinate convention
 

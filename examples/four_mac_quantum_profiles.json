@@ -44,7 +44,8 @@
       "dimmer_fine": 103,
       "shutter": 101,
       "shutter_open": 30,
-      "intensity_scale": 1.0
+      "intensity_scale": 1.0,
+      "marker_id": 1
     },
     {
       "name": "MAC Quantum Profile 102",
@@ -70,7 +71,8 @@
       "dimmer_fine": 130,
       "shutter": 128,
       "shutter_open": 30,
-      "intensity_scale": 1.0
+      "intensity_scale": 1.0,
+      "marker_id": 1
     },
     {
       "name": "MAC Quantum Profile 103",
@@ -96,7 +98,8 @@
       "dimmer_fine": 157,
       "shutter": 155,
       "shutter_open": 30,
-      "intensity_scale": 1.0
+      "intensity_scale": 1.0,
+      "marker_id": 1
     },
     {
       "name": "MAC Quantum Profile 104",
@@ -122,7 +125,8 @@
       "dimmer_fine": 184,
       "shutter": 182,
       "shutter_open": 30,
-      "intensity_scale": 1.0
+      "intensity_scale": 1.0,
+      "marker_id": 1
     }
   ]
 }

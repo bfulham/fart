@@ -3,7 +3,7 @@
 
 A single-file Windows GUI that receives OpenFollow PosiStageNet (PSN) tracker
 positions, calculates the exact line of sight from one or more moving fixtures
-to the selected marker, and outputs DMX using ENTTEC Open DMX USB, Art-Net, or
+to independently selected markers, and outputs DMX using ENTTEC Open DMX USB, Art-Net, or
 sACN. Intensity can come from the manual UI, a configurable OSC value, or an
 Art-Net input channel.
 
@@ -26,7 +26,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -66,6 +66,7 @@ def dmx16(frac):
 class FixtureConfig:
     name: str = "Light 1"
     enabled: bool = True
+    marker_id: int = 1
 
     # Optical centre / pan-tilt pivot in OpenFollow world coordinates.
     x: float = 0.0
@@ -125,16 +126,23 @@ class Settings:
     fixtures: list[FixtureConfig] = field(default_factory=lambda: [FixtureConfig()])
 
 
-class Tracker:
+class TrackerBank:
+    """Thread-safe store of the latest position for every PSN tracker ID."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.xyz = (0.0, 0.0, 0.0, 0.0)
-    def update(self, x, y, z):
+        self.xyz = {}
+
+    def update(self, marker_id, x, y, z):
         with self.lock:
-            self.xyz = (float(x), float(y), float(z), time.monotonic())
-    def get(self):
+            self.xyz[int(marker_id)] = (float(x), float(y), float(z), time.monotonic())
+
+    def get(self, marker_id):
         with self.lock:
-            return self.xyz
+            return self.xyz.get(int(marker_id), (0.0, 0.0, 0.0, 0.0))
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.xyz)
 
 
 class FaderState:
@@ -230,9 +238,8 @@ class PSNReceiver:
                     self.discovered.add(tracker_id)
                     if self.on_discovered:
                         self.on_discovered(tracker_id)
-                if tracker_id != self.marker:
-                    continue
-                self.selected_tracker_count += 1
+                if tracker_id == self.marker:
+                    self.selected_tracker_count += 1
                 for field_id, field_sub, f_body, f_len in _chunks(data, t_body, t_len):
                     # OpenFollow uses pypsn. pypsn sets the high flag bit on
                     # leaf chunks as well as container chunks, including the
@@ -240,11 +247,11 @@ class PSNReceiver:
                     # because that flag is set.
                     if field_id == self.DATA_TRACKER_POS and f_len >= 12:
                         x, y, z = struct.unpack_from('<fff', data, f_body)
-                        self.tracker.update(x, y, z)
+                        self.tracker.update(tracker_id, x, y, z)
                         self.position_count += 1
                         self.last_position_time = time.monotonic()
                         if self.position_count == 1:
-                            self.log(f'PSN position received for tracker {self.marker}: {x:.3f}, {y:.3f}, {z:.3f}')
+                            self.log(f'PSN position received for tracker {tracker_id}: {x:.3f}, {y:.3f}, {z:.3f}')
                         break
 
     def stats(self):
@@ -521,6 +528,7 @@ class App(tk.Tk):
     FIXTURE_TYPES = {
         'name': str,
         'enabled': bool,
+        'marker_id': int,
         'x': float,
         'y': float,
         'z': float,
@@ -552,7 +560,7 @@ class App(tk.Tk):
         self.minsize(1000, 700)
 
         self.settings = self.load_settings()
-        self.tracker = Tracker()
+        self.trackers = TrackerBank()
         self.fader = FaderState()
         self.running = False
         self.psn = None
@@ -590,6 +598,8 @@ class App(tk.Tk):
                 for item in fixtures_data:
                     if isinstance(item, dict):
                         filtered = {k: v for k, v in item.items() if k in FixtureConfig.__dataclass_fields__}
+                        if 'marker_id' not in filtered:
+                            filtered['marker_id'] = int(data.get('marker_id', 1))
                         fixtures.append(FixtureConfig(**filtered))
 
             # Migrate all pre-0.3 single-light settings automatically.
@@ -607,7 +617,7 @@ class App(tk.Tk):
                     'dimmer': 'dimmer', 'shutter': 'shutter',
                     'shutter_open': 'shutter_open',
                 }
-                migrated = {'name': 'Light 1'}
+                migrated = {'name': 'Light 1', 'marker_id': int(data.get('marker_id', 1))}
                 for old, new in old_map.items():
                     if old in data:
                         migrated[new] = data[old]
@@ -671,7 +681,7 @@ class App(tk.Tk):
         lights_tab = ttk.Frame(notebook)
         io_tab = ttk.Frame(notebook)
         calibration_tab = ttk.Frame(notebook)
-        notebook.add(run_tab, text='Run')
+        notebook.add(run_tab, text='Overview')
         notebook.add(lights_tab, text='Lights')
         notebook.add(io_tab, text='I/O')
         notebook.add(calibration_tab, text='Calibration')
@@ -679,7 +689,7 @@ class App(tk.Tk):
         # Run tab
         connection = ttk.LabelFrame(run_tab, text='Tracking and output')
         connection.pack(side='left', fill='y', padx=8, pady=8)
-        ttk.Label(connection, text='PSN tracker').grid(row=0, column=0, sticky='w', padx=4, pady=3)
+        ttk.Label(connection, text='Default PSN tracker').grid(row=0, column=0, sticky='w', padx=4, pady=3)
         self.psn_tracker_combo = ttk.Combobox(connection, textvariable=self.var('marker_id', int), width=16)
         self.psn_tracker_combo.grid(row=0, column=1, sticky='ew', padx=4, pady=3)
         self.add_entry(connection, 1, 'PSN multicast', 'psn_multicast', str, 18)
@@ -717,10 +727,10 @@ class App(tk.Tk):
 
         run_right = ttk.Frame(run_tab)
         run_right.pack(side='left', fill='both', expand=True, padx=8, pady=8)
-        status = ttk.LabelFrame(run_right, text='Live status')
+        status = ttk.LabelFrame(run_right, text='System status')
         status.pack(fill='x')
         self.status_labels = {}
-        status_keys = ['PSN', 'XYZ', 'Selected light', 'Fixture angles', 'DMX angles', 'Distance', 'Fader', 'Lights', 'State']
+        status_keys = ['PSN', 'Selected light', 'Fader', 'Lights', 'State']
         for row, key in enumerate(status_keys):
             ttk.Label(status, text=key + ':').grid(row=row, column=0, sticky='e', padx=5, pady=3)
             label = ttk.Label(status, text='—', font=('Segoe UI', 10, 'bold'))
@@ -737,24 +747,65 @@ class App(tk.Tk):
         self.manual_value_label = ttk.Label(fader_box, text='0.0%', width=8)
         self.manual_value_label.pack(side='left', padx=8)
 
-        log_frame = ttk.LabelFrame(run_right, text='Log')
-        log_frame.pack(fill='both', expand=True, pady=(8, 0))
-        self.logbox = tk.Text(log_frame, height=14, state='disabled')
+        overview_notebook = ttk.Notebook(run_right)
+        overview_notebook.pack(fill='both', expand=True, pady=(8, 0))
+        lights_overview = ttk.Frame(overview_notebook)
+        preview_page = ttk.Frame(overview_notebook)
+        log_page = ttk.Frame(overview_notebook)
+        overview_notebook.add(lights_overview, text='Light overview')
+        overview_notebook.add(preview_page, text='3D preview')
+        overview_notebook.add(log_page, text='Log')
+
+        self.overview_tree = ttk.Treeview(
+            lights_overview, columns=('marker', 'position', 'angles', 'distance', 'state'),
+            show='tree headings', height=13
+        )
+        self.overview_tree.heading('#0', text='Light')
+        self.overview_tree.heading('marker', text='Marker')
+        self.overview_tree.heading('position', text='Marker XYZ')
+        self.overview_tree.heading('angles', text='Pan / Tilt')
+        self.overview_tree.heading('distance', text='Distance')
+        self.overview_tree.heading('state', text='State')
+        self.overview_tree.column('#0', width=145)
+        self.overview_tree.column('marker', width=65, anchor='center')
+        self.overview_tree.column('position', width=145)
+        self.overview_tree.column('angles', width=130)
+        self.overview_tree.column('distance', width=75, anchor='e')
+        self.overview_tree.column('state', width=120)
+        self.overview_tree.pack(fill='both', expand=True, padx=5, pady=5)
+
+        preview_controls = ttk.Frame(preview_page)
+        preview_controls.pack(fill='x', padx=5, pady=4)
+        ttk.Label(preview_controls, text='Drag to orbit • Mouse wheel to zoom').pack(side='left')
+        ttk.Button(preview_controls, text='Reset view', command=self.reset_preview_view).pack(side='right')
+        self.preview_canvas = tk.Canvas(preview_page, background='#10151a', highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+        self.preview_yaw = -35.0
+        self.preview_pitch = 25.0
+        self.preview_zoom = 32.0
+        self.preview_drag = None
+        self.preview_canvas.bind('<ButtonPress-1>', self.preview_press)
+        self.preview_canvas.bind('<B1-Motion>', self.preview_motion)
+        self.preview_canvas.bind('<MouseWheel>', self.preview_wheel)
+
+        self.logbox = tk.Text(log_page, height=14, state='disabled')
         self.logbox.pack(fill='both', expand=True)
 
         # Lights tab
         list_frame = ttk.LabelFrame(lights_tab, text='Lights in output universe')
         list_frame.pack(side='left', fill='y', padx=8, pady=8)
         self.light_tree = ttk.Treeview(
-            list_frame, columns=('enabled', 'position', 'channels'), show='tree headings',
+            list_frame, columns=('enabled', 'marker', 'position', 'channels'), show='tree headings',
             selectmode='browse', height=22
         )
         self.light_tree.heading('#0', text='Name')
         self.light_tree.heading('enabled', text='On')
+        self.light_tree.heading('marker', text='Marker')
         self.light_tree.heading('position', text='Position X,Y,Z')
         self.light_tree.heading('channels', text='Pan/Tilt')
         self.light_tree.column('#0', width=130)
         self.light_tree.column('enabled', width=40, anchor='center')
+        self.light_tree.column('marker', width=60, anchor='center')
         self.light_tree.column('position', width=145)
         self.light_tree.column('channels', width=90)
         self.light_tree.pack(fill='both', expand=True, padx=5, pady=5)
@@ -780,10 +831,14 @@ class App(tk.Tk):
         ttk.Checkbutton(identity, text='Enabled', variable=self.light_var('enabled', bool)).grid(
             row=1, column=0, columnspan=2, sticky='w', padx=4, pady=4
         )
-        self.add_light_entry(identity, 2, 'Optical centre X', 'x')
-        self.add_light_entry(identity, 3, 'Optical centre Y', 'y')
-        self.add_light_entry(identity, 4, 'Optical centre Z', 'z')
-        self.add_light_entry(identity, 5, 'Intensity scale', 'intensity_scale')
+        ttk.Label(identity, text='PSN marker').grid(row=2, column=0, sticky='w', padx=4, pady=3)
+        marker_var = self.light_var('marker_id', int)
+        self.light_marker_combo = ttk.Combobox(identity, textvariable=marker_var, width=16)
+        self.light_marker_combo.grid(row=2, column=1, sticky='ew', padx=4, pady=3)
+        self.add_light_entry(identity, 3, 'Optical centre X', 'x')
+        self.add_light_entry(identity, 4, 'Optical centre Y', 'y')
+        self.add_light_entry(identity, 5, 'Optical centre Z', 'z')
+        self.add_light_entry(identity, 6, 'Intensity scale', 'intensity_scale')
 
         mapping = ttk.LabelFrame(geometry_page, text='Physical angle mapping')
         mapping.pack(side='left', fill='y', padx=6, pady=6)
@@ -922,7 +977,7 @@ class App(tk.Tk):
             self.psn_tracker_combo['values'] = []
             self.psn_detect_label.configure(text='Listening for PSN…')
             self.psn_scanner = PSNReceiver(
-                group, port, interface, marker, Tracker(), self.log, self._psn_discovered
+                group, port, interface, marker, TrackerBank(), self.log, self._psn_discovered
             )
             self.psn_scanner.start()
             self.after(4000, self.finish_psn_scan)
@@ -940,6 +995,8 @@ class App(tk.Tk):
         if self.psn_tracker_ids:
             ids = sorted(self.psn_tracker_ids)
             self.psn_tracker_combo['values'] = ids
+            if hasattr(self, 'light_marker_combo'):
+                self.light_marker_combo['values'] = ids
             self.psn_detect_label.configure(text='Found tracker IDs: ' + ', '.join(map(str, ids)))
             try:
                 selected = int(self.vars['marker_id'].get())
@@ -986,7 +1043,7 @@ class App(tk.Tk):
         iid = str(index)
         position = f'{fixture.x:g}, {fixture.y:g}, {fixture.z:g}'
         pan_tilt = f'{fixture.pan_coarse}/{fixture.tilt_coarse}'
-        values = ('Yes' if fixture.enabled else 'No', position, pan_tilt)
+        values = ('Yes' if fixture.enabled else 'No', fixture.marker_id, position, pan_tilt)
         if self.light_tree.exists(iid):
             self.light_tree.item(iid, text=fixture.name, values=values)
         else:
@@ -1029,6 +1086,8 @@ class App(tk.Tk):
         try:
             for name in self.FIXTURE_TYPES:
                 self.light_vars[name].set(getattr(fixture, name))
+            if hasattr(self, 'light_marker_combo'):
+                self.light_marker_combo['values'] = sorted(self.psn_tracker_ids)
             self.calibration_light_label.configure(text=f'Selected light: {fixture.name}')
         finally:
             self.loading_light_editor = False
@@ -1057,6 +1116,8 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: angle maximum must be greater than minimum')
         if fixture.pan_direction not in (-1, 1) or fixture.tilt_direction not in (-1, 1):
             raise ValueError(f'{fixture.name}: pan and tilt directions must be +1 or -1')
+        if fixture.marker_id < 0 or fixture.marker_id > 65535:
+            raise ValueError(f'{fixture.name}: PSN marker ID must be 0–65535')
         if fixture.intensity_scale < 0:
             raise ValueError(f'{fixture.name}: intensity scale cannot be negative')
         if not 0 <= fixture.shutter_open <= 255:
@@ -1092,7 +1153,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, 'Fix the selected light settings before adding another light')
             return
         number = len(self.settings.fixtures) + 1
-        new_fixture = FixtureConfig(name=f'Light {number}')
+        new_fixture = FixtureConfig(name=f'Light {number}', marker_id=int(self.vars['marker_id'].get()))
         # Put newly added defaults after the highest channel currently in use.
         used = [ch for fixture in self.settings.fixtures for ch in fixture_channels(fixture).values() if ch > 0]
         start = max(used, default=0) + 1
@@ -1244,7 +1305,7 @@ class App(tk.Tk):
         if not self.apply_selected_light(silent=True):
             raise ValueError('Selected light settings are invalid')
         fixture = self.settings.fixtures[self.selected_light_index]
-        x, y, z, timestamp = self.tracker.get()
+        x, y, z, timestamp = self.trackers.get(fixture.marker_id)
         if timestamp == 0:
             raise ValueError('No live PSN position has been received')
         return fixture, calculate_aim(fixture, x, y, z)
@@ -1295,7 +1356,7 @@ class App(tk.Tk):
             self.output = self.make_output(self.settings)
             self.psn = PSNReceiver(
                 self.settings.psn_multicast, self.settings.psn_port, self.settings.psn_interface,
-                self.settings.marker_id, self.tracker, self.log, self._psn_discovered
+                self.settings.marker_id, self.trackers, self.log, self._psn_discovered
             )
             self.psn.start()
             self.fader_input = self.make_fader_input(self.settings)
@@ -1355,54 +1416,59 @@ class App(tk.Tk):
         self.log('Stopped and blacked out all lights')
 
     def loop(self):
-        smooth_x = smooth_y = smooth_z = None
+        smoothed = {}
         previous_pan = {}
         try:
             while not self.stop_evt.is_set():
                 cycle_start = time.monotonic()
                 settings = self.settings
-                x, y, z, tracker_time = self.tracker.get()
                 fader, _fader_time = self.fader.get()
                 smoothing = clamp(settings.smoothing, 0.0, 0.95)
                 alpha = 1.0 - smoothing
-                smooth_x = x if smooth_x is None else smooth_x + (x - smooth_x) * alpha
-                smooth_y = y if smooth_y is None else smooth_y + (y - smooth_y) * alpha
-                smooth_z = z if smooth_z is None else smooth_z + (z - smooth_z) * alpha
-                stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
-                blackout = stale or not self.arm_var.get()
-
                 frame = bytearray(512)
                 light_statuses = []
+
                 for index, fixture in enumerate(settings.fixtures):
                     if not fixture.enabled:
                         continue
+                    x, y, z, tracker_time = self.trackers.get(fixture.marker_id)
+                    previous_xyz = smoothed.get(fixture.marker_id)
+                    if previous_xyz is None:
+                        sx, sy, sz = x, y, z
+                    else:
+                        sx = previous_xyz[0] + (x - previous_xyz[0]) * alpha
+                        sy = previous_xyz[1] + (y - previous_xyz[1]) * alpha
+                        sz = previous_xyz[2] + (z - previous_xyz[2]) * alpha
+                    smoothed[fixture.marker_id] = (sx, sy, sz)
+                    stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
+                    blackout = stale or not self.arm_var.get()
                     try:
                         bearing, elevation, pan, tilt, distance = calculate_aim(
-                            fixture, smooth_x, smooth_y, smooth_z, previous_pan.get(index)
+                            fixture, sx, sy, sz, previous_pan.get(index)
                         )
                         previous_pan[index] = pan
                         status = write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout)
                         status.update({
-                            'index': index,
-                            'name': fixture.name,
-                            'bearing': bearing,
-                            'elevation': elevation,
-                            'distance': distance,
+                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
+                            'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
+                            'bearing': bearing, 'elevation': elevation, 'distance': distance,
+                            'stale': stale, 'blackout': blackout,
                         })
                         light_statuses.append(status)
                     except ValueError as exc:
                         light_statuses.append({
-                            'index': index, 'name': fixture.name, 'error': str(exc),
+                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
+                            'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
+                            'error': str(exc), 'stale': stale, 'blackout': True,
                             'pan_limit': False, 'tilt_limit': False,
                         })
 
                 self.output.send(bytes(frame))
                 self.live = {
-                    'xyz': (smooth_x, smooth_y, smooth_z),
                     'fader': fader,
-                    'blackout': blackout,
-                    'stale': stale,
+                    'blackout': not self.arm_var.get(),
                     'lights': light_statuses,
+                    'trackers': self.trackers.snapshot(),
                 }
                 sleep_time = 1.0 / max(1, settings.refresh_hz) - (time.monotonic() - cycle_start)
                 time.sleep(max(0.0, sleep_time))
@@ -1433,6 +1499,8 @@ class App(tk.Tk):
         if found_changed:
             ids = sorted(self.psn_tracker_ids)
             self.psn_tracker_combo['values'] = ids
+            if hasattr(self, 'light_marker_combo'):
+                self.light_marker_combo['values'] = ids
             self.psn_detect_label.configure(text='Found tracker IDs: ' + ', '.join(map(str, ids)))
 
         if self.psn:
@@ -1446,46 +1514,129 @@ class App(tk.Tk):
             self.status_labels['PSN'].configure(text='Stopped')
 
         if self.live:
-            x, y, z = self.live['xyz']
             lights = self.live['lights']
             selected = next((item for item in lights if item.get('index') == self.selected_light_index), None)
             if selected is None and lights:
                 selected = lights[0]
             limits = sum(bool(item.get('pan_limit') or item.get('tilt_limit')) for item in lights)
+            stale_count = sum(bool(item.get('stale')) for item in lights)
             values = {
-                'XYZ': f'{x:.3f}, {y:.3f}, {z:.3f}',
                 'Fader': f"{self.live['fader'] * 100:.1f}%",
-                'Lights': f'{len(lights)} enabled, {limits} at a limit',
-                'State': 'TRACKING LOST — BLACKOUT' if self.live['stale'] else (
-                    'LIVE' if not self.live['blackout'] else 'DIMMERS LOCKED'
+                'Lights': f'{len(lights)} enabled, {stale_count} lost, {limits} at a limit',
+                'State': 'ALL DIMMERS LOCKED' if self.live['blackout'] else (
+                    'TRACKING WARNINGS' if stale_count else 'LIVE'
                 ),
             }
-            if selected and 'error' not in selected:
-                values.update({
-                    'Selected light': selected['name'],
-                    'Fixture angles': f"pan {selected['pan']:.2f}°, tilt {selected['tilt']:.2f}°",
-                    'DMX angles': (
-                        f"pan {selected['pan_dmx_angle']:.2f}°{' LIMIT' if selected['pan_limit'] else ''}, "
-                        f"tilt {selected['tilt_dmx_angle']:.2f}°{' LIMIT' if selected['tilt_limit'] else ''}"
-                    ),
-                    'Distance': f"{selected['distance']:.2f} m",
-                })
-            elif selected:
-                values.update({
-                    'Selected light': selected['name'],
-                    'Fixture angles': selected['error'],
-                    'DMX angles': '—',
-                    'Distance': '—',
-                })
+            if selected:
+                values['Selected light'] = f"{selected['name']} → marker {selected.get('marker_id', '—')}"
             else:
-                values.update({
-                    'Selected light': 'No enabled lights',
-                    'Fixture angles': '—', 'DMX angles': '—', 'Distance': '—',
-                })
+                values['Selected light'] = 'No enabled lights'
             for key, value in values.items():
                 self.status_labels[key].configure(text=value)
+            self.update_overview_tree(lights)
+            self.draw_preview(lights)
 
         self.after(100, self.ui_tick)
+
+    def update_overview_tree(self, lights):
+        current = set()
+        for item in lights:
+            iid = str(item.get('index'))
+            current.add(iid)
+            xyz = item.get('marker_xyz', (0.0, 0.0, 0.0))
+            position = f'{xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f}'
+            if item.get('error'):
+                angles, distance, state = '—', '—', item['error']
+            else:
+                angles = f"{item['pan']:.1f}° / {item['tilt']:.1f}°"
+                distance = f"{item['distance']:.2f} m"
+                if item.get('stale'):
+                    state = 'TRACKING LOST'
+                elif item.get('pan_limit') or item.get('tilt_limit'):
+                    state = 'AT LIMIT'
+                elif item.get('blackout'):
+                    state = 'DIMMER LOCKED'
+                else:
+                    state = 'LIVE'
+            values = (item.get('marker_id'), position, angles, distance, state)
+            if self.overview_tree.exists(iid):
+                self.overview_tree.item(iid, text=item.get('name'), values=values)
+            else:
+                self.overview_tree.insert('', 'end', iid=iid, text=item.get('name'), values=values)
+        for iid in self.overview_tree.get_children():
+            if iid not in current:
+                self.overview_tree.delete(iid)
+
+    def reset_preview_view(self):
+        self.preview_yaw = -35.0
+        self.preview_pitch = 25.0
+        self.preview_zoom = 32.0
+        self.draw_preview(self.live['lights'] if self.live else [])
+
+    def preview_press(self, event):
+        self.preview_drag = (event.x, event.y, self.preview_yaw, self.preview_pitch)
+
+    def preview_motion(self, event):
+        if not self.preview_drag:
+            return
+        x, y, yaw, pitch = self.preview_drag
+        self.preview_yaw = yaw + (event.x - x) * 0.5
+        self.preview_pitch = clamp(pitch - (event.y - y) * 0.5, -85.0, 85.0)
+        self.draw_preview(self.live['lights'] if self.live else [])
+
+    def preview_wheel(self, event):
+        self.preview_zoom = clamp(self.preview_zoom * (1.12 if event.delta > 0 else 0.89), 5.0, 180.0)
+        self.draw_preview(self.live['lights'] if self.live else [])
+
+    def _project_preview(self, point, centre, width, height):
+        x, y, z = point
+        x -= centre[0]; y -= centre[1]; z -= centre[2]
+        yaw = math.radians(self.preview_yaw)
+        pitch = math.radians(self.preview_pitch)
+        x1 = x * math.cos(yaw) - y * math.sin(yaw)
+        y1 = x * math.sin(yaw) + y * math.cos(yaw)
+        y2 = y1 * math.cos(pitch) - z * math.sin(pitch)
+        z2 = y1 * math.sin(pitch) + z * math.cos(pitch)
+        return width / 2 + x1 * self.preview_zoom, height / 2 - z2 * self.preview_zoom, y2
+
+    def draw_preview(self, lights):
+        if not hasattr(self, 'preview_canvas'):
+            return
+        c = self.preview_canvas
+        c.delete('all')
+        width = max(c.winfo_width(), 100)
+        height = max(c.winfo_height(), 100)
+        points = []
+        for item in lights:
+            points.extend([item.get('fixture_xyz', (0, 0, 0)), item.get('marker_xyz', (0, 0, 0))])
+        if not points:
+            c.create_text(width/2, height/2, text='Start FART to preview lights and PSN markers', fill='#c7d0d9')
+            return
+        centre = tuple(sum(p[i] for p in points) / len(points) for i in range(3))
+        # Ground grid around scene centre.
+        extent = max(5, int(max(max(abs(p[0]-centre[0]), abs(p[1]-centre[1])) for p in points) + 2))
+        for n in range(-extent, extent + 1):
+            for axis in (0, 1):
+                a = (centre[0]-extent if axis == 0 else centre[0]+n, centre[1]+n if axis == 0 else centre[1]-extent, 0)
+                b = (centre[0]+extent if axis == 0 else centre[0]+n, centre[1]+n if axis == 0 else centre[1]+extent, 0)
+                pa = self._project_preview(a, centre, width, height)
+                pb = self._project_preview(b, centre, width, height)
+                c.create_line(pa[0], pa[1], pb[0], pb[1], fill='#26323b')
+        marker_drawn = set()
+        for item in sorted(lights, key=lambda x: self._project_preview(x.get('fixture_xyz',(0,0,0)), centre, width, height)[2]):
+            fp = item.get('fixture_xyz', (0, 0, 0))
+            mp = item.get('marker_xyz', (0, 0, 0))
+            f2 = self._project_preview(fp, centre, width, height)
+            m2 = self._project_preview(mp, centre, width, height)
+            beam_colour = '#b24a4a' if item.get('stale') or item.get('error') else '#e3c85b'
+            c.create_line(f2[0], f2[1], m2[0], m2[1], fill=beam_colour, width=2)
+            c.create_rectangle(f2[0]-5, f2[1]-5, f2[0]+5, f2[1]+5, fill='#6fa8dc', outline='white')
+            c.create_text(f2[0]+7, f2[1]-7, text=item.get('name','Light'), fill='#dce8f2', anchor='sw')
+            marker_key = item.get('marker_id')
+            if marker_key not in marker_drawn:
+                marker_drawn.add(marker_key)
+                c.create_oval(m2[0]-6, m2[1]-6, m2[0]+6, m2[1]+6, fill='#63d17a', outline='white')
+                c.create_text(m2[0]+8, m2[1]-8, text=f'Marker {marker_key}', fill='#dff5e4', anchor='sw')
 
     def on_close(self):
         if self.psn_scanner:
