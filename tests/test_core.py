@@ -59,6 +59,33 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(frame[5], 0)
 
 
+    def test_zoom_iris_focus_mapping(self):
+        fixture = fart.FixtureConfig(
+            dimmer=0, shutter=0,
+            zoom=10, zoom_fine=11, iris=12, focus=13, focus_fine=14,
+        )
+        frame = bytearray(512)
+        fart.write_fixture_to_frame(
+            frame, fixture, 0.0, 0.0, 0.0, False,
+            zoom=0.5, iris=1.0, focus=0.25,
+        )
+        self.assertEqual(frame[9:14], bytes([128, 0, 255, 64, 0]))
+
+    def test_beam_control_reverse(self):
+        fixture = fart.FixtureConfig(
+            dimmer=0, shutter=0, zoom=10, iris=11, focus=12,
+            zoom_reverse=True, iris_reverse=True, focus_reverse=True,
+        )
+        frame = bytearray(512)
+        fart.write_fixture_to_frame(
+            frame, fixture, 0.0, 0.0, 0.0, False,
+            zoom=0.0, iris=0.25, focus=1.0,
+        )
+        self.assertEqual(frame[9], 255)
+        self.assertEqual(frame[10], 191)
+        self.assertEqual(frame[11], 0)
+
+
 class PSNTests(unittest.TestCase):
     def test_openfollow_flagged_position_leaf_is_decoded(self):
         tracker_state = fart.TrackerBank()
@@ -106,6 +133,11 @@ class ChannelTests(unittest.TestCase):
             dimmer=102,
             dimmer_fine=103,
             shutter=101,
+            iris=194,
+            zoom=195,
+            zoom_fine=196,
+            focus=197,
+            focus_fine=198,
         )
         self.assertEqual(fart.fixture_channels(fixture), {
             'pan coarse': 118,
@@ -115,6 +147,11 @@ class ChannelTests(unittest.TestCase):
             'dimmer': 102,
             'dimmer fine': 103,
             'shutter': 101,
+            'zoom': 195,
+            'zoom fine': 196,
+            'iris': 194,
+            'focus': 197,
+            'focus fine': 198,
         })
 
 

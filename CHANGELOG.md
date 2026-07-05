@@ -2,6 +2,14 @@
 
 All notable changes to FART are documented here.
 
+## 0.6.0 - 2026-07-05
+
+- Added live shared zoom, iris, and focus controls to the Overview tab.
+- Added per-light zoom, iris, and focus DMX channel mapping.
+- Added optional 16-bit fine channels for zoom and focus.
+- Added per-light reverse controls for fixture personalities with inverted attribute ranges.
+- Extended channel conflict validation, duplication, configuration migration, tests, and the MAC Quantum example.
+
 ## 0.5.0 - 2026-07-04
 
 - Added independent PSN marker selection for every light.

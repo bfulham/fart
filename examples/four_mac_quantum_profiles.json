@@ -45,7 +45,15 @@
       "shutter": 101,
       "shutter_open": 30,
       "intensity_scale": 1.0,
-      "marker_id": 1
+      "marker_id": 1,
+      "iris": 113,
+      "zoom": 114,
+      "zoom_fine": 115,
+      "focus": 116,
+      "focus_fine": 117,
+      "zoom_reverse": false,
+      "iris_reverse": false,
+      "focus_reverse": false
     },
     {
       "name": "MAC Quantum Profile 102",
@@ -72,7 +80,15 @@
       "shutter": 128,
       "shutter_open": 30,
       "intensity_scale": 1.0,
-      "marker_id": 1
+      "marker_id": 1,
+      "iris": 140,
+      "zoom": 141,
+      "zoom_fine": 142,
+      "focus": 143,
+      "focus_fine": 144,
+      "zoom_reverse": false,
+      "iris_reverse": false,
+      "focus_reverse": false
     },
     {
       "name": "MAC Quantum Profile 103",
@@ -99,7 +115,15 @@
       "shutter": 155,
       "shutter_open": 30,
       "intensity_scale": 1.0,
-      "marker_id": 1
+      "marker_id": 1,
+      "iris": 167,
+      "zoom": 168,
+      "zoom_fine": 169,
+      "focus": 170,
+      "focus_fine": 171,
+      "zoom_reverse": false,
+      "iris_reverse": false,
+      "focus_reverse": false
     },
     {
       "name": "MAC Quantum Profile 104",
@@ -126,7 +150,18 @@
       "shutter": 182,
       "shutter_open": 30,
       "intensity_scale": 1.0,
-      "marker_id": 1
+      "marker_id": 1,
+      "iris": 194,
+      "zoom": 195,
+      "zoom_fine": 196,
+      "focus": 197,
+      "focus_fine": 198,
+      "zoom_reverse": false,
+      "iris_reverse": false,
+      "focus_reverse": false
     }
-  ]
+  ],
+  "zoom_master": 0.5,
+  "iris_master": 1.0,
+  "focus_master": 0.5
 }

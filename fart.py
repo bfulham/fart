@@ -26,7 +26,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -97,6 +97,17 @@ class FixtureConfig:
     shutter_open: int = 255
     intensity_scale: float = 1.0
 
+    # Optional beam controls. Coarse channels are 8-bit when their fine
+    # channel is zero, otherwise they are emitted as 16-bit pairs.
+    zoom: int = 0
+    zoom_fine: int = 0
+    iris: int = 0
+    focus: int = 0
+    focus_fine: int = 0
+    zoom_reverse: bool = False
+    iris_reverse: bool = False
+    focus_reverse: bool = False
+
 
 @dataclass
 class Settings:
@@ -122,6 +133,10 @@ class Settings:
     refresh_hz: int = 30
     timeout_s: float = 0.5
     smoothing: float = 0.12
+
+    zoom_master: float = 0.5
+    iris_master: float = 1.0
+    focus_master: float = 0.5
 
     fixtures: list[FixtureConfig] = field(default_factory=lambda: [FixtureConfig()])
 
@@ -462,10 +477,15 @@ def fixture_channels(fixture: FixtureConfig):
         'dimmer': fixture.dimmer,
         'dimmer fine': fixture.dimmer_fine,
         'shutter': fixture.shutter,
+        'zoom': fixture.zoom,
+        'zoom fine': fixture.zoom_fine,
+        'iris': fixture.iris,
+        'focus': fixture.focus,
+        'focus fine': fixture.focus_fine,
     }
 
 
-def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout):
+def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5):
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
     tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
     pan_fraction = (plim - fixture.pan_min) / (fixture.pan_max - fixture.pan_min)
@@ -486,6 +506,21 @@ def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout):
         values.append((fixture.dimmer_fine, df))
     if fixture.shutter:
         values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
+
+    def add_parameter(coarse_channel, fine_channel, value, reverse=False):
+        if not coarse_channel:
+            return
+        fraction = clamp(float(value), 0.0, 1.0)
+        if reverse:
+            fraction = 1.0 - fraction
+        coarse, fine = dmx16(fraction)
+        values.append((coarse_channel, coarse))
+        if fine_channel:
+            values.append((fine_channel, fine))
+
+    add_parameter(fixture.zoom, fixture.zoom_fine, zoom, fixture.zoom_reverse)
+    add_parameter(fixture.iris, 0, iris, fixture.iris_reverse)
+    add_parameter(fixture.focus, fixture.focus_fine, focus, fixture.focus_reverse)
 
     for channel, value in values:
         if 1 <= channel <= 512:
@@ -523,6 +558,9 @@ class App(tk.Tk):
         'refresh_hz': int,
         'timeout_s': float,
         'smoothing': float,
+        'zoom_master': float,
+        'iris_master': float,
+        'focus_master': float,
     }
 
     FIXTURE_TYPES = {
@@ -551,6 +589,14 @@ class App(tk.Tk):
         'shutter': int,
         'shutter_open': int,
         'intensity_scale': float,
+        'zoom': int,
+        'zoom_fine': int,
+        'iris': int,
+        'focus': int,
+        'focus_fine': int,
+        'zoom_reverse': bool,
+        'iris_reverse': bool,
+        'focus_reverse': bool,
     }
 
     def __init__(self):
@@ -573,6 +619,9 @@ class App(tk.Tk):
         self.psn_discovered = queue.Queue()
         self.psn_tracker_ids = set()
         self.manual_fader_value = self.settings.manual_fader
+        self.zoom_value = self.settings.zoom_master
+        self.iris_value = self.settings.iris_master
+        self.focus_value = self.settings.focus_master
         self.vars = {}
         self.light_vars = {}
         self.selected_light_index = 0
@@ -747,6 +796,25 @@ class App(tk.Tk):
         self.manual_value_label = ttk.Label(fader_box, text='0.0%', width=8)
         self.manual_value_label.pack(side='left', padx=8)
 
+        beam_box = ttk.LabelFrame(run_right, text='Beam controls — shared normalized output')
+        beam_box.pack(fill='x', pady=(8, 0))
+        self.beam_value_labels = {}
+        for row, (label, attr, initial) in enumerate((
+            ('Zoom', 'zoom', self.zoom_value),
+            ('Iris', 'iris', self.iris_value),
+            ('Focus', 'focus', self.focus_value),
+        )):
+            ttk.Label(beam_box, text=label, width=7).grid(row=row, column=0, padx=5, pady=2, sticky='w')
+            variable = tk.DoubleVar(value=initial * 100.0)
+            setattr(self, f'{attr}_scale_var', variable)
+            scale = ttk.Scale(beam_box, from_=0, to=100, variable=variable,
+                              command=lambda value, name=attr: self.beam_control_changed(name, value))
+            scale.grid(row=row, column=1, sticky='ew', padx=5, pady=2)
+            value_label = ttk.Label(beam_box, text=f'{initial * 100:.1f}%', width=8)
+            value_label.grid(row=row, column=2, padx=5)
+            self.beam_value_labels[attr] = value_label
+        beam_box.columnconfigure(1, weight=1)
+
         overview_notebook = ttk.Notebook(run_right)
         overview_notebook.pack(fill='both', expand=True, pady=(8, 0))
         lights_overview = ttk.Frame(overview_notebook)
@@ -863,9 +931,18 @@ class App(tk.Tk):
             ('Tilt coarse', 'tilt_coarse'), ('Tilt fine', 'tilt_fine'),
             ('Dimmer coarse', 'dimmer'), ('Dimmer fine', 'dimmer_fine'),
             ('Shutter', 'shutter'), ('Shutter open value', 'shutter_open'),
+            ('Zoom coarse', 'zoom'), ('Zoom fine', 'zoom_fine'),
+            ('Iris', 'iris'), ('Focus coarse', 'focus'), ('Focus fine', 'focus_fine'),
         ]
         for row, (label, name) in enumerate(channel_fields):
             self.add_light_entry(channels, row, label, name, int)
+
+        direction_box = ttk.LabelFrame(dmx_page, text='Beam control direction')
+        direction_box.pack(side='left', fill='y', padx=8, pady=8)
+        ttk.Checkbutton(direction_box, text='Reverse zoom', variable=self.light_var('zoom_reverse', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Checkbutton(direction_box, text='Reverse iris', variable=self.light_var('iris_reverse', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Checkbutton(direction_box, text='Reverse focus', variable=self.light_var('focus_reverse', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Label(direction_box, text="Use reverse when the fixture's\nDMX range runs opposite to the UI.", justify='left').pack(anchor='w', padx=6, pady=(8, 5))
         ttk.Label(
             dmx_page,
             text='All lights share the selected 512-channel output universe.\n'
@@ -954,6 +1031,15 @@ class App(tk.Tk):
             if name in self.vars:
                 self.vars[name].set(getattr(self.settings, name))
         self.manual_scale_var.set(self.settings.manual_fader * 100.0)
+        self.zoom_value = self.settings.zoom_master
+        self.iris_value = self.settings.iris_master
+        self.focus_value = self.settings.focus_master
+        for name in ('zoom', 'iris', 'focus'):
+            variable = getattr(self, f'{name}_scale_var', None)
+            if variable is not None:
+                variable.set(getattr(self, f'{name}_value') * 100.0)
+            if hasattr(self, 'beam_value_labels'):
+                self.beam_value_labels[name].configure(text=f"{getattr(self, f'{name}_value') * 100:.1f}%")
         self.manual_changed(self.manual_scale_var.get())
         self.update_fader_mode()
         self.rebuild_light_tree(select_index=0)
@@ -1013,6 +1099,12 @@ class App(tk.Tk):
             self.manual_value_label.configure(text=f'{self.manual_fader_value * 100:.1f}%')
         if self.settings.fader_mode == 'Manual':
             self.fader.update(self.manual_fader_value)
+
+    def beam_control_changed(self, name, value):
+        normalized = clamp(float(value) / 100.0, 0.0, 1.0)
+        setattr(self, f'{name}_value', normalized)
+        if hasattr(self, 'beam_value_labels') and name in self.beam_value_labels:
+            self.beam_value_labels[name].configure(text=f'{normalized * 100:.1f}%')
 
     def update_fader_mode(self):
         mode = self.vars['fader_mode'].get() if 'fader_mode' in self.vars else 'Manual'
@@ -1130,6 +1222,10 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: tilt fine requires tilt coarse')
         if fixture.dimmer_fine and not fixture.dimmer:
             raise ValueError(f'{fixture.name}: dimmer fine requires dimmer coarse')
+        if fixture.zoom_fine and not fixture.zoom:
+            raise ValueError(f'{fixture.name}: zoom fine requires zoom coarse')
+        if fixture.focus_fine and not fixture.focus:
+            raise ValueError(f'{fixture.name}: focus fine requires focus coarse')
         for label, channel in fixture_channels(fixture).items():
             if not 0 <= channel <= 512:
                 raise ValueError(f'{fixture.name}: {label} channel must be 0–512')
@@ -1189,7 +1285,8 @@ class App(tk.Tk):
             shift = max(all_used, default=0) + 1 - min(source_channels)
             shifted = {}
             for field_name in ('pan_coarse', 'pan_fine', 'tilt_coarse', 'tilt_fine',
-                               'dimmer', 'dimmer_fine', 'shutter'):
+                               'dimmer', 'dimmer_fine', 'shutter', 'zoom', 'zoom_fine',
+                               'iris', 'focus', 'focus_fine'):
                 channel = getattr(copied, field_name)
                 shifted[field_name] = channel + shift if channel > 0 else 0
             if max(shifted.values(), default=0) <= 512:
@@ -1219,6 +1316,9 @@ class App(tk.Tk):
             if name == 'manual_fader':
                 values[name] = self.manual_fader_value
                 continue
+            if name in ('zoom_master', 'iris_master', 'focus_master'):
+                values[name] = getattr(self, name.replace('_master', '_value'))
+                continue
             raw = self.vars[name].get()
             if typ is int:
                 raw = int(raw)
@@ -1228,6 +1328,9 @@ class App(tk.Tk):
                 raw = str(raw)
             values[name] = raw
         values['manual_fader'] = self.manual_fader_value
+        values['zoom_master'] = self.zoom_value
+        values['iris_master'] = self.iris_value
+        values['focus_master'] = self.focus_value
 
         fixtures = [FixtureConfig(**asdict(fixture)) for fixture in self.settings.fixtures]
         settings = Settings(**values, fixtures=fixtures)
@@ -1237,6 +1340,9 @@ class App(tk.Tk):
             raise ValueError('Tracking timeout must be greater than zero')
         if not 0 <= settings.smoothing <= 0.95:
             raise ValueError('Smoothing must be between 0 and 0.95')
+        for label, value in (('Zoom', settings.zoom_master), ('Iris', settings.iris_master), ('Focus', settings.focus_master)):
+            if not 0 <= value <= 1:
+                raise ValueError(f'{label} master must be between 0 and 1')
         if settings.osc_fader_arg < 0:
             raise ValueError('OSC argument index cannot be negative')
         if not 1 <= settings.artnet_input_channel <= 512:
@@ -1447,7 +1553,10 @@ class App(tk.Tk):
                             fixture, sx, sy, sz, previous_pan.get(index)
                         )
                         previous_pan[index] = pan
-                        status = write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout)
+                        status = write_fixture_to_frame(
+                            frame, fixture, pan, tilt, fader, blackout,
+                            self.zoom_value, self.iris_value, self.focus_value
+                        )
                         status.update({
                             'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),

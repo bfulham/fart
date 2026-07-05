@@ -16,6 +16,7 @@ It supports:
 - Manual, OSC, or Art-Net intensity input
 - ENTTEC Open DMX USB, Art-Net, and sACN output
 - 8-bit or 16-bit dimmer mapping
+- Live shared zoom, iris, and focus controls with optional 16-bit zoom/focus output
 - Tracking-loss blackout and explicit dimmer arming
 - Multi-light overview table and lightweight interactive 3D preview
 - Configuration import/export through JSON
@@ -111,10 +112,23 @@ Every enabled fixture chooses its own PSN marker and calculates its own aim from
 - Mechanical/personality angle limits
 - Absolute DMX channels within the output universe
 - Shutter-open value and optional 16-bit dimmer fine channel
+- Optional zoom, iris, and focus channels, including fine channels and per-light direction reversal
 
 Channel fields are **absolute DMX slots**, not fixture offsets. For a fixture starting at channel 101, an attribute at fixture offset 18 is absolute channel `118`.
 
 FART blocks startup if enabled fixtures overlap on any configured DMX channel.
+
+
+## Zoom, iris, and focus
+
+The **Overview** tab includes live 0–100% controls for zoom, iris, and focus. These normalized values are sent to every enabled light that has the corresponding channel configured. Each light can independently enable or omit the attribute and reverse its direction when the fixture personality runs opposite to the UI.
+
+- Zoom supports an optional fine channel for 16-bit output.
+- Iris is 8-bit.
+- Focus supports an optional fine channel for 16-bit output.
+- A channel value of `0` disables that attribute for the light.
+
+For the MAC Quantum Profile Extended mode at address `1.182`, for example, use iris `194`, zoom `195/196`, and focus `197/198`.
 
 ## Multi-light overview and 3D preview
 
