@@ -206,4 +206,8 @@ FART is released under the [MIT License](LICENSE).
 
 ### GDTF channel import
 
-FART can import a basic DMX channel map from a `.gdtf` fixture file. Use it as a setup helper only: always verify the imported channel offsets against the fixture manual before moving real fixtures. Complex GDTF personalities may still need manual correction.
+FART can import a DMX channel map from a `.gdtf` fixture file from either the main light editor or the DMX setup step before calibration. When a GDTF contains multiple DMX modes, FART asks which mode to import so it can match the mode patched in MA3 or on the real fixture.
+
+The importer fills common attributes where they are present in the selected mode: pan, tilt, dimmer, shutter, zoom, iris, focus, and supported fine channels. It also attempts to derive practical defaults from the GDTF channel ranges, including a shutter-open value and an iris 100% cap so the iris slider does not run into pulse, pattern, or effect ranges.
+
+Use GDTF import as a setup helper only: always verify the imported channels and values against the fixture manual before moving real fixtures. Complex GDTF personalities may still need manual correction.

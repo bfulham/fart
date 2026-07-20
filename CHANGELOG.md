@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.3
+
+- GDTF import now prompts for the fixture DMX mode instead of always using the first mode in the file.
+- GDTF import now applies the selected mode in both the main light editor and the pre-calibration DMX setup wizard.
+- GDTF import now attempts to derive shutter-open DMX values from open shutter ranges.
+- GDTF import now attempts to derive the iris 100% cap from the normal iris range before effect/pulse/pattern ranges.
+- Added automated GDTF importer coverage for mode selection, shutter open, iris cap, and 16-bit attributes.
+
 ## 0.7.2
 
 - Fixed calibration dialogs calling the old light-editor method name.

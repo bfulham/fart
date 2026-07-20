@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "0.7.2"
+APP_VERSION = "0.7.3"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -514,20 +514,175 @@ def _parse_gdtf_offsets(value):
     return out
 
 
-def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
-    """Best-effort GDTF DMX attribute extraction.
-
-    Returns (mapping, mode_names). Mapping values are absolute one-based DMX slots.
-    This intentionally covers common GDTF files; complex virtual channels may still
-    need manual checking against the fixture manual.
-    """
+def _read_gdtf_description(path):
     with zipfile.ZipFile(path, 'r') as zf:
         names = zf.namelist()
         desc_name = next((n for n in names if n.lower().endswith('description.xml')), None)
         if not desc_name:
             raise ValueError('No description.xml found in the GDTF file')
-        root = ET.fromstring(zf.read(desc_name))
+        return ET.fromstring(zf.read(desc_name))
 
+
+def list_gdtf_modes(path):
+    root = _read_gdtf_description(path)
+    modes = [node for node in root.iter() if _strip_ns(node.tag) == 'DMXMode']
+    names = [_xml_attr(m, 'Name', f'Mode {i+1}') for i, m in enumerate(modes)]
+    if not names:
+        raise ValueError('No DMXMode entries found in the GDTF file')
+    return names
+
+
+def select_gdtf_mode(parent, path):
+    modes = list_gdtf_modes(path)
+    if len(modes) == 1:
+        return modes[0]
+
+    dialog = tk.Toplevel(parent)
+    dialog.title(f'{APP_SHORT_NAME} GDTF mode')
+    dialog.geometry('520x360')
+    dialog.transient(parent)
+    dialog.grab_set()
+    result = {'mode': None}
+
+    ttk.Label(
+        dialog,
+        text='Select the GDTF DMX mode to import. This must match the fixture mode patched in MA3.',
+        wraplength=480,
+        justify='left',
+    ).pack(fill='x', padx=10, pady=(10, 6))
+
+    frame = ttk.Frame(dialog)
+    frame.pack(fill='both', expand=True, padx=10, pady=6)
+    scrollbar = ttk.Scrollbar(frame, orient='vertical')
+    listbox = tk.Listbox(frame, height=12, yscrollcommand=scrollbar.set, exportselection=False)
+    scrollbar.config(command=listbox.yview)
+    listbox.pack(side='left', fill='both', expand=True)
+    scrollbar.pack(side='right', fill='y')
+    for mode in modes:
+        listbox.insert('end', mode)
+    listbox.selection_set(0)
+    listbox.activate(0)
+
+    buttons = ttk.Frame(dialog)
+    buttons.pack(fill='x', padx=10, pady=(4, 10))
+
+    def choose():
+        sel = listbox.curselection()
+        if sel:
+            result['mode'] = modes[int(sel[0])]
+            dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    ttk.Button(buttons, text='Import selected mode', command=choose).pack(side='right', padx=4)
+    ttk.Button(buttons, text='Cancel', command=cancel).pack(side='right', padx=4)
+    listbox.bind('<Double-1>', lambda _event: choose())
+    dialog.bind('<Return>', lambda _event: choose())
+    dialog.bind('<Escape>', lambda _event: cancel())
+    parent.wait_window(dialog)
+    return result['mode']
+
+
+def _parse_gdtf_dmx_value(value, default=None):
+    if value is None or value == '':
+        return default
+    text = str(value).strip().replace('{', '').replace('}', '')
+    if not text:
+        return default
+    # GDTF often stores values like "20/1" or "32768/2". The first
+    # number is the actual DMX value; the value after / is the byte count.
+    text = text.split()[0].split(',')[0].split('/')[0]
+    try:
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _gdtf_range_from_node(node):
+    start = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXFrom', ''))
+    end = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXTo', ''))
+    if start is None and end is None:
+        return None
+    if start is None:
+        start = end
+    if end is None:
+        end = start
+    if end < start:
+        start, end = end, start
+    return int(start), int(end)
+
+
+def _gdtf_ranges_for_channel(dmx_channel):
+    ranges = []
+    for node in dmx_channel.iter():
+        if node is dmx_channel:
+            continue
+        tag = _strip_ns(node.tag)
+        if tag not in ('ChannelFunction', 'ChannelSet'):
+            continue
+        r = _gdtf_range_from_node(node)
+        if not r:
+            continue
+        name = ' '.join(filter(None, [
+            _xml_attr(node, 'Name', ''),
+            _xml_attr(node, 'Attribute', ''),
+            _xml_attr(node, 'PhysicalFrom', ''),
+            _xml_attr(node, 'PhysicalTo', ''),
+        ])).lower()
+        ranges.append((r[0], r[1], name, tag))
+    return sorted(ranges, key=lambda item: (item[0], item[1]))
+
+
+def _derive_shutter_open_value(dmx_channel):
+    bad = ('closed', 'close', 'strobe', 'random', 'pulse', 'effect', 'macro', 'reset', 'lamp', 'strike', 'douse')
+    candidates = []
+    for start, end, name, _tag in _gdtf_ranges_for_channel(dmx_channel):
+        if 'open' in name and not any(word in name for word in bad):
+            candidates.append((start, end))
+    if candidates:
+        start, end = candidates[0]
+        return int(round((start + end) / 2))
+    # Fall back to common simple shutter behaviour if the GDTF names are poor.
+    for start, end, name, _tag in _gdtf_ranges_for_channel(dmx_channel):
+        if 'open' in name:
+            return int(round((start + end) / 2))
+    return None
+
+
+def _derive_iris_100_value(dmx_channel):
+    ranges = _gdtf_ranges_for_channel(dmx_channel)
+    if not ranges:
+        return None
+    effect_words = ('effect', 'macro', 'pulse', 'random', 'strobe', 'shake', 'pattern', 'animation')
+    useful = []
+    effect_starts = []
+    for start, end, name, _tag in ranges:
+        is_effect = any(word in name for word in effect_words)
+        if is_effect:
+            effect_starts.append(start)
+        else:
+            useful.append((start, end, name))
+    if effect_starts:
+        first_effect = min(effect_starts)
+        before_effect = [(s, e, n) for s, e, n in useful if s < first_effect]
+        if before_effect:
+            return int(clamp(max(e for _s, e, _n in before_effect), 0, 255))
+        return int(clamp(first_effect - 1, 0, 255))
+    if useful:
+        return int(clamp(max(e for _s, e, _n in useful), 0, 255))
+    return None
+
+
+def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
+    """Best-effort GDTF DMX attribute extraction for one selected mode.
+
+    Returns (mapping, mode_names, selected_mode_name). Mapping values are
+    absolute one-based DMX slots, except shutter_open and iris_100_dmx which are
+    DMX values for those attributes. Complex GDTF files may still need manual
+    checking against the fixture manual.
+    """
+    root = _read_gdtf_description(path)
     modes = [node for node in root.iter() if _strip_ns(node.tag) == 'DMXMode']
     mode_names = [_xml_attr(m, 'Name', f'Mode {i+1}') for i, m in enumerate(modes)]
     if not modes:
@@ -538,6 +693,7 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
             if _xml_attr(candidate, 'Name', '').lower() == preferred_mode.lower():
                 mode = candidate
                 break
+    selected_mode = _xml_attr(mode, 'Name', mode_names[0] if mode_names else 'default')
 
     def classify(attr):
         a = attr.lower().replace('_', '').replace('-', '').replace(' ', '')
@@ -558,14 +714,14 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
         return None
 
     found = {}
+    kind_channels = {}
     for dmx_channel in mode.iter():
         if _strip_ns(dmx_channel.tag) != 'DMXChannel':
             continue
         offsets = _parse_gdtf_offsets(_xml_attr(dmx_channel, 'Offset', ''))
         if not offsets:
             continue
-        attr_names = []
-        attr_names.append(_xml_attr(dmx_channel, 'Attribute', ''))
+        attr_names = [_xml_attr(dmx_channel, 'Attribute', '')]
         for child in dmx_channel.iter():
             if child is dmx_channel:
                 continue
@@ -576,8 +732,9 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
             kind = classify(name)
             if kind:
                 break
-        if not kind or kind in found:
+        if not kind or kind in kind_channels:
             continue
+        kind_channels[kind] = dmx_channel
         abs_offsets = [int(start_address) + off - 1 for off in offsets]
         if kind == 'pan':
             found['pan_coarse'] = abs_offsets[0]
@@ -603,9 +760,19 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
             found['focus'] = abs_offsets[0]
             if len(abs_offsets) > 1:
                 found['focus_fine'] = abs_offsets[1]
+
+    if 'shutter' in kind_channels:
+        open_value = _derive_shutter_open_value(kind_channels['shutter'])
+        if open_value is not None:
+            found['shutter_open'] = int(clamp(open_value, 0, 255))
+    if 'iris' in kind_channels:
+        iris_cap = _derive_iris_100_value(kind_channels['iris'])
+        if iris_cap is not None:
+            found['iris_100_dmx'] = int(clamp(iris_cap, 0, 255))
+
     if not found:
         raise ValueError('No usable pan/tilt/dimmer/beam channels were found in that GDTF mode')
-    return found, mode_names
+    return found, mode_names, selected_mode
 
 def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5):
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
@@ -814,7 +981,10 @@ class DMXSetupDialog(tk.Toplevel):
             )
             if not start:
                 return
-            mapping, modes = import_gdtf_channel_mapping(path, start)
+            mode = select_gdtf_mode(self, path)
+            if not mode:
+                return
+            mapping, modes, selected_mode = import_gdtf_channel_mapping(path, start, mode)
             for field, channel in mapping.items():
                 if field in self.vars:
                     self.vars[field].set(int(channel))
@@ -1921,7 +2091,10 @@ class App(tk.Tk):
             )
             if not start:
                 return
-            mapping, modes = import_gdtf_channel_mapping(path, start)
+            mode = select_gdtf_mode(self, path)
+            if not mode:
+                return
+            mapping, modes, selected_mode = import_gdtf_channel_mapping(path, start, mode)
             for field, channel in mapping.items():
                 if field in self.light_vars:
                     self.light_vars[field].set(channel)
@@ -1933,7 +2106,7 @@ class App(tk.Tk):
                 APP_NAME,
                 'Imported GDTF channel mapping.\n\n'
                 'Check these against the fixture manual before moving a real light.\n\n'
-                f'Mode used: {modes[0] if modes else "default"}\n{found}',
+                f'Mode used: {selected_mode}\n{found}',
                 parent=self,
             )
             self.log(f'Imported GDTF channels for {fixture.name}: {found}')

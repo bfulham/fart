@@ -1,6 +1,9 @@
 import math
 import struct
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 
 import fart
 
@@ -177,6 +180,40 @@ class ChannelTests(unittest.TestCase):
             'focus': 197,
             'focus fine': 198,
         })
+
+
+class GDTFImportTests(unittest.TestCase):
+    def make_gdtf(self):
+        xml = '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n    <DMXMode Name="Basic">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" /></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n    <DMXMode Name="Extended">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Shutter1"><ChannelFunction Name="Shutter closed" Attribute="Shutter1" DMXFrom="0/1" DMXTo="19/1"/><ChannelFunction Name="Shutter open" Attribute="Shutter1" DMXFrom="20/1" DMXTo="49/1"/><ChannelFunction Name="Strobe" Attribute="Shutter1" DMXFrom="50/1" DMXTo="200/1"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="2 3"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="14 15"><LogicalChannel Attribute="Zoom"><ChannelFunction Name="Zoom" Attribute="Zoom" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="16 17"><LogicalChannel Attribute="Focus"><ChannelFunction Name="Focus" Attribute="Focus" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="18 19"><LogicalChannel Attribute="Pan"><ChannelFunction Name="Pan" Attribute="Pan" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="20 21"><LogicalChannel Attribute="Tilt"><ChannelFunction Name="Tilt" Attribute="Tilt" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="13"><LogicalChannel Attribute="Iris"><ChannelFunction Name="Iris" Attribute="Iris" DMXFrom="0/1" DMXTo="191/1"/><ChannelFunction Name="Iris pulse effect" Attribute="Iris" DMXFrom="192/1" DMXTo="255/1"/></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n  </DMXModes>\n</FixtureType>\n'
+        tmp = tempfile.NamedTemporaryFile(suffix='.gdtf', delete=False)
+        tmp.close()
+        with zipfile.ZipFile(tmp.name, 'w') as zf:
+            zf.writestr('description.xml', xml)
+        return Path(tmp.name)
+
+    def test_gdtf_mode_selection_and_practical_values(self):
+        path = self.make_gdtf()
+        try:
+            modes = fart.list_gdtf_modes(path)
+            self.assertEqual(modes, ['Basic', 'Extended'])
+            mapping, _modes, selected = fart.import_gdtf_channel_mapping(path, start_address=101, preferred_mode='Extended')
+            self.assertEqual(selected, 'Extended')
+            self.assertEqual(mapping['shutter'], 101)
+            self.assertEqual(mapping['shutter_open'], 34)
+            self.assertEqual(mapping['dimmer'], 102)
+            self.assertEqual(mapping['dimmer_fine'], 103)
+            self.assertEqual(mapping['iris'], 113)
+            self.assertEqual(mapping['iris_100_dmx'], 191)
+            self.assertEqual(mapping['zoom'], 114)
+            self.assertEqual(mapping['zoom_fine'], 115)
+            self.assertEqual(mapping['focus'], 116)
+            self.assertEqual(mapping['focus_fine'], 117)
+            self.assertEqual(mapping['pan_coarse'], 118)
+            self.assertEqual(mapping['pan_fine'], 119)
+            self.assertEqual(mapping['tilt_coarse'], 120)
+            self.assertEqual(mapping['tilt_fine'], 121)
+        finally:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
