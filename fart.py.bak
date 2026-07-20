@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.7.3"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -1026,34 +1026,23 @@ class CalibrationWizard(tk.Toplevel):
         ('Centre at head height', 0.0, 0.0, 1.7),
     ]
 
-    def __init__(self, app, light_indices):
+    def __init__(self, app, light_index):
         super().__init__(app)
         self.app = app
-        if isinstance(light_indices, int):
-            light_indices = [light_indices]
-        self.light_indices = [int(i) for i in light_indices]
+        self.light_index = light_index
         self.title(f'{APP_SHORT_NAME} calibration wizard')
-        self.geometry('1050x760')
+        self.geometry('900x680')
         self.transient(app)
         self.protocol('WM_DELETE_WINDOW', self.close)
-        self.fixtures = {
-            idx: FixtureConfig(**asdict(app.settings.fixtures[idx]))
-            for idx in self.light_indices
-        }
+        self.fixture = FixtureConfig(**asdict(app.settings.fixtures[light_index]))
         self.targets = list(self.DEFAULT_TARGETS)
-        self.samples = {idx: [] for idx in self.light_indices}
+        self.samples = []
         self.output = None
         self.output_running = False
         self.current_target = tk.IntVar(value=0)
-        self.control_vars = {}
-        for idx, fixture in self.fixtures.items():
-            self.control_vars[idx] = {
-                'pan': tk.DoubleVar(value=(fixture.pan_min + fixture.pan_max) / 2.0),
-                'tilt': tk.DoubleVar(value=(fixture.tilt_min + fixture.tilt_max) / 2.0),
-                'level': tk.DoubleVar(value=0.15),
-                'zoom': tk.DoubleVar(value=float(getattr(app, 'zoom_value', 0.5))),
-                'iris': tk.DoubleVar(value=float(getattr(app, 'iris_value', 1.0))),
-            }
+        self.pan_var = tk.DoubleVar(value=(self.fixture.pan_min + self.fixture.pan_max) / 2.0)
+        self.tilt_var = tk.DoubleVar(value=(self.fixture.tilt_min + self.fixture.tilt_max) / 2.0)
+        self.level_var = tk.DoubleVar(value=0.15)
         self.status_var = tk.StringVar(value='Output stopped')
         self.solution_var = tk.StringVar(value='No solution yet')
         self.build_ui()
@@ -1063,15 +1052,14 @@ class CalibrationWizard(tk.Toplevel):
         intro = ttk.LabelFrame(self, text='Fixture-position calibration')
         intro.pack(fill='x', padx=10, pady=8)
         ttk.Label(intro, text=(
-            'Select a known XYZ point, then aim every selected fixture at that same point. '
-            'Use coarse faders plus fine buttons for accurate pan/tilt. Capture the point, repeat for several points, then solve.\n'
-            'Zoom and iris are available here so you can calibrate with a small, clean beam. Keep dimmer low while aiming.'
+            'Use these faders to point the selected light at known XYZ points. Capture the pan/tilt reading for each point.\n'
+            'The solver then triangulates optical-centre XYZ plus pan-zero and tilt-zero mapping. Keep the dimmer low.'
         ), justify='left').pack(anchor='w', padx=8, pady=8)
         body = ttk.Frame(self)
         body.pack(fill='both', expand=True, padx=10, pady=6)
         left = ttk.LabelFrame(body, text='Known points')
         left.pack(side='left', fill='y', padx=(0,8))
-        self.target_list = tk.Listbox(left, height=12, exportselection=False, width=34)
+        self.target_list = tk.Listbox(left, height=12, exportselection=False, width=32)
         self.target_list.pack(fill='both', expand=True, padx=6, pady=6)
         for name, x, y, z in self.targets:
             self.target_list.insert('end', f'{name}: X {x:g}, Y {y:g}, Z {z:g}')
@@ -1084,88 +1072,44 @@ class CalibrationWizard(tk.Toplevel):
             ttk.Label(custom, text=label).grid(row=row, column=0, sticky='w', padx=4, pady=2)
             ttk.Entry(custom, textvariable=var, width=10).grid(row=row, column=1, padx=4, pady=2)
         ttk.Button(custom, text='Add point', command=self.add_custom_point).grid(row=3, column=0, columnspan=2, sticky='ew', padx=4, pady=4)
-        ttk.Label(left, text='Tip: spread points across the area.\nUse left, right, upstage, downstage,\ncentre and at least one raised point.', justify='left').pack(anchor='w', padx=8, pady=8)
-
-        right = ttk.LabelFrame(body, text='Aim selected fixtures')
+        right = ttk.LabelFrame(body, text=f'Aim {self.fixture.name}')
         right.pack(side='left', fill='both', expand=True)
         self.target_label = ttk.Label(right, text='', font=('Segoe UI', 12, 'bold'))
         self.target_label.pack(anchor='w', padx=8, pady=8)
         self.update_target_label()
-
-        self.rows_frame = ttk.Frame(right)
-        self.rows_frame.pack(fill='both', expand=True, padx=8, pady=4)
-        header = ttk.Frame(self.rows_frame)
-        header.pack(fill='x')
-        for w, text in ((18, 'Fixture'), (36, 'Pan'), (36, 'Tilt'), (20, 'Dimmer'), (20, 'Zoom'), (20, 'Iris')):
-            ttk.Label(header, text=text, width=w).pack(side='left', padx=2)
-        self.readout_labels = {}
-        for idx in self.light_indices:
-            self.add_fixture_control_row(idx)
-
+        sliders = ttk.Frame(right)
+        sliders.pack(fill='x', padx=8, pady=6)
+        ttk.Label(sliders, text='Pan angle').grid(row=0, column=0, sticky='w')
+        ttk.Scale(sliders, from_=self.fixture.pan_min, to=self.fixture.pan_max, variable=self.pan_var, orient='horizontal').grid(row=0, column=1, sticky='ew', padx=6)
+        self.pan_readout = ttk.Label(sliders, width=10); self.pan_readout.grid(row=0, column=2)
+        ttk.Label(sliders, text='Tilt angle').grid(row=1, column=0, sticky='w')
+        ttk.Scale(sliders, from_=self.fixture.tilt_min, to=self.fixture.tilt_max, variable=self.tilt_var, orient='horizontal').grid(row=1, column=1, sticky='ew', padx=6)
+        self.tilt_readout = ttk.Label(sliders, width=10); self.tilt_readout.grid(row=1, column=2)
+        ttk.Label(sliders, text='Dimmer for aiming').grid(row=2, column=0, sticky='w')
+        ttk.Scale(sliders, from_=0.0, to=1.0, variable=self.level_var, orient='horizontal').grid(row=2, column=1, sticky='ew', padx=6)
+        self.level_readout = ttk.Label(sliders, width=10); self.level_readout.grid(row=2, column=2)
+        sliders.columnconfigure(1, weight=1)
         out_buttons = ttk.Frame(right); out_buttons.pack(fill='x', padx=8, pady=6)
         ttk.Button(out_buttons, text='Start calibration output', command=self.start_output).pack(side='left', padx=3)
         ttk.Button(out_buttons, text='Stop output / blackout', command=self.stop_output).pack(side='left', padx=3)
         ttk.Label(out_buttons, textvariable=self.status_var).pack(side='left', padx=12)
         cap_buttons = ttk.Frame(right); cap_buttons.pack(fill='x', padx=8, pady=8)
-        ttk.Button(cap_buttons, text='Capture point for all fixtures', command=self.capture).pack(side='left', padx=3)
-        ttk.Button(cap_buttons, text='Solve and apply all', command=self.solve_apply).pack(side='left', padx=3)
+        ttk.Button(cap_buttons, text='Capture this point', command=self.capture).pack(side='left', padx=3)
+        ttk.Button(cap_buttons, text='Solve and apply', command=self.solve_apply).pack(side='left', padx=3)
         ttk.Button(cap_buttons, text='Close', command=self.close).pack(side='left', padx=3)
-        self.sample_tree = ttk.Treeview(right, columns=('fixture','target','pan','tilt'), show='headings', height=9)
-        for col, text, width in (('fixture','Fixture',150), ('target','Captured point',300), ('pan','Pan',80), ('tilt','Tilt',80)):
-            self.sample_tree.heading(col, text=text); self.sample_tree.column(col, width=width, anchor='e' if col in ('pan','tilt') else 'w')
+        self.sample_tree = ttk.Treeview(right, columns=('target','pan','tilt'), show='headings', height=9)
+        for col, text, width in (('target','Captured point',300), ('pan','Pan',80), ('tilt','Tilt',80)):
+            self.sample_tree.heading(col, text=text); self.sample_tree.column(col, width=width, anchor='e' if col!='target' else 'w')
         self.sample_tree.pack(fill='both', expand=True, padx=8, pady=6)
         ttk.Label(right, textvariable=self.solution_var, justify='left').pack(anchor='w', padx=8, pady=6)
+        ttk.Label(right, text='Use spread-out points: left, right, upstage, downstage, centre, and a raised point if possible.', justify='left').pack(anchor='w', padx=8, pady=(0,8))
         self.update_readouts()
-
-    def add_fixture_control_row(self, idx):
-        fixture = self.fixtures[idx]
-        vars_ = self.control_vars[idx]
-        row = ttk.LabelFrame(self.rows_frame, text=fixture.name)
-        row.pack(fill='x', pady=3)
-        ttk.Label(row, text=fixture.name, width=18).pack(side='left', padx=2)
-        self._angle_control(row, idx, 'pan', fixture.pan_min, fixture.pan_max, 36).pack(side='left', fill='x', expand=True, padx=2)
-        self._angle_control(row, idx, 'tilt', fixture.tilt_min, fixture.tilt_max, 36).pack(side='left', fill='x', expand=True, padx=2)
-        self._simple_control(row, idx, 'level', 0.0, 1.0, 20).pack(side='left', padx=2)
-        self._simple_control(row, idx, 'zoom', 0.0, 1.0, 20).pack(side='left', padx=2)
-        self._simple_control(row, idx, 'iris', 0.0, 1.0, 20).pack(side='left', padx=2)
-
-    def _angle_control(self, parent, idx, key, low, high, width):
-        box = ttk.Frame(parent, width=width*6)
-        scale = ttk.Scale(box, from_=low, to=high, variable=self.control_vars[idx][key], orient='horizontal')
-        scale.pack(fill='x', expand=True)
-        buttons = ttk.Frame(box); buttons.pack(fill='x')
-        for delta in (-1.0, -0.1, 0.1, 1.0):
-            ttk.Button(buttons, text=f'{delta:+g}', width=4, command=lambda d=delta, i=idx, k=key: self.nudge_angle(i, k, d)).pack(side='left', padx=1)
-        lbl = ttk.Label(buttons, width=9)
-        lbl.pack(side='right')
-        self.readout_labels[(idx, key)] = lbl
-        return box
-
-    def _simple_control(self, parent, idx, key, low, high, width):
-        box = ttk.Frame(parent, width=width*6)
-        ttk.Scale(box, from_=low, to=high, variable=self.control_vars[idx][key], orient='horizontal').pack(fill='x', expand=True)
-        lbl = ttk.Label(box, width=8)
-        lbl.pack(anchor='e')
-        self.readout_labels[(idx, key)] = lbl
-        return box
-
-    def nudge_angle(self, idx, key, delta):
-        fixture = self.fixtures[idx]
-        var = self.control_vars[idx][key]
-        if key == 'pan':
-            low, high = fixture.pan_min, fixture.pan_max
-        else:
-            low, high = fixture.tilt_min, fixture.tilt_max
-        var.set(clamp(var.get() + delta, low, high))
 
     def update_readouts(self):
         if self.winfo_exists():
-            for idx in self.light_indices:
-                vars_ = self.control_vars[idx]
-                for key in ('pan', 'tilt'):
-                    self.readout_labels[(idx, key)].configure(text=f'{vars_[key].get():.2f}°')
-                for key in ('level', 'zoom', 'iris'):
-                    self.readout_labels[(idx, key)].configure(text=f'{vars_[key].get()*100:.0f}%')
+            self.pan_readout.configure(text=f'{self.pan_var.get():.2f}°')
+            self.tilt_readout.configure(text=f'{self.tilt_var.get():.2f}°')
+            self.level_readout.configure(text=f'{self.level_var.get()*100:.0f}%')
             self.after(80, self.update_readouts)
 
     def target_selected(self, _event=None):
@@ -1175,7 +1119,7 @@ class CalibrationWizard(tk.Toplevel):
 
     def update_target_label(self):
         name, x, y, z = self.targets[self.current_target.get()]
-        self.target_label.configure(text=f'Aim all fixtures at: {name}   X {x:g}, Y {y:g}, Z {z:g}')
+        self.target_label.configure(text=f'Aim at: {name}   X {x:g}, Y {y:g}, Z {z:g}')
 
     def add_custom_point(self):
         try:
@@ -1190,8 +1134,7 @@ class CalibrationWizard(tk.Toplevel):
             messagebox.showerror(APP_NAME, 'Stop the main FART output before calibration output.', parent=self); return
         try:
             settings = self.app.collect()
-            for idx in self.light_indices:
-                self.fixtures[idx] = FixtureConfig(**asdict(settings.fixtures[idx]))
+            self.fixture = FixtureConfig(**asdict(settings.fixtures[self.light_index]))
             self.output = self.app.make_output(settings)
             self.output_running = True
             self.status_var.set('Calibration output running')
@@ -1212,11 +1155,8 @@ class CalibrationWizard(tk.Toplevel):
         if self.output_running and self.output:
             try:
                 frame = bytearray(512)
-                for idx in self.light_indices:
-                    fixture = self.fixtures[idx]
-                    vars_ = self.control_vars[idx]
-                    write_fixture_to_frame(frame, fixture, vars_['pan'].get(), vars_['tilt'].get(), vars_['level'].get(), False,
-                                           vars_['zoom'].get(), vars_['iris'].get(), self.app.focus_value)
+                write_fixture_to_frame(frame, self.fixture, self.pan_var.get(), self.tilt_var.get(), self.level_var.get(), False,
+                                       self.app.zoom_value, self.app.iris_value, self.app.focus_value)
                 self.output.send(bytes(frame))
             except Exception as exc:
                 self.status_var.set('Output error: ' + str(exc)); self.output_running = False
@@ -1225,32 +1165,25 @@ class CalibrationWizard(tk.Toplevel):
 
     def capture(self):
         name, x, y, z = self.targets[self.current_target.get()]
-        for idx in self.light_indices:
-            vars_ = self.control_vars[idx]
-            sample = (x, y, z, float(vars_['pan'].get()), float(vars_['tilt'].get()))
-            self.samples[idx].append(sample)
-            self.sample_tree.insert('', 'end', values=(self.fixtures[idx].name, f'{name} ({x:g}, {y:g}, {z:g})', f'{sample[3]:.3f}', f'{sample[4]:.3f}'))
-        counts = ', '.join(f'{self.fixtures[idx].name}: {len(self.samples[idx])}' for idx in self.light_indices)
-        self.solution_var.set(f'Captured point for all selected fixtures. Samples: {counts}. Capture at least 4 per fixture, preferably 5–6.')
+        sample = (x, y, z, float(self.pan_var.get()), float(self.tilt_var.get()))
+        self.samples.append(sample)
+        self.sample_tree.insert('', 'end', values=(f'{name} ({x:g}, {y:g}, {z:g})', f'{sample[3]:.3f}', f'{sample[4]:.3f}'))
+        self.solution_var.set(f'{len(self.samples)} point(s) captured. Capture at least 4, preferably 5–6.')
 
     def solve_apply(self):
         try:
-            messages = []
-            first_index = self.light_indices[0]
-            for idx in self.light_indices:
-                solved, rms = solve_fixture_calibration(self.fixtures[idx], self.samples[idx])
-                self.app.settings.fixtures[idx] = solved
-                self.app.insert_or_update_light_row(idx, solved)
-                messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, RMS={rms:.3f}°')
-                self.app.log('Calibration applied to ' + messages[-1])
-            self.app.rebuild_light_tree(first_index)
-            self.app.load_light_editor(first_index)
-            self.solution_var.set('Applied solutions:\n' + '\n'.join(messages))
+            solved, rms = solve_fixture_calibration(self.fixture, self.samples)
+            self.app.settings.fixtures[self.light_index] = solved
+            self.app.rebuild_light_tree(self.light_index)
+            self.app.load_light_editor(self.light_index)
+            self.app.log(f'Calibration applied to {solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, RMS={rms:.3f}°')
+            self.solution_var.set(f'Applied: XYZ {solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}; pan zero {solved.pan_zero_bearing:.3f}°, tilt zero {solved.tilt_zero_elevation:.3f}°; RMS {rms:.3f}°')
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc), parent=self)
 
     def close(self):
         self.stop_output(); self.destroy()
+
 
 
 class App(tk.Tk):
@@ -1582,7 +1515,7 @@ class App(tk.Tk):
         list_frame.pack(side='left', fill='y', padx=8, pady=8)
         self.light_tree = ttk.Treeview(
             list_frame, columns=('enabled', 'marker', 'position', 'channels'), show='tree headings',
-            selectmode='extended', height=22
+            selectmode='browse', height=22
         )
         self.light_tree.heading('#0', text='Name')
         self.light_tree.heading('enabled', text='On')
@@ -1718,7 +1651,7 @@ class App(tk.Tk):
         ttk.Label(
             calibration,
             text='Keep the lamp/shutter closed. Put the marker at a known point, start output, and verify each light separately.\n'
-                 'Select one or more lights on the Lights tab. The wizard can calibrate all selected lights against the same target points.',
+                 'The buttons below affect only the light selected on the Lights tab.',
             justify='left'
         ).grid(row=1, column=0, columnspan=4, sticky='w', padx=8, pady=8)
         ttk.Button(calibration, text='Open fixture calibration wizard', command=self.open_calibration_wizard).grid(
@@ -2215,37 +2148,17 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
-    def selected_light_indices(self):
-        selection = self.light_tree.selection() if hasattr(self, 'light_tree') else ()
-        indices = []
-        for item in selection:
-            try:
-                idx = int(item)
-            except ValueError:
-                continue
-            if 0 <= idx < len(self.settings.fixtures):
-                indices.append(idx)
-        if not indices:
-            indices = [self.selected_light_index]
-        return sorted(set(indices))
-
     def open_calibration_wizard(self):
         try:
             if not self.apply_selected_light(silent=True):
                 raise ValueError('Fix the selected light settings before calibration')
-            indices = self.selected_light_indices()
-            for idx in indices:
-                fixture = self.settings.fixtures[idx]
-                try:
-                    self.require_calibration_dmx(fixture)
-                except ValueError:
-                    self.selected_light_index = idx
-                    self.light_tree.selection_set(str(idx))
-                    self.light_tree.focus(str(idx))
-                    self.load_light_editor(idx)
-                    DMXSetupDialog(self, idx, on_complete=self.open_calibration_wizard)
-                    return
-            CalibrationWizard(self, indices)
+            fixture = self.settings.fixtures[self.selected_light_index]
+            try:
+                self.require_calibration_dmx(fixture)
+            except ValueError:
+                DMXSetupDialog(self, self.selected_light_index, on_complete=self.open_calibration_wizard)
+                return
+            CalibrationWizard(self, self.selected_light_index)
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 

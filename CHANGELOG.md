@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+
+- Added zoom and iris controls to the calibration wizard so users can aim with a tighter beam.
+- Added fine pan/tilt nudge controls for accurate calibration aiming.
+- Added multi-fixture calibration: select multiple lights, aim all of them at the same target point, capture, then solve all selected fixture positions at once.
+- Changed the Lights list to support multi-select for calibration.
+
 ## 0.7.3
 
 - GDTF import now prompts for the fixture DMX mode instead of always using the first mode in the file.

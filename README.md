@@ -17,6 +17,9 @@ It supports:
 - ENTTEC Open DMX USB, Art-Net, and sACN output
 - 8-bit or 16-bit dimmer mapping
 - Live shared zoom, iris, and focus controls with optional 16-bit zoom/focus output
+- Calibration wizard zoom and iris controls for small-beam aiming
+- Coarse and fine pan/tilt calibration controls
+- Multi-fixture calibration against the same set of known points
 - Tracking-loss blackout and explicit dimmer arming
 - Multi-light overview table and lightweight interactive 3D preview
 - Configuration import/export through JSON
@@ -31,7 +34,9 @@ Calibration now starts with DMX setup. FART asks for pan, tilt, dimmer, and opti
 
 When adding a fixture, FART now asks whether to set it up manually or calibrate it. Manual setup is the existing workflow: type the fixture XYZ position, zero bearings, directions, trims, limits, and DMX channels yourself.
 
-Calibration mode is intended for users who do not know the fixture's exact installed position. It opens a wizard with pan and tilt faders. Aim the real or visualised light at several known stage points, such as `(5, 0, 0)`, `(-5, 0, 0)`, `(0, 0, 0)`, upstage/downstage points, and a raised point. Capture the pan/tilt reading for each point, then solve. FART estimates the fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation.
+Calibration mode is intended for users who do not know the fixture's exact installed position. It opens a wizard with pan, tilt, dimmer, zoom and iris controls. Use the zoom and iris controls to make a small beam, then use the pan/tilt faders plus the fine nudge buttons to aim accurately at several known stage points, such as `(5, 0, 0)`, `(-5, 0, 0)`, `(0, 0, 0)`, upstage/downstage points, and a raised point. Capture the pan/tilt reading for each point, then solve. FART estimates the fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation.
+
+Multiple fixtures can be calibrated together: select several lights in the Lights tab, open calibration, choose one known point, aim every selected fixture at that same point, capture, then repeat. Solve and apply will calculate each selected light independently from the shared point list.
 
 The old "set current bearing/elevation as zero" buttons have been removed because they were easy to misunderstand.
 
