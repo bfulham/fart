@@ -21,7 +21,7 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(bearing, 0.0, places=6)
         self.assertAlmostEqual(elevation, -26.565051, places=5)
         self.assertAlmostEqual(pan, 0.0, places=6)
-        self.assertAlmostEqual(tilt, elevation, places=6)
+        self.assertAlmostEqual(tilt, -elevation, places=6)
         self.assertAlmostEqual(distance, math.sqrt(31.25), places=6)
 
     def test_marker_stage_right(self):

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2
+
+- Fixed calibration dialogs calling the old light-editor method name.
+- Added zoom, iris, focus, and iris 100% DMX point fields to the DMX setup wizard.
+- Changed new-fixture default tilt direction to -1 to match common moving-head tilt behaviour.
+- Added basic GDTF channel import for pan, tilt, dimmer, shutter, zoom, iris, and focus setup.
+- Capped iris output at a configurable DMX value so 100% can avoid effect ranges above the usable iris band.
+
 ## 0.7.1 - 2026-07-20
 
 - Calibration now requires DMX setup first.

@@ -202,3 +202,8 @@ Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feat
 ## Licence
 
 FART is released under the [MIT License](LICENSE).
+
+
+### GDTF channel import
+
+FART can import a basic DMX channel map from a `.gdtf` fixture file. Use it as a setup helper only: always verify the imported channel offsets against the fixture manual before moving real fixtures. Complex GDTF personalities may still need manual correction.

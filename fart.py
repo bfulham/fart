@@ -21,12 +21,14 @@ import struct
 import sys
 import threading
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -77,7 +79,7 @@ class FixtureConfig:
     pan_zero_bearing: float = 0.0
     tilt_zero_elevation: float = 0.0
     pan_direction: int = 1
-    tilt_direction: int = 1
+    tilt_direction: int = -1
     pan_offset: float = 0.0
     tilt_offset: float = 0.0
 
@@ -102,6 +104,7 @@ class FixtureConfig:
     zoom: int = 0
     zoom_fine: int = 0
     iris: int = 0
+    iris_100_dmx: int = 255
     focus: int = 0
     focus_fine: int = 0
     zoom_reverse: bool = False
@@ -485,6 +488,125 @@ def fixture_channels(fixture: FixtureConfig):
     }
 
 
+
+def _strip_ns(tag):
+    return tag.split('}', 1)[-1] if '}' in tag else tag
+
+
+def _xml_attr(node, name, default=''):
+    # GDTF files vary in case and namespace handling between tools. Keep this forgiving.
+    for key, value in node.attrib.items():
+        if key.lower() == name.lower():
+            return value
+    return default
+
+
+def _parse_gdtf_offsets(value):
+    if not value:
+        return []
+    text = str(value).replace('{', '').replace('}', '').replace(',', ' ')
+    out = []
+    for part in text.split():
+        try:
+            out.append(int(part))
+        except Exception:
+            pass
+    return out
+
+
+def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
+    """Best-effort GDTF DMX attribute extraction.
+
+    Returns (mapping, mode_names). Mapping values are absolute one-based DMX slots.
+    This intentionally covers common GDTF files; complex virtual channels may still
+    need manual checking against the fixture manual.
+    """
+    with zipfile.ZipFile(path, 'r') as zf:
+        names = zf.namelist()
+        desc_name = next((n for n in names if n.lower().endswith('description.xml')), None)
+        if not desc_name:
+            raise ValueError('No description.xml found in the GDTF file')
+        root = ET.fromstring(zf.read(desc_name))
+
+    modes = [node for node in root.iter() if _strip_ns(node.tag) == 'DMXMode']
+    mode_names = [_xml_attr(m, 'Name', f'Mode {i+1}') for i, m in enumerate(modes)]
+    if not modes:
+        raise ValueError('No DMXMode entries found in the GDTF file')
+    mode = modes[0]
+    if preferred_mode:
+        for candidate in modes:
+            if _xml_attr(candidate, 'Name', '').lower() == preferred_mode.lower():
+                mode = candidate
+                break
+
+    def classify(attr):
+        a = attr.lower().replace('_', '').replace('-', '').replace(' ', '')
+        if 'pan' in a and 'tilt' not in a:
+            return 'pan'
+        if 'tilt' in a:
+            return 'tilt'
+        if 'dimmer' in a or 'intensity' in a:
+            return 'dimmer'
+        if 'shutter' in a or 'strobe' in a:
+            return 'shutter'
+        if 'zoom' in a:
+            return 'zoom'
+        if 'iris' in a:
+            return 'iris'
+        if 'focus' in a:
+            return 'focus'
+        return None
+
+    found = {}
+    for dmx_channel in mode.iter():
+        if _strip_ns(dmx_channel.tag) != 'DMXChannel':
+            continue
+        offsets = _parse_gdtf_offsets(_xml_attr(dmx_channel, 'Offset', ''))
+        if not offsets:
+            continue
+        attr_names = []
+        attr_names.append(_xml_attr(dmx_channel, 'Attribute', ''))
+        for child in dmx_channel.iter():
+            if child is dmx_channel:
+                continue
+            attr_names.append(_xml_attr(child, 'Attribute', ''))
+            attr_names.append(_xml_attr(child, 'Name', ''))
+        kind = None
+        for name in attr_names:
+            kind = classify(name)
+            if kind:
+                break
+        if not kind or kind in found:
+            continue
+        abs_offsets = [int(start_address) + off - 1 for off in offsets]
+        if kind == 'pan':
+            found['pan_coarse'] = abs_offsets[0]
+            if len(abs_offsets) > 1:
+                found['pan_fine'] = abs_offsets[1]
+        elif kind == 'tilt':
+            found['tilt_coarse'] = abs_offsets[0]
+            if len(abs_offsets) > 1:
+                found['tilt_fine'] = abs_offsets[1]
+        elif kind == 'dimmer':
+            found['dimmer'] = abs_offsets[0]
+            if len(abs_offsets) > 1:
+                found['dimmer_fine'] = abs_offsets[1]
+        elif kind == 'shutter':
+            found['shutter'] = abs_offsets[0]
+        elif kind == 'zoom':
+            found['zoom'] = abs_offsets[0]
+            if len(abs_offsets) > 1:
+                found['zoom_fine'] = abs_offsets[1]
+        elif kind == 'iris':
+            found['iris'] = abs_offsets[0]
+        elif kind == 'focus':
+            found['focus'] = abs_offsets[0]
+            if len(abs_offsets) > 1:
+                found['focus_fine'] = abs_offsets[1]
+    if not found:
+        raise ValueError('No usable pan/tilt/dimmer/beam channels were found in that GDTF mode')
+    return found, mode_names
+
 def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5):
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
     tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
@@ -519,7 +641,16 @@ def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5,
             values.append((fine_channel, fine))
 
     add_parameter(fixture.zoom, fixture.zoom_fine, zoom, fixture.zoom_reverse)
-    add_parameter(fixture.iris, 0, iris, fixture.iris_reverse)
+
+    # Iris is intentionally capped by a per-fixture "100%" DMX point.
+    # Many fixtures put iris effects/macros above the useful manual iris range.
+    if fixture.iris:
+        iris_fraction = clamp(float(iris), 0.0, 1.0)
+        if fixture.iris_reverse:
+            iris_fraction = 1.0 - iris_fraction
+        iris_cap = int(clamp(getattr(fixture, 'iris_100_dmx', 255), 0, 255))
+        values.append((fixture.iris, round(iris_fraction * iris_cap)))
+
     add_parameter(fixture.focus, fixture.focus_fine, focus, fixture.focus_reverse)
 
     for channel, value in values:
@@ -615,6 +746,12 @@ class DMXSetupDialog(tk.Toplevel):
         ('dimmer_fine', 'Dimmer fine', False),
         ('shutter', 'Shutter', False),
         ('shutter_open', 'Shutter open value', False),
+        ('zoom', 'Zoom coarse', False),
+        ('zoom_fine', 'Zoom fine', False),
+        ('iris', 'Iris', False),
+        ('iris_100_dmx', 'Iris 100% DMX', False),
+        ('focus', 'Focus coarse', False),
+        ('focus_fine', 'Focus fine', False),
     ]
 
     def __init__(self, app, light_index, on_complete=None):
@@ -624,7 +761,7 @@ class DMXSetupDialog(tk.Toplevel):
         self.on_complete = on_complete
         self.fixture = FixtureConfig(**asdict(app.settings.fixtures[light_index]))
         self.title(f'{APP_SHORT_NAME} DMX setup')
-        self.geometry('520x430')
+        self.geometry('560x650')
         self.transient(app)
         self.grab_set()
         self.vars = {}
@@ -651,11 +788,40 @@ class DMXSetupDialog(tk.Toplevel):
             self.vars[field] = var
             ttk.Entry(frame, textvariable=var, width=10).grid(row=row, column=1, sticky='w', padx=8, pady=4)
         ttk.Label(frame, text='* Required for calibration. Use 0 to disable optional channels.').grid(row=len(self.CHANNEL_FIELDS), column=0, columnspan=2, sticky='w', padx=8, pady=8)
+        ttk.Button(frame, text='Import channels from GDTF…', command=self.import_gdtf).grid(row=len(self.CHANNEL_FIELDS)+1, column=0, columnspan=2, sticky='ew', padx=8, pady=(0, 8))
 
         buttons = ttk.Frame(self)
         buttons.pack(fill='x', padx=10, pady=(0, 10))
         ttk.Button(buttons, text='Save DMX and continue', command=self.save_continue).pack(side='right', padx=4)
         ttk.Button(buttons, text='Cancel', command=self.destroy).pack(side='right', padx=4)
+
+    def import_gdtf(self):
+        try:
+            path = filedialog.askopenfilename(
+                title='Select GDTF fixture file',
+                filetypes=[('GDTF fixture', '*.gdtf'), ('Zip files', '*.zip'), ('All files', '*.*')],
+                parent=self,
+            )
+            if not path:
+                return
+            start = simpledialog.askinteger(
+                APP_NAME,
+                'Fixture start DMX address?\n\nExample: for patch 1.101 enter 101.',
+                initialvalue=max(1, min([int(v.get()) for k, v in self.vars.items() if k != 'shutter_open' and int(v.get()) > 0] or [1])),
+                minvalue=1,
+                maxvalue=512,
+                parent=self,
+            )
+            if not start:
+                return
+            mapping, modes = import_gdtf_channel_mapping(path, start)
+            for field, channel in mapping.items():
+                if field in self.vars:
+                    self.vars[field].set(int(channel))
+            found = ', '.join(f'{k}={v}' for k, v in mapping.items())
+            messagebox.showinfo(APP_NAME, f'Imported GDTF channel mapping. Check it against the manual.\n\nMode used: {modes[0] if modes else "default"}\n{found}', parent=self)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
 
     def save_continue(self):
         try:
@@ -670,7 +836,7 @@ class DMXSetupDialog(tk.Toplevel):
             self.app.validate_channel_conflicts(fixtures)
             self.app.settings.fixtures[self.light_index] = fixture
             self.app.rebuild_light_tree(self.light_index)
-            self.app.load_light_to_editor(self.light_index)
+            self.app.load_light_editor(self.light_index)
             self.app.apply_selected_light(silent=True)
             self.app.log(f'DMX channels set for {fixture.name}; calibration can now start')
             self.destroy()
@@ -839,7 +1005,7 @@ class CalibrationWizard(tk.Toplevel):
             solved, rms = solve_fixture_calibration(self.fixture, self.samples)
             self.app.settings.fixtures[self.light_index] = solved
             self.app.rebuild_light_tree(self.light_index)
-            self.app.load_light_to_editor(self.light_index)
+            self.app.load_light_editor(self.light_index)
             self.app.log(f'Calibration applied to {solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, RMS={rms:.3f}°')
             self.solution_var.set(f'Applied: XYZ {solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}; pan zero {solved.pan_zero_bearing:.3f}°, tilt zero {solved.tilt_zero_elevation:.3f}°; RMS {rms:.3f}°')
         except Exception as exc:
@@ -906,6 +1072,7 @@ class App(tk.Tk):
         'zoom': int,
         'zoom_fine': int,
         'iris': int,
+        'iris_100_dmx': int,
         'focus': int,
         'focus_fine': int,
         'zoom_reverse': bool,
@@ -1246,10 +1413,13 @@ class App(tk.Tk):
             ('Dimmer coarse', 'dimmer'), ('Dimmer fine', 'dimmer_fine'),
             ('Shutter', 'shutter'), ('Shutter open value', 'shutter_open'),
             ('Zoom coarse', 'zoom'), ('Zoom fine', 'zoom_fine'),
-            ('Iris', 'iris'), ('Focus coarse', 'focus'), ('Focus fine', 'focus_fine'),
+            ('Iris', 'iris'), ('Iris 100% DMX', 'iris_100_dmx'), ('Focus coarse', 'focus'), ('Focus fine', 'focus_fine'),
         ]
         for row, (label, name) in enumerate(channel_fields):
             self.add_light_entry(channels, row, label, name, int)
+        ttk.Button(channels, text='Import channels from GDTF…', command=self.import_gdtf_for_selected_light).grid(
+            row=len(channel_fields), column=0, columnspan=2, sticky='ew', padx=4, pady=(10, 4)
+        )
 
         direction_box = ttk.LabelFrame(dmx_page, text='Beam control direction')
         direction_box.pack(side='left', fill='y', padx=8, pady=8)
@@ -1526,6 +1696,8 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: intensity scale cannot be negative')
         if not 0 <= fixture.shutter_open <= 255:
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
+        if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
+            raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
         if fixture.enabled and (fixture.pan_coarse == 0 or fixture.tilt_coarse == 0):
             raise ValueError(f'{fixture.name}: enabled lights require pan coarse and tilt coarse channels')
         if fixture.pan_fine and not fixture.pan_coarse:
@@ -1727,6 +1899,47 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
+
+    def import_gdtf_for_selected_light(self):
+        try:
+            if not self.apply_selected_light(silent=True):
+                raise ValueError('Fix the selected light settings before importing GDTF channels')
+            fixture = self.settings.fixtures[self.selected_light_index]
+            path = filedialog.askopenfilename(
+                title='Select GDTF fixture file',
+                filetypes=[('GDTF fixture', '*.gdtf'), ('Zip files', '*.zip'), ('All files', '*.*')]
+            )
+            if not path:
+                return
+            start = simpledialog.askinteger(
+                APP_NAME,
+                'Fixture start DMX address?\n\nExample: for patch 1.101 enter 101.',
+                initialvalue=max(1, min([ch for ch in fixture_channels(fixture).values() if ch > 0] or [1])),
+                minvalue=1,
+                maxvalue=512,
+                parent=self,
+            )
+            if not start:
+                return
+            mapping, modes = import_gdtf_channel_mapping(path, start)
+            for field, channel in mapping.items():
+                if field in self.light_vars:
+                    self.light_vars[field].set(channel)
+                    setattr(fixture, field, channel)
+            self.settings.fixtures[self.selected_light_index] = fixture
+            self.insert_or_update_light_row(self.selected_light_index, fixture)
+            found = ', '.join(f'{k}={v}' for k, v in mapping.items())
+            messagebox.showinfo(
+                APP_NAME,
+                'Imported GDTF channel mapping.\n\n'
+                'Check these against the fixture manual before moving a real light.\n\n'
+                f'Mode used: {modes[0] if modes else "default"}\n{found}',
+                parent=self,
+            )
+            self.log(f'Imported GDTF channels for {fixture.name}: {found}')
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+
     def require_calibration_dmx(self, fixture):
         missing = []
         if int(fixture.pan_coarse) <= 0:
@@ -1743,12 +1956,15 @@ class App(tk.Tk):
             ('pan coarse', fixture.pan_coarse), ('pan fine', fixture.pan_fine),
             ('tilt coarse', fixture.tilt_coarse), ('tilt fine', fixture.tilt_fine),
             ('dimmer coarse', fixture.dimmer), ('dimmer fine', fixture.dimmer_fine),
-            ('shutter', fixture.shutter),
+            ('shutter', fixture.shutter), ('zoom coarse', fixture.zoom), ('zoom fine', fixture.zoom_fine),
+            ('iris', fixture.iris), ('focus coarse', fixture.focus), ('focus fine', fixture.focus_fine),
         ):
             if not 0 <= int(channel) <= 512:
                 raise ValueError(f'{fixture.name}: {label} channel must be 0–512')
         if not 0 <= int(fixture.shutter_open) <= 255:
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
+        if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
+            raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
         return True
 
     def open_dmx_setup_then_calibration(self):
