@@ -2,6 +2,8 @@
 
 **Fixture Aiming and Remote Tracking**
 
+Version 1.0.0 is a cleaned-up production baseline with the same tested functionality as the 0.x prototypes, a tidier UI layout, safer startup checks, improved documentation, and a clean GitHub repository structure.
+
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
@@ -39,6 +41,15 @@ Calibration mode is intended for users who do not know the fixture's exact insta
 Multiple fixtures can be calibrated together: select several lights in the Lights tab, open calibration, choose one known point, aim every selected fixture at that same point, capture, then repeat. Solve and apply will calculate each selected light independently from the shared point list.
 
 The old "set current bearing/elevation as zero" buttons have been removed because they were easy to misunderstand.
+
+## Recommended workflow
+
+1. Configure output first: Art-Net, sACN, or Open DMX.
+2. Add or import a fixture profile and confirm DMX channels.
+3. Calibrate manually or with the multi-fixture calibration wizard.
+4. Auto-detect PSN trackers.
+5. Assign markers per light.
+6. Test with dimmers locked, then arm output only when movement is correct.
 
 ## Quick start
 

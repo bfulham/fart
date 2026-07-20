@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0 - Production baseline
+
+- Rebuilt the repository as a clean GitHub-ready release with no generated caches or prototype leftovers.
+- Kept existing tested functionality: PSN marker tracking, per-light marker assignment, multi-light aiming, manual/OSC/Art-Net fader modes, Art-Net/sACN/Open DMX output, GDTF import, beam controls, and multi-fixture calibration.
+- Polished the UI spacing, window sizing, notebook tabs, and labelframe/table styling.
+- Retained backwards-compatible settings migration from earlier FART/OpenFollow Followspot configurations.
+- Re-ran the geometry, PSN, DMX, calibration, and GDTF importer test suite.
+
 ## 0.8.0
 
 - Added zoom and iris controls to the calibration wizard so users can aim with a tighter beam.

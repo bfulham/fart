@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "1.0.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -1320,8 +1320,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(WINDOW_TITLE)
-        self.geometry('1120x780')
-        self.minsize(1000, 700)
+        self.geometry('1240x820')
+        self.minsize(1120, 760)
+        self.configure_theme()
 
         self.settings = self.load_settings()
         self.trackers = TrackerBank()
@@ -1350,6 +1351,28 @@ class App(tk.Tk):
         self.populate()
         self.after(100, self.ui_tick)
         self.protocol('WM_DELETE_WINDOW', self.on_close)
+
+
+    def configure_theme(self):
+        """Apply a calm, higher-contrast ttk theme without external assets."""
+        try:
+            style = ttk.Style(self)
+            if 'vista' in style.theme_names():
+                style.theme_use('vista')
+            elif 'clam' in style.theme_names():
+                style.theme_use('clam')
+            default_font = ('Segoe UI', 9)
+            heading_font = ('Segoe UI', 9, 'bold')
+            self.option_add('*Font', default_font)
+            style.configure('TNotebook.Tab', padding=(14, 7))
+            style.configure('TLabelframe', padding=(8, 6))
+            style.configure('TLabelframe.Label', font=heading_font)
+            style.configure('Treeview', rowheight=24)
+            style.configure('Treeview.Heading', font=heading_font)
+            style.configure('Danger.TButton', padding=(8, 5))
+            style.configure('Primary.TButton', padding=(8, 5))
+        except Exception:
+            pass
 
     def load_settings(self):
         source_path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
@@ -1435,11 +1458,11 @@ class App(tk.Tk):
     def build_ui(self):
         header = ttk.Frame(self)
         header.pack(fill='x', padx=12, pady=(10, 0))
-        ttk.Label(header, text='FART', font=('Segoe UI', 20, 'bold')).pack(side='left')
+        ttk.Label(header, text='FART', font=('Segoe UI', 22, 'bold')).pack(side='left')
         ttk.Label(
-            header, text='  Fixture Aiming and Remote Tracking',
+            header, text='  Fixture Aiming and Remote Tracking — PSN to DMX followspot control',
             font=('Segoe UI', 11)
-        ).pack(side='left', anchor='s', pady=(0, 4))
+        ).pack(side='left', anchor='s', pady=(0, 5))
         ttk.Label(header, text=f'v{APP_VERSION}').pack(side='right', anchor='s', pady=(0, 4))
 
         notebook = ttk.Notebook(self)
