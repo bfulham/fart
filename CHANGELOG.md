@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-07-20
+
+- Calibration now requires DMX setup first.
+- Added a DMX setup dialog before calibration so pan, tilt, dimmer, and optional shutter channels are confirmed before any calibration output can start.
+- Starting calibration on an incomplete fixture now opens DMX setup instead of the pan/tilt aiming wizard.
+
 ## 0.7.0 - 2026-07-20
 
 - Replaced confusing set-zero calibration buttons with a fixture calibration wizard.

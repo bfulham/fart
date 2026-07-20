@@ -26,6 +26,9 @@ It supports:
 
 ### Fixture calibration wizard
 
+Calibration now starts with DMX setup. FART asks for pan, tilt, dimmer, and optional shutter channels before the aiming faders are shown, because the calibration faders directly drive the selected fixture.
+
+
 When adding a fixture, FART now asks whether to set it up manually or calibrate it. Manual setup is the existing workflow: type the fixture XYZ position, zero bearings, directions, trims, limits, and DMX channels yourself.
 
 Calibration mode is intended for users who do not know the fixture's exact installed position. It opens a wizard with pan and tilt faders. Aim the real or visualised light at several known stage points, such as `(5, 0, 0)`, `(-5, 0, 0)`, `(0, 0, 0)`, upstage/downstage points, and a raised point. Capture the pan/tilt reading for each point, then solve. FART estimates the fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation.

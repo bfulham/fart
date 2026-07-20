@@ -26,7 +26,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -600,6 +600,84 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
     solved.pan_offset = 0.0
     solved.tilt_offset = 0.0
     return solved, math.sqrt(best_loss)
+
+
+
+class DMXSetupDialog(tk.Toplevel):
+    """Collect the minimum DMX mapping required before live calibration."""
+
+    CHANNEL_FIELDS = [
+        ('pan_coarse', 'Pan coarse', True),
+        ('pan_fine', 'Pan fine', False),
+        ('tilt_coarse', 'Tilt coarse', True),
+        ('tilt_fine', 'Tilt fine', False),
+        ('dimmer', 'Dimmer coarse', True),
+        ('dimmer_fine', 'Dimmer fine', False),
+        ('shutter', 'Shutter', False),
+        ('shutter_open', 'Shutter open value', False),
+    ]
+
+    def __init__(self, app, light_index, on_complete=None):
+        super().__init__(app)
+        self.app = app
+        self.light_index = light_index
+        self.on_complete = on_complete
+        self.fixture = FixtureConfig(**asdict(app.settings.fixtures[light_index]))
+        self.title(f'{APP_SHORT_NAME} DMX setup')
+        self.geometry('520x430')
+        self.transient(app)
+        self.grab_set()
+        self.vars = {}
+        self.build_ui()
+
+    def build_ui(self):
+        intro = ttk.LabelFrame(self, text='DMX setup before calibration')
+        intro.pack(fill='x', padx=10, pady=8)
+        ttk.Label(intro, text=(
+            'Calibration faders drive the real fixture, so FART needs the fixture DMX channels first.\n'
+            'Set at least pan coarse, tilt coarse, and dimmer. Fine channels and shutter are optional but recommended.'
+        ), justify='left').pack(anchor='w', padx=8, pady=8)
+
+        out = ttk.LabelFrame(self, text='Output currently selected')
+        out.pack(fill='x', padx=10, pady=5)
+        ttk.Label(out, text=f'Output: {self.app.vars["output"].get()}   Universe: {self.app.vars["universe"].get()}').pack(anchor='w', padx=8, pady=6)
+        ttk.Label(out, text='Change Art-Net/sACN/Open DMX output settings on the Setup tab before starting calibration output.').pack(anchor='w', padx=8, pady=(0, 6))
+
+        frame = ttk.LabelFrame(self, text=f'Channels for {self.fixture.name}')
+        frame.pack(fill='both', expand=True, padx=10, pady=8)
+        for row, (field, label, required) in enumerate(self.CHANNEL_FIELDS):
+            ttk.Label(frame, text=label + (' *' if required else '')).grid(row=row, column=0, sticky='w', padx=8, pady=4)
+            var = tk.IntVar(value=int(getattr(self.fixture, field)))
+            self.vars[field] = var
+            ttk.Entry(frame, textvariable=var, width=10).grid(row=row, column=1, sticky='w', padx=8, pady=4)
+        ttk.Label(frame, text='* Required for calibration. Use 0 to disable optional channels.').grid(row=len(self.CHANNEL_FIELDS), column=0, columnspan=2, sticky='w', padx=8, pady=8)
+
+        buttons = ttk.Frame(self)
+        buttons.pack(fill='x', padx=10, pady=(0, 10))
+        ttk.Button(buttons, text='Save DMX and continue', command=self.save_continue).pack(side='right', padx=4)
+        ttk.Button(buttons, text='Cancel', command=self.destroy).pack(side='right', padx=4)
+
+    def save_continue(self):
+        try:
+            fixture = FixtureConfig(**asdict(self.fixture))
+            for field, _label, _required in self.CHANNEL_FIELDS:
+                setattr(fixture, field, int(self.vars[field].get()))
+            self.app.require_calibration_dmx(fixture)
+            self.app.validate_fixture(fixture)
+            # Check conflicts against all other enabled fixtures before applying.
+            fixtures = [FixtureConfig(**asdict(f)) for f in self.app.settings.fixtures]
+            fixtures[self.light_index] = fixture
+            self.app.validate_channel_conflicts(fixtures)
+            self.app.settings.fixtures[self.light_index] = fixture
+            self.app.rebuild_light_tree(self.light_index)
+            self.app.load_light_to_editor(self.light_index)
+            self.app.apply_selected_light(silent=True)
+            self.app.log(f'DMX channels set for {fixture.name}; calibration can now start')
+            self.destroy()
+            if self.on_complete:
+                self.app.after(100, self.on_complete)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
 
 
 class CalibrationWizard(tk.Toplevel):
@@ -1502,12 +1580,12 @@ class App(tk.Tk):
         choice = messagebox.askyesnocancel(
             APP_NAME,
             'How do you want to set up this new fixture?\n\n'
-            'Yes = open calibration wizard now\n'
+            'Yes = set DMX channels first, then open calibration wizard\n'
             'No = manual XYZ/bearing entry on the Lights tab\n'
             'Cancel = leave the fixture created but do nothing else'
         )
         if choice is True:
-            self.open_calibration_wizard()
+            self.open_dmx_setup_then_calibration()
 
     def duplicate_light(self):
         if not self.apply_selected_light(silent=True):
@@ -1649,10 +1727,48 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
+    def require_calibration_dmx(self, fixture):
+        missing = []
+        if int(fixture.pan_coarse) <= 0:
+            missing.append('pan coarse')
+        if int(fixture.tilt_coarse) <= 0:
+            missing.append('tilt coarse')
+        if int(fixture.dimmer) <= 0:
+            missing.append('dimmer coarse')
+        if missing:
+            raise ValueError(
+                f'{fixture.name}: set DMX channels before calibration. Missing: ' + ', '.join(missing)
+            )
+        for label, channel in (
+            ('pan coarse', fixture.pan_coarse), ('pan fine', fixture.pan_fine),
+            ('tilt coarse', fixture.tilt_coarse), ('tilt fine', fixture.tilt_fine),
+            ('dimmer coarse', fixture.dimmer), ('dimmer fine', fixture.dimmer_fine),
+            ('shutter', fixture.shutter),
+        ):
+            if not 0 <= int(channel) <= 512:
+                raise ValueError(f'{fixture.name}: {label} channel must be 0–512')
+        if not 0 <= int(fixture.shutter_open) <= 255:
+            raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
+        return True
+
+    def open_dmx_setup_then_calibration(self):
+        try:
+            if not self.apply_selected_light(silent=True):
+                raise ValueError('Fix the selected light settings before calibration')
+            DMXSetupDialog(self, self.selected_light_index, on_complete=self.open_calibration_wizard)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
     def open_calibration_wizard(self):
         try:
             if not self.apply_selected_light(silent=True):
                 raise ValueError('Fix the selected light settings before calibration')
+            fixture = self.settings.fixtures[self.selected_light_index]
+            try:
+                self.require_calibration_dmx(fixture)
+            except ValueError:
+                DMXSetupDialog(self, self.selected_light_index, on_complete=self.open_calibration_wizard)
+                return
             CalibrationWizard(self, self.selected_light_index)
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
