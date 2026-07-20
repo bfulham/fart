@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -1929,6 +1929,18 @@ class App(tk.Tk):
         self.loading_light_editor = False
         self.live = None
 
+        # Widget references created during build_ui().
+        # Tkinter/Tk __getattr__ can forward missing attributes to the Tcl app,
+        # which made hasattr(self, "spot_diameter_scale") unsafe during early startup
+        # on the packaged EXE. Initialise these explicitly so startup state checks
+        # are deterministic even before the widgets are created.
+        self.zoom_mode_combo = None
+        self.auto_beam_diameter_entry = None
+        self.spot_diameter_scale = None
+        self.spot_diameter_scale_var = None
+        self.beam_scales = {}
+        self.auto_beam_status_label = None
+
         self.build_ui()
         self.populate()
         self.after(100, self.ui_tick)
@@ -2507,9 +2519,33 @@ class App(tk.Tk):
     def zoom_auto_available(self):
         return any(fixture.enabled and fixture_has_zoom_model(fixture) for fixture in self.settings.fixtures)
 
+
+    def spot_diameter_changed(self):
+        """Commit the typed auto-beam spot diameter value and keep the live slider in sync."""
+        try:
+            raw = self.vars.get('auto_beam_diameter_m').get() if 'auto_beam_diameter_m' in self.vars else self.settings.auto_beam_diameter_m
+            value = clamp(float(raw), 0.1, 5.0)
+        except Exception:
+            value = clamp(float(getattr(self.settings, 'auto_beam_diameter_m', 1.0)), 0.1, 5.0)
+        if 'auto_beam_diameter_m' in self.vars:
+            self.vars['auto_beam_diameter_m'].set(value)
+        self.settings.auto_beam_diameter_m = value
+        if self.spot_diameter_scale_var is not None:
+            self.spot_diameter_scale_var.set(value)
+
+    def spot_diameter_scale_changed(self, value):
+        """Update the auto-beam spot diameter from the live slider."""
+        try:
+            diameter = clamp(float(value), 0.1, 5.0)
+        except Exception:
+            return
+        self.settings.auto_beam_diameter_m = diameter
+        if 'auto_beam_diameter_m' in self.vars:
+            self.vars['auto_beam_diameter_m'].set(round(diameter, 3))
+
     def update_zoom_mode_state(self):
         available = self.zoom_auto_available()
-        if hasattr(self, 'zoom_mode_combo'):
+        if self.zoom_mode_combo is not None:
             if available:
                 self.zoom_mode_combo.state(['!disabled', 'readonly'])
             else:
@@ -2518,16 +2554,15 @@ class App(tk.Tk):
                     self.vars['zoom_mode'].set('Manual')
                 self.zoom_mode_combo.state(['disabled'])
         auto_selected = bool('zoom_mode' in self.vars and self.vars['zoom_mode'].get() == 'Auto beam size' and available)
-        if hasattr(self, 'auto_beam_diameter_entry'):
+        if self.auto_beam_diameter_entry is not None:
             self.auto_beam_diameter_entry.state(['!disabled'] if available else ['disabled'])
-        if hasattr(self, 'spot_diameter_scale'):
+        if self.spot_diameter_scale is not None:
             self.spot_diameter_scale.state(['!disabled'] if available else ['disabled'])
-        if hasattr(self, 'beam_scales'):
-            for key in ('zoom', 'iris'):
-                scale = self.beam_scales.get(key)
-                if scale:
-                    scale.state(['disabled'] if auto_selected else ['!disabled'])
-        if hasattr(self, 'auto_beam_status_label'):
+        for key in ('zoom', 'iris'):
+            scale = self.beam_scales.get(key)
+            if scale:
+                scale.state(['disabled'] if auto_selected else ['!disabled'])
+        if self.auto_beam_status_label is not None:
             if available:
                 self.auto_beam_status_label.configure(
                     text='Auto beam size is available. FART uses zoom first; if zoom cannot get tight enough and an iris physical model is available, it closes iris to finish the requested spot size.'

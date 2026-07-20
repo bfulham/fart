@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.0
+## 1.4.1
 
 - Import pan and tilt physical limits from GDTF files when available.
 - Keep configured fixture positions fixed in the 3D preview instead of recentering around moving markers.
