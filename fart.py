@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -888,14 +888,12 @@ def _closest_point_to_lines(line_points, line_dirs):
 
 
 def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
-    """Estimate fixture position and zero-angle mapping from aimed samples.
+    """Estimate fixture position and physical pan/tilt mapping from aimed samples.
 
-    The v1.0.1 solver uses the captured pan/tilt values as rays aimed at known
-    points. For a candidate pan-zero and tilt-zero, it triangulates the fixture
-    position as the closest point to all reverse rays, then scores the result.
-    This is more stable than the original unconstrained five-parameter hill
-    climb, which could occasionally find mathematically valid but physically
-    ridiculous solutions such as a 100 m fixture height.
+    This solver converts each captured pan/tilt value into a 3D ray aimed at a
+    known point. It then triangulates the fixture position from the reverse rays.
+    v1.0.2 also tries pan/tilt direction combinations, rejects high-error
+    solutions, and returns the direction combination that best matches the data.
     """
     if len(samples) < 4:
         raise ValueError('At least four calibration points are required')
@@ -905,62 +903,56 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
     min_y, max_y = min(p[1] for p in points), max(p[1] for p in points)
     min_z, max_z = min(p[2] for p in points), max(p[2] for p in points)
 
-    # Generous physical sanity bounds. They prevent false minima while still
-    # supporting unusually high truss positions. Users can seed the existing
-    # fixture height before calibration if their rig is taller than this.
     xy_margin = 60.0
-    if base_fixture.z > max_z + 1.0:
+    # Keep the height range generous, but not infinite. False solutions usually
+    # show up as huge height errors or multi-metre ray fit errors.
+    if base_fixture.z > max_z + 1.0 and base_fixture.z < 60.0:
         z_low = max(-2.0, min(max_z + 0.2, base_fixture.z - 20.0))
         z_high = max(max_z + 35.0, base_fixture.z + 20.0)
     else:
         z_low = -2.0
-        z_high = max(max_z + 35.0, base_fixture.z + 20.0, 20.0)
+        z_high = max(max_z + 35.0, 30.0)
 
-    def make_fixture(position, pan_zero, tilt_zero):
+    def make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir):
         f = FixtureConfig(**asdict(base_fixture))
         f.x, f.y, f.z = position
         f.pan_zero_bearing = wrap180(pan_zero)
         f.tilt_zero_elevation = tilt_zero
+        f.pan_direction = 1 if pan_dir >= 0 else -1
+        f.tilt_direction = 1 if tilt_dir >= 0 else -1
         f.pan_offset = 0.0
         f.tilt_offset = 0.0
         return f
 
-    def candidate_from_zeros(pan_zero, tilt_zero):
+    def candidate_from_zeros(pan_zero, tilt_zero, pan_dir, tilt_dir):
         dirs = []
         for _tx, _ty, _tz, observed_pan, observed_tilt in points:
-            bearing = pan_zero + (observed_pan - base_fixture.pan_offset) / (base_fixture.pan_direction or 1)
-            elevation = tilt_zero + (observed_tilt - base_fixture.tilt_offset) / (base_fixture.tilt_direction or 1)
+            bearing = pan_zero + (observed_pan - base_fixture.pan_offset) / (pan_dir or 1)
+            elevation = tilt_zero + (observed_tilt - base_fixture.tilt_offset) / (tilt_dir or 1)
             dirs.append(_direction_from_bearing_elevation(bearing, elevation))
         position = _closest_point_to_lines(target_points, dirs)
         return position, dirs
 
-    def loss_for_zeros(pan_zero, tilt_zero):
-        try:
-            position, dirs = candidate_from_zeros(pan_zero, tilt_zero)
-        except Exception:
-            return 1e12, None
+    def score_candidate(position, dirs, pan_zero, tilt_zero, pan_dir, tilt_dir):
         x, y, z = position
+        ray_total = 0.0
         total = 0.0
-        # Ray-distance error: every known point should lie on the ray from the
-        # solved fixture position in the decoded pan/tilt direction.
         for (tx, ty, tz, observed_pan, observed_tilt), direction in zip(points, dirs):
             vx, vy, vz = tx - x, ty - y, tz - z
             dx, dy, dz = direction
             along = vx * dx + vy * dy + vz * dz
             closest = (x + dx * along, y + dy * along, z + dz * along)
             err = math.dist((tx, ty, tz), closest)
+            ray_total += err * err
             total += err * err
             if along <= 0:
                 total += 5000.0 + abs(along) * 100.0
-            # Retain angular scoring too, so pan wrap and tilt sign mistakes are obvious.
-            f = make_fixture(position, pan_zero, tilt_zero)
+            f = make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir)
             try:
                 _b, _e, pan, tilt, _d = calculate_aim(f, tx, ty, tz, observed_pan)
-                total += (wrap180(pan - observed_pan) * 0.05) ** 2 + ((tilt - observed_tilt) * 0.05) ** 2
+                total += (wrap180(pan - observed_pan) * 0.03) ** 2 + ((tilt - observed_tilt) * 0.03) ** 2
             except Exception:
                 total += 1e6
-        # Strong but soft bounds. A bad calibration should fail loudly rather
-        # than silently applying a fixture 100 m in the air.
         if not (min_x - xy_margin <= x <= max_x + xy_margin):
             total += (min(abs(x - (min_x - xy_margin)), abs(x - (max_x + xy_margin))) * 50.0) ** 2
         if not (min_y - xy_margin <= y <= max_y + xy_margin):
@@ -969,52 +961,73 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
             total += ((z_low - z) * 80.0) ** 2
         if z > z_high:
             total += ((z - z_high) * 80.0) ** 2
-        if base_fixture.z > max_z + 0.5:
-            total += ((z - base_fixture.z) / 12.0) ** 2
-        return total / len(points), position
+        # Very light preference for the user's seed height when it is plausible.
+        if -2.0 <= base_fixture.z <= 60.0 and base_fixture.z > max_z + 0.5:
+            total += ((z - base_fixture.z) / 25.0) ** 2
+        ray_rms = math.sqrt(ray_total / max(1, len(points)))
+        return total / len(points), ray_rms
 
-    # Search around likely zero orientations. Include the current fixture
-    # values and the common downward-hung moving-head case around -90 degrees.
+    def loss_for_zeros(pan_zero, tilt_zero, pan_dir, tilt_dir):
+        try:
+            position, dirs = candidate_from_zeros(pan_zero, tilt_zero, pan_dir, tilt_dir)
+            loss, ray_rms = score_candidate(position, dirs, pan_zero, tilt_zero, pan_dir, tilt_dir)
+            return loss, ray_rms, position
+        except Exception:
+            return 1e12, float('inf'), None
+
+    base_pan_dir = 1 if base_fixture.pan_direction >= 0 else -1
+    base_tilt_dir = 1 if base_fixture.tilt_direction >= 0 else -1
+    direction_candidates = []
+    for combo in ((base_pan_dir, base_tilt_dir), (-base_pan_dir, base_tilt_dir), (base_pan_dir, -base_tilt_dir), (-base_pan_dir, -base_tilt_dir)):
+        if combo not in direction_candidates:
+            direction_candidates.append(combo)
+
     starts = []
-    for p0 in (base_fixture.pan_zero_bearing, 0.0, 90.0, -90.0, 180.0, -180.0):
-        for t0 in (base_fixture.tilt_zero_elevation, -90.0, 0.0, 90.0):
+    for p0 in (base_fixture.pan_zero_bearing, 0.0, 90.0, -90.0, 180.0, -180.0, 30.0, -30.0):
+        for t0 in (base_fixture.tilt_zero_elevation, -90.0, -45.0, 0.0, 45.0, 90.0):
             starts.append((wrap180(p0), t0))
 
     best = None
     best_loss = float('inf')
-    for start_pan, start_tilt in starts:
-        params = [float(start_pan), float(start_tilt)]
-        steps = [45.0, 30.0]
-        current, pos = loss_for_zeros(*params)
-        for _ in range(140):
-            improved = False
-            for i in range(2):
-                for sign in (1.0, -1.0):
-                    trial = params[:]
-                    trial[i] += steps[i] * sign
-                    if i == 0:
-                        trial[i] = wrap180(trial[i])
-                    value, trial_pos = loss_for_zeros(*trial)
-                    if value < current:
-                        params, current, pos, improved = trial, value, trial_pos, True
-            if not improved:
-                steps = [step * 0.55 for step in steps]
-                if max(steps) < 0.002:
-                    break
-        if current < best_loss and pos is not None:
-            best = (params[:], pos)
-            best_loss = current
+    for pan_dir, tilt_dir in direction_candidates:
+        for start_pan, start_tilt in starts:
+            params = [float(start_pan), float(start_tilt)]
+            steps = [45.0, 30.0]
+            current, ray_rms, pos = loss_for_zeros(params[0], params[1], pan_dir, tilt_dir)
+            for _ in range(160):
+                improved = False
+                for i in range(2):
+                    for sign in (1.0, -1.0):
+                        trial = params[:]
+                        trial[i] += steps[i] * sign
+                        if i == 0:
+                            trial[i] = wrap180(trial[i])
+                        value, trial_rms, trial_pos = loss_for_zeros(trial[0], trial[1], pan_dir, tilt_dir)
+                        if value < current:
+                            params, current, ray_rms, pos, improved = trial, value, trial_rms, trial_pos, True
+                if not improved:
+                    steps = [step * 0.55 for step in steps]
+                    if max(steps) < 0.001:
+                        break
+            if current < best_loss and pos is not None:
+                best = (params[:], pos, pan_dir, tilt_dir, ray_rms)
+                best_loss = current
 
     if best is None:
         raise ValueError('Calibration failed; check captured points and pan/tilt directions')
-    (pan_zero, tilt_zero), position = best
+    (pan_zero, tilt_zero), position, pan_dir, tilt_dir, ray_rms = best
     x, y, z = position
     if z > z_high + 0.5 or z < z_low - 0.5:
         raise ValueError(
             f'Calibration result was physically implausible: Z={z:.2f} m. '
             'Check tilt direction and capture points, or seed the fixture with an approximate height first.'
         )
-    solved = make_fixture(position, pan_zero, tilt_zero)
+    if ray_rms > 1.0:
+        raise ValueError(
+            f'Calibration did not fit well enough to apply safely: fit error {ray_rms:.2f} m. '
+            'Recapture wider-spaced points, check the selected fixture, and confirm pan/tilt channels are not swapped.'
+        )
+    solved = make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir)
     solved.x = round(solved.x, 4)
     solved.y = round(solved.y, 4)
     solved.z = round(solved.z, 4)
@@ -1022,8 +1035,7 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
     solved.tilt_zero_elevation = round(solved.tilt_zero_elevation, 4)
     solved.pan_offset = 0.0
     solved.tilt_offset = 0.0
-    rms_metres = math.sqrt(max(best_loss, 0.0))
-    return solved, rms_metres
+    return solved, ray_rms
 
 
 
@@ -1262,8 +1274,19 @@ class CalibrationWizard(tk.Toplevel):
         buttons = ttk.Frame(box); buttons.pack(fill='x')
         for delta in (-1.0, -0.1, 0.1, 1.0):
             ttk.Button(buttons, text=f'{delta:+g}', width=4, command=lambda d=delta, i=idx, k=key: self.nudge_angle(i, k, d)).pack(side='left', padx=1)
+
+        # Direct numeric entry is intentionally beside the fine controls so
+        # users can type values from a console/DMX monitor instead of trying
+        # to land a slider exactly. The entry commits on Enter or focus loss
+        # and clamps to the fixture's configured mechanical range.
+        entry = ttk.Entry(buttons, textvariable=self.control_vars[idx][key], width=9)
+        entry.pack(side='right', padx=(2, 0))
+        entry.bind('<Return>', lambda _e, i=idx, k=key: self.commit_angle_entry(i, k))
+        entry.bind('<FocusOut>', lambda _e, i=idx, k=key: self.commit_angle_entry(i, k))
+        ttk.Label(buttons, text='°').pack(side='right')
+
         lbl = ttk.Label(buttons, width=9)
-        lbl.pack(side='right')
+        lbl.pack(side='right', padx=(4, 0))
         self.readout_labels[(idx, key)] = lbl
         return box
 
@@ -1275,14 +1298,30 @@ class CalibrationWizard(tk.Toplevel):
         self.readout_labels[(idx, key)] = lbl
         return box
 
-    def nudge_angle(self, idx, key, delta):
+    def angle_limits(self, idx, key):
         fixture = self.fixtures[idx]
-        var = self.control_vars[idx][key]
         if key == 'pan':
-            low, high = fixture.pan_min, fixture.pan_max
-        else:
-            low, high = fixture.tilt_min, fixture.tilt_max
-        var.set(clamp(var.get() + delta, low, high))
+            return fixture.pan_min, fixture.pan_max
+        return fixture.tilt_min, fixture.tilt_max
+
+    def commit_angle_entry(self, idx, key):
+        var = self.control_vars[idx][key]
+        low, high = self.angle_limits(idx, key)
+        try:
+            value = float(var.get())
+        except Exception:
+            messagebox.showerror(APP_NAME, f'Invalid {key} value. Enter a number between {low:g} and {high:g}.', parent=self)
+            value = clamp(0.0, low, high)
+        var.set(round(clamp(value, low, high), 4))
+
+    def nudge_angle(self, idx, key, delta):
+        var = self.control_vars[idx][key]
+        low, high = self.angle_limits(idx, key)
+        try:
+            current = float(var.get())
+        except Exception:
+            current = 0.0
+        var.set(round(clamp(current + delta, low, high), 4))
 
     def update_readouts(self):
         if self.winfo_exists():
@@ -1367,7 +1406,7 @@ class CalibrationWizard(tk.Toplevel):
                 solved, rms = solve_fixture_calibration(self.fixtures[idx], self.samples[idx])
                 self.app.settings.fixtures[idx] = solved
                 self.app.insert_or_update_light_row(idx, solved)
-                messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, RMS={rms:.3f}°')
+                messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, pan dir={solved.pan_direction:+d}, tilt dir={solved.tilt_direction:+d}, fit={rms:.3f} m')
                 self.app.log('Calibration applied to ' + messages[-1])
             self.app.rebuild_light_tree(first_index)
             self.app.load_light_editor(first_index)

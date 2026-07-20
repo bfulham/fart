@@ -2,7 +2,7 @@
 
 **Fixture Aiming and Remote Tracking**
 
-Version 1.0.1 is a cleaned-up production baseline with the same tested functionality as the 0.x prototypes, a tidier UI layout, safer startup checks, improved documentation, and a clean GitHub repository structure.
+Version 1.0.2 is a cleaned-up production baseline with the same tested functionality as the 0.x prototypes, a tidier UI layout, safer startup checks, improved documentation, and a clean GitHub repository structure.
 
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
