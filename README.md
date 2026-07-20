@@ -2,7 +2,7 @@
 
 **Fixture Aiming and Remote Tracking**
 
-Version 1.3.0 adds true multi-universe output. Each light can now target its own output universe; Art-Net and sACN transmit every universe in use, and Open DMX can drive multiple USB adapters with one software universe assigned to each adapter.
+Version 1.4.0 improves fixture setup, operator control, and safety: GDTF imports pan/tilt physical limits when available, the 3D preview keeps fixture positions fixed, spot diameter can be adjusted live, zoom/iris sliders lock out during Auto Beam mode, fixtures can blackout when hitting pan/tilt limits, setup tab locking is optional, and lead/lag prediction is available for fast-moving markers.
 
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)

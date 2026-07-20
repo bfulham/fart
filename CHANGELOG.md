@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- Import pan and tilt physical limits from GDTF files when available.
+- Keep configured fixture positions fixed in the 3D preview instead of recentering around moving markers.
+- Add live spot-diameter slider and numeric entry for Auto Beam mode.
+- Disable manual zoom and iris sliders when Auto Beam mode is active.
+- Add per-fixture Blackout on Limit, with optional zoom/iris-to-100% during limit blackout.
+- Add optional setup-tab locking while live output is running.
+- Add lead/lag marker prediction in milliseconds for fast motion or intentional delay.
+
 ## 1.3.0
 
 - Added per-light output universe assignment.

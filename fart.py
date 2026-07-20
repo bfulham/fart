@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -126,6 +126,11 @@ class FixtureConfig:
     zoom_angle_at_0: float = 0.0
     zoom_angle_at_100: float = 0.0
 
+    # Safety behaviour when calculated pan/tilt hits a configured mechanical limit.
+    blackout_on_limit: bool = False
+    limit_blackout_zoom_100: bool = False
+    limit_blackout_iris_100: bool = False
+
 
 @dataclass
 class Settings:
@@ -160,23 +165,40 @@ class Settings:
     focus_master: float = 0.5
     zoom_mode: str = "Manual"
     auto_beam_diameter_m: float = 1.0
+    lock_setup_while_running: bool = True
+    lead_lag_ms: float = 0.0
 
     fixtures: list[FixtureConfig] = field(default_factory=lambda: [FixtureConfig()])
 
 
 class TrackerBank:
-    """Thread-safe store of the latest position for every PSN tracker ID."""
+    """Thread-safe store of the latest position and velocity for every PSN tracker ID."""
     def __init__(self):
         self.lock = threading.Lock()
         self.xyz = {}
+        self.vel = {}
 
     def update(self, marker_id, x, y, z):
+        marker_id = int(marker_id)
+        now = time.monotonic()
+        x, y, z = float(x), float(y), float(z)
         with self.lock:
-            self.xyz[int(marker_id)] = (float(x), float(y), float(z), time.monotonic())
+            old = self.xyz.get(marker_id)
+            if old and now > old[3]:
+                dt = max(0.001, now - old[3])
+                self.vel[marker_id] = ((x - old[0]) / dt, (y - old[1]) / dt, (z - old[2]) / dt)
+            self.xyz[marker_id] = (x, y, z, now)
 
     def get(self, marker_id):
         with self.lock:
             return self.xyz.get(int(marker_id), (0.0, 0.0, 0.0, 0.0))
+
+    def predict(self, marker_id, seconds):
+        marker_id = int(marker_id)
+        with self.lock:
+            x, y, z, t = self.xyz.get(marker_id, (0.0, 0.0, 0.0, 0.0))
+            vx, vy, vz = self.vel.get(marker_id, (0.0, 0.0, 0.0))
+        return (x + vx * float(seconds), y + vy * float(seconds), z + vz * float(seconds), t)
 
     def snapshot(self):
         with self.lock:
@@ -235,6 +257,12 @@ class PSNReceiver:
     def set_setup_tabs_enabled(self, enabled):
         if not hasattr(self, 'notebook'):
             return
+        if not enabled:
+            try:
+                if not bool(self.vars.get('lock_setup_while_running').get()):
+                    return
+            except Exception:
+                pass
         state = 'normal' if enabled else 'disabled'
         # Operator is tab 0; all other tabs are setup tabs and should not be
         # edited while live output is running.
@@ -329,6 +357,12 @@ class OSCFaderReceiver:
     def set_setup_tabs_enabled(self, enabled):
         if not hasattr(self, 'notebook'):
             return
+        if not enabled:
+            try:
+                if not bool(self.vars.get('lock_setup_while_running').get()):
+                    return
+            except Exception:
+                pass
         state = 'normal' if enabled else 'disabled'
         # Operator is tab 0; all other tabs are setup tabs and should not be
         # edited while live output is running.
@@ -368,6 +402,12 @@ class ArtNetFaderReceiver:
     def set_setup_tabs_enabled(self, enabled):
         if not hasattr(self, 'notebook'):
             return
+        if not enabled:
+            try:
+                if not bool(self.vars.get('lock_setup_while_running').get()):
+                    return
+            except Exception:
+                pass
         state = 'normal' if enabled else 'disabled'
         # Operator is tab 0; all other tabs are setup tabs and should not be
         # edited while live output is running.
@@ -779,6 +819,45 @@ def _derive_zoom_angles(dmx_channel):
     return a0, a100
 
 
+
+
+def _derive_pan_tilt_limits(dmx_channel, kind):
+    """Best-effort physical pan/tilt limit import from GDTF PhysicalFrom/To.
+
+    GDTF files commonly store Pan/Tilt physical values as either centred
+    ranges (-270..270) or positive spans (0..540). FART expects fixture DMX
+    angle ranges around the mechanical centre, so positive-only ranges are
+    converted to +/- span/2.
+    """
+    candidates = []
+    key = kind.lower()
+    for node in dmx_channel.iter():
+        tag = _strip_ns(node.tag)
+        if tag not in ('ChannelFunction', 'LogicalChannel'):
+            continue
+        attr_text = ' '.join(filter(None, [_xml_attr(node, 'Attribute', ''), _xml_attr(node, 'Name', '')])).lower()
+        if key not in attr_text:
+            continue
+        if key == 'pan' and 'tilt' in attr_text:
+            continue
+        physical_from = _parse_gdtf_physical(_xml_attr(node, 'PhysicalFrom', ''))
+        physical_to = _parse_gdtf_physical(_xml_attr(node, 'PhysicalTo', ''))
+        if physical_from is None or physical_to is None:
+            continue
+        span = abs(float(physical_to) - float(physical_from))
+        if span < 1.0:
+            continue
+        r = _gdtf_range_from_node(node) or (0, 255)
+        candidates.append((abs(r[1] - r[0]), float(physical_from), float(physical_to), span))
+    if not candidates:
+        return None
+    _dmx_span, a, b, span = max(candidates, key=lambda item: item[0])
+    lo, hi = min(a, b), max(a, b)
+    # If the range is 0..540 or 0..270, centre it around zero for FART.
+    if lo >= 0 and hi > 180:
+        return -span / 2.0, span / 2.0
+    return lo, hi
+
 def fixture_has_zoom_model(fixture):
     try:
         a0 = float(getattr(fixture, 'zoom_angle_at_0', 0.0))
@@ -1027,10 +1106,18 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
             found['pan_coarse'] = abs_offsets[0]
             if len(abs_offsets) > 1:
                 found['pan_fine'] = abs_offsets[1]
+            pan_limits = _derive_pan_tilt_limits(dmx_channel, 'pan')
+            if pan_limits:
+                found['pan_min'] = round(float(pan_limits[0]), 4)
+                found['pan_max'] = round(float(pan_limits[1]), 4)
         elif kind == 'tilt':
             found['tilt_coarse'] = abs_offsets[0]
             if len(abs_offsets) > 1:
                 found['tilt_fine'] = abs_offsets[1]
+            tilt_limits = _derive_pan_tilt_limits(dmx_channel, 'tilt')
+            if tilt_limits:
+                found['tilt_min'] = round(float(tilt_limits[0]), 4)
+                found['tilt_max'] = round(float(tilt_limits[1]), 4)
         elif kind == 'dimmer':
             found['dimmer'] = abs_offsets[0]
             if len(abs_offsets) > 1:
@@ -1072,12 +1159,19 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
 def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5):
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
     tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
+    pan_limit = not math.isclose(pan, plim, abs_tol=1e-9)
+    tilt_limit = not math.isclose(tilt, tlim, abs_tol=1e-9)
+    limit_blackout = bool((pan_limit or tilt_limit) and getattr(fixture, 'blackout_on_limit', False))
+    if limit_blackout and getattr(fixture, 'limit_blackout_zoom_100', False):
+        zoom = 1.0
+    if limit_blackout and getattr(fixture, 'limit_blackout_iris_100', False):
+        iris = 1.0
     pan_fraction = (plim - fixture.pan_min) / (fixture.pan_max - fixture.pan_min)
     tilt_fraction = (tlim - fixture.tilt_min) / (fixture.tilt_max - fixture.tilt_min)
     pc, pf = dmx16(pan_fraction)
     tc, tf = dmx16(tilt_fraction)
 
-    intensity = 0.0 if blackout else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
+    intensity = 0.0 if (blackout or limit_blackout) else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
     dc, df = dmx16(intensity)
     values = [
         (fixture.pan_coarse, pc),
@@ -1124,8 +1218,9 @@ def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5,
         'tilt': tilt,
         'pan_dmx_angle': plim,
         'tilt_dmx_angle': tlim,
-        'pan_limit': not math.isclose(pan, plim, abs_tol=1e-9),
-        'tilt_limit': not math.isclose(tilt, tlim, abs_tol=1e-9),
+        'pan_limit': pan_limit,
+        'tilt_limit': tilt_limit,
+        'limit_blackout': limit_blackout,
     }
 
 
@@ -1755,6 +1850,8 @@ class App(tk.Tk):
         'focus_master': float,
         'zoom_mode': str,
         'auto_beam_diameter_m': float,
+        'lock_setup_while_running': bool,
+        'lead_lag_ms': float,
     }
 
     FIXTURE_TYPES = {
@@ -1797,6 +1894,9 @@ class App(tk.Tk):
         'zoom_angle_at_100': float,
         'iris_physical_at_0': float,
         'iris_physical_at_100': float,
+        'blackout_on_limit': bool,
+        'limit_blackout_zoom_100': bool,
+        'limit_blackout_iris_100': bool,
     }
 
     def __init__(self):
@@ -2036,6 +2136,9 @@ class App(tk.Tk):
             scale = ttk.Scale(beam_box, from_=0, to=100, variable=variable,
                               command=lambda value, name=attr: self.beam_control_changed(name, value))
             scale.grid(row=row, column=1, sticky='ew', padx=5, pady=2)
+            if not hasattr(self, 'beam_scales'):
+                self.beam_scales = {}
+            self.beam_scales[attr] = scale
             value_label = ttk.Label(beam_box, text=f'{initial * 100:.1f}%', width=8)
             value_label.grid(row=row, column=2, padx=5)
             self.beam_value_labels[attr] = value_label
@@ -2053,6 +2156,13 @@ class App(tk.Tk):
             beam_box, textvariable=self.var('auto_beam_diameter_m', float), width=10
         )
         self.auto_beam_diameter_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        self.auto_beam_diameter_entry.bind('<Return>', lambda _e: self.spot_diameter_changed())
+        self.auto_beam_diameter_entry.bind('<FocusOut>', lambda _e: self.spot_diameter_changed())
+        self.spot_diameter_scale_var = tk.DoubleVar(value=float(self.settings.auto_beam_diameter_m))
+        self.spot_diameter_scale = ttk.Scale(
+            beam_box, from_=0.1, to=5.0, variable=self.spot_diameter_scale_var, command=self.spot_diameter_scale_changed
+        )
+        self.spot_diameter_scale.grid(row=5, column=2, sticky='ew', padx=5, pady=2)
         self.auto_beam_status_label = ttk.Label(beam_box, text='Auto zoom unavailable until a fixture has beam-angle data', wraplength=460)
         self.auto_beam_status_label.grid(row=6, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 4))
 
@@ -2170,6 +2280,13 @@ class App(tk.Tk):
         self.add_light_entry(limits, 2, 'Tilt minimum', 'tilt_min')
         self.add_light_entry(limits, 3, 'Tilt maximum', 'tilt_max')
 
+        safety = ttk.LabelFrame(geometry_page, text='Limit safety')
+        safety.pack(side='left', fill='y', padx=6, pady=6)
+        ttk.Checkbutton(safety, text='Blackout on limit', variable=self.light_var('blackout_on_limit', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Checkbutton(safety, text='Set zoom to 100% on limit blackout', variable=self.light_var('limit_blackout_zoom_100', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Checkbutton(safety, text='Set iris to 100% on limit blackout', variable=self.light_var('limit_blackout_iris_100', bool)).pack(anchor='w', padx=6, pady=5)
+        ttk.Label(safety, text="Limit blackout is per light.\nIt triggers when calculated pan/tilt\nwould exceed that fixture\'s limits.", justify='left', wraplength=220).pack(anchor='w', padx=6, pady=(8, 4))
+
         channels = ttk.LabelFrame(dmx_page, text='Absolute channels (1-based; 0 disables)')
         channels.pack(side='left', fill='y', padx=8, pady=8)
         channel_fields = [
@@ -2255,6 +2372,13 @@ class App(tk.Tk):
                  'Art-Net universes are zero-based; sACN universes are one-based.',
             justify='left', wraplength=280
         ).grid(row=5, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+        ttk.Checkbutton(output_settings, text='Lock setup tabs while running', variable=self.var('lock_setup_while_running', bool)).grid(
+            row=6, column=0, columnspan=2, sticky='w', padx=4, pady=(4, 2)
+        )
+        self.add_entry(output_settings, 7, 'Lead / lag ms', 'lead_lag_ms', float)
+        ttk.Label(output_settings, text='Positive predicts ahead. Negative lags behind.', justify='left', wraplength=280).grid(
+            row=8, column=0, columnspan=2, sticky='w', padx=4, pady=(2, 8)
+        )
 
         # Calibration tab
         calibration = ttk.LabelFrame(calibration_tab, text='Selected-light pointing verification')
@@ -2305,6 +2429,8 @@ class App(tk.Tk):
                 variable.set(getattr(self, f'{name}_value') * 100.0)
             if hasattr(self, 'beam_value_labels'):
                 self.beam_value_labels[name].configure(text=f"{getattr(self, f'{name}_value') * 100:.1f}%")
+        if hasattr(self, 'spot_diameter_scale_var'):
+            self.spot_diameter_scale_var.set(clamp(float(self.settings.auto_beam_diameter_m), 0.1, 5.0))
         self.manual_changed(self.manual_scale_var.get())
         self.update_fader_mode()
         self.update_zoom_mode_state()
@@ -2391,8 +2517,16 @@ class App(tk.Tk):
                 if 'zoom_mode' in self.vars:
                     self.vars['zoom_mode'].set('Manual')
                 self.zoom_mode_combo.state(['disabled'])
+        auto_selected = bool('zoom_mode' in self.vars and self.vars['zoom_mode'].get() == 'Auto beam size' and available)
         if hasattr(self, 'auto_beam_diameter_entry'):
             self.auto_beam_diameter_entry.state(['!disabled'] if available else ['disabled'])
+        if hasattr(self, 'spot_diameter_scale'):
+            self.spot_diameter_scale.state(['!disabled'] if available else ['disabled'])
+        if hasattr(self, 'beam_scales'):
+            for key in ('zoom', 'iris'):
+                scale = self.beam_scales.get(key)
+                if scale:
+                    scale.state(['disabled'] if auto_selected else ['!disabled'])
         if hasattr(self, 'auto_beam_status_label'):
             if available:
                 self.auto_beam_status_label.configure(
@@ -2659,6 +2793,8 @@ class App(tk.Tk):
             raise ValueError('Zoom mode must be Manual or Auto beam size')
         if settings.auto_beam_diameter_m <= 0:
             raise ValueError('Auto beam diameter must be greater than zero')
+        if abs(float(settings.lead_lag_ms)) > 5000:
+            raise ValueError('Lead/lag must be between -5000 and +5000 ms')
         if settings.zoom_mode == 'Auto beam size' and not any(fixture.enabled and fixture_has_zoom_model(fixture) for fixture in settings.fixtures):
             raise ValueError('Auto beam size requires at least one enabled fixture with zoom beam-angle data')
         if settings.osc_fader_arg < 0:
@@ -2905,6 +3041,12 @@ class App(tk.Tk):
     def set_setup_tabs_enabled(self, enabled):
         if not hasattr(self, 'notebook'):
             return
+        if not enabled:
+            try:
+                if not bool(self.vars.get('lock_setup_while_running').get()):
+                    return
+            except Exception:
+                pass
         state = 'normal' if enabled else 'disabled'
         # Operator is tab 0; all other tabs are setup tabs and should not be
         # edited while live output is running.
@@ -3000,7 +3142,8 @@ class App(tk.Tk):
                 for index, fixture in enumerate(settings.fixtures):
                     if not fixture.enabled:
                         continue
-                    x, y, z, tracker_time = self.trackers.get(fixture.marker_id)
+                    lead_lag_s = float(getattr(settings, 'lead_lag_ms', 0.0)) / 1000.0
+                    x, y, z, tracker_time = self.trackers.predict(fixture.marker_id, lead_lag_s) if abs(lead_lag_s) > 0.0001 else self.trackers.get(fixture.marker_id)
                     previous_xyz = smoothed.get(fixture.marker_id)
                     if previous_xyz is None:
                         sx, sy, sz = x, y, z
@@ -3135,6 +3278,8 @@ class App(tk.Tk):
                 distance = f"{item['distance']:.2f} m"
                 if item.get('stale'):
                     state = 'TRACKING LOST'
+                elif item.get('limit_blackout'):
+                    state = 'LIMIT BLACKOUT'
                 elif item.get('pan_limit') or item.get('tilt_limit'):
                     state = 'AT LIMIT'
                 elif item.get('blackout'):
@@ -3195,13 +3340,19 @@ class App(tk.Tk):
         c.delete('all')
         width = max(c.winfo_width(), 100)
         height = max(c.winfo_height(), 100)
+        fixture_points = [item.get('fixture_xyz', (0, 0, 0)) for item in lights]
         points = []
         for item in lights:
             points.extend([item.get('fixture_xyz', (0, 0, 0)), item.get('marker_xyz', (0, 0, 0))])
         if not points:
-            c.create_text(width/2, height/2, text='Start FART to preview lights and PSN markers', fill='#c7d0d9')
+            # When stopped, still show configured fixture locations so the preview
+            # acts as a fixed rig layout, not only a live-output view.
+            fixture_points = [(f.x, f.y, f.z) for f in self.settings.fixtures if f.enabled]
+            points = list(fixture_points)
+        if not points:
+            c.create_text(width/2, height/2, text='No enabled fixtures to preview', fill='#c7d0d9')
             return
-        centre = tuple(sum(p[i] for p in points) / len(points) for i in range(3))
+        centre = tuple(sum(p[i] for p in fixture_points) / len(fixture_points) for i in range(3)) if fixture_points else tuple(sum(p[i] for p in points) / len(points) for i in range(3))
         # Ground grid around scene centre.
         extent = max(5, int(max(max(abs(p[0]-centre[0]), abs(p[1]-centre[1])) for p in points) + 2))
         for n in range(-extent, extent + 1):
@@ -3212,6 +3363,8 @@ class App(tk.Tk):
                 pb = self._project_preview(b, centre, width, height)
                 c.create_line(pa[0], pa[1], pb[0], pb[1], fill='#26323b')
         marker_drawn = set()
+        if not lights:
+            lights = [{'name': f.name, 'marker_id': f.marker_id, 'fixture_xyz': (f.x, f.y, f.z), 'marker_xyz': (f.x, f.y, f.z), 'stale': True} for f in self.settings.fixtures if f.enabled]
         for item in sorted(lights, key=lambda x: self._project_preview(x.get('fixture_xyz',(0,0,0)), centre, width, height)[2]):
             fp = item.get('fixture_xyz', (0, 0, 0))
             mp = item.get('marker_xyz', (0, 0, 0))
