@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -111,6 +111,12 @@ class FixtureConfig:
     iris_reverse: bool = False
     focus_reverse: bool = False
 
+    # Optional beam-angle model used for automatic spot-size control.
+    # Values are the beam/field angle in degrees produced by the zoom UI at
+    # 0% and 100%. Leave both as 0 to disable auto-zoom for that fixture.
+    zoom_angle_at_0: float = 0.0
+    zoom_angle_at_100: float = 0.0
+
 
 @dataclass
 class Settings:
@@ -140,6 +146,8 @@ class Settings:
     zoom_master: float = 0.5
     iris_master: float = 1.0
     focus_master: float = 0.5
+    zoom_mode: str = "Manual"
+    auto_beam_diameter_m: float = 1.0
 
     fixtures: list[FixtureConfig] = field(default_factory=lambda: [FixtureConfig()])
 
@@ -211,6 +219,18 @@ class PSNReceiver:
         self.position_count = 0
         self.last_packet_time = 0.0
         self.last_position_time = 0.0
+
+    def set_setup_tabs_enabled(self, enabled):
+        if not hasattr(self, 'notebook'):
+            return
+        state = 'normal' if enabled else 'disabled'
+        # Operator is tab 0; all other tabs are setup tabs and should not be
+        # edited while live output is running.
+        for tab_index in range(1, 4):
+            try:
+                self.notebook.tab(tab_index, state=state)
+            except Exception:
+                pass
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -294,6 +314,18 @@ class OSCFaderReceiver:
         self.port, self.address, self.arg_index = port, address, arg_index
         self.input_min, self.input_max = input_min, input_max
         self.fader, self.log, self.server = fader, log, None
+    def set_setup_tabs_enabled(self, enabled):
+        if not hasattr(self, 'notebook'):
+            return
+        state = 'normal' if enabled else 'disabled'
+        # Operator is tab 0; all other tabs are setup tabs and should not be
+        # edited while live output is running.
+        for tab_index in range(1, 4):
+            try:
+                self.notebook.tab(tab_index, state=state)
+            except Exception:
+                pass
+
     def start(self):
         if Dispatcher is None:
             raise RuntimeError('python-osc is missing')
@@ -321,6 +353,18 @@ class ArtNetFaderReceiver:
         self.universe, self.channel, self.fader, self.log = universe, channel, fader, log
         self.sock = None
         self.stop_evt = threading.Event()
+    def set_setup_tabs_enabled(self, enabled):
+        if not hasattr(self, 'notebook'):
+            return
+        state = 'normal' if enabled else 'disabled'
+        # Operator is tab 0; all other tabs are setup tabs and should not be
+        # edited while live output is running.
+        for tab_index in range(1, 4):
+            try:
+                self.notebook.tab(tab_index, state=state)
+            except Exception:
+                pass
+
     def start(self):
         if not 1 <= self.channel <= 512:
             raise ValueError('Art-Net input channel must be 1–512')
@@ -599,6 +643,76 @@ def _parse_gdtf_dmx_value(value, default=None):
         return default
 
 
+def _parse_gdtf_physical(value, default=None):
+    if value is None or value == '':
+        return default
+    text = str(value).strip().replace('{', '').replace('}', '')
+    if not text:
+        return default
+    # GDTF physical values are plain numbers for angular attributes in degrees.
+    # Some exporters include units or multi-value text; keep the first token.
+    token = text.replace(',', ' ').split()[0]
+    try:
+        return float(token)
+    except Exception:
+        return default
+
+
+def _derive_zoom_angles(dmx_channel):
+    """Return beam/field angle at zoom 0% and 100% if GDTF provides it.
+
+    GDTF stores this most commonly on a Zoom ChannelFunction as PhysicalFrom
+    and PhysicalTo. The values are not guaranteed to exist, so this is always a
+    best-effort import and remains editable in the UI.
+    """
+    candidates = []
+    for node in dmx_channel.iter():
+        tag = _strip_ns(node.tag)
+        if tag not in ('ChannelFunction', 'LogicalChannel'):
+            continue
+        attr_text = ' '.join(filter(None, [_xml_attr(node, 'Attribute', ''), _xml_attr(node, 'Name', '')])).lower()
+        if 'zoom' not in attr_text:
+            continue
+        physical_from = _parse_gdtf_physical(_xml_attr(node, 'PhysicalFrom', ''))
+        physical_to = _parse_gdtf_physical(_xml_attr(node, 'PhysicalTo', ''))
+        if physical_from is None or physical_to is None:
+            continue
+        if physical_from <= 0 or physical_to <= 0:
+            continue
+        # Prefer the widest DMX range if there are multiple zoom functions.
+        r = _gdtf_range_from_node(node) or (0, 255)
+        candidates.append((abs(r[1] - r[0]), float(physical_from), float(physical_to)))
+    if not candidates:
+        return None
+    _span, a0, a100 = max(candidates, key=lambda item: item[0])
+    return a0, a100
+
+
+def fixture_has_zoom_model(fixture):
+    try:
+        a0 = float(getattr(fixture, 'zoom_angle_at_0', 0.0))
+        a100 = float(getattr(fixture, 'zoom_angle_at_100', 0.0))
+    except Exception:
+        return False
+    return a0 > 0.0 and a100 > 0.0 and abs(a100 - a0) > 0.001
+
+
+def auto_zoom_for_distance(fixture, distance, target_diameter_m, fallback_zoom=0.5):
+    """Map desired spot diameter at the marker to normalized zoom output.
+
+    Returns (normalized_zoom, required_angle_degrees, available). If the fixture
+    has no physical zoom model, available is False and fallback_zoom is used.
+    """
+    if not fixture_has_zoom_model(fixture) or distance <= 0:
+        return clamp(fallback_zoom, 0.0, 1.0), None, False
+    diameter = max(0.01, float(target_diameter_m))
+    required = math.degrees(2.0 * math.atan((diameter / 2.0) / max(0.001, distance)))
+    a0 = float(fixture.zoom_angle_at_0)
+    a100 = float(fixture.zoom_angle_at_100)
+    value = (required - a0) / (a100 - a0)
+    return clamp(value, 0.0, 1.0), required, True
+
+
 def _gdtf_range_from_node(node):
     start = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXFrom', ''))
     end = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXTo', ''))
@@ -754,6 +868,10 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
             found['zoom'] = abs_offsets[0]
             if len(abs_offsets) > 1:
                 found['zoom_fine'] = abs_offsets[1]
+            zoom_angles = _derive_zoom_angles(dmx_channel)
+            if zoom_angles:
+                found['zoom_angle_at_0'] = round(float(zoom_angles[0]), 4)
+                found['zoom_angle_at_100'] = round(float(zoom_angles[1]), 4)
         elif kind == 'iris':
             found['iris'] = abs_offsets[0]
         elif kind == 'focus':
@@ -1053,6 +1171,8 @@ class DMXSetupDialog(tk.Toplevel):
         ('shutter_open', 'Shutter open value', False),
         ('zoom', 'Zoom coarse', False),
         ('zoom_fine', 'Zoom fine', False),
+        ('zoom_angle_at_0', 'Beam angle at zoom 0%', False),
+        ('zoom_angle_at_100', 'Beam angle at zoom 100%', False),
         ('iris', 'Iris', False),
         ('iris_100_dmx', 'Iris 100% DMX', False),
         ('focus', 'Focus coarse', False),
@@ -1089,7 +1209,10 @@ class DMXSetupDialog(tk.Toplevel):
         frame.pack(fill='both', expand=True, padx=10, pady=8)
         for row, (field, label, required) in enumerate(self.CHANNEL_FIELDS):
             ttk.Label(frame, text=label + (' *' if required else '')).grid(row=row, column=0, sticky='w', padx=8, pady=4)
-            var = tk.IntVar(value=int(getattr(self.fixture, field)))
+            if field in ('zoom_angle_at_0', 'zoom_angle_at_100'):
+                var = tk.DoubleVar(value=float(getattr(self.fixture, field)))
+            else:
+                var = tk.IntVar(value=int(getattr(self.fixture, field)))
             self.vars[field] = var
             ttk.Entry(frame, textvariable=var, width=10).grid(row=row, column=1, sticky='w', padx=8, pady=4)
         ttk.Label(frame, text='* Required for calibration. Use 0 to disable optional channels.').grid(row=len(self.CHANNEL_FIELDS), column=0, columnspan=2, sticky='w', padx=8, pady=8)
@@ -1125,7 +1248,7 @@ class DMXSetupDialog(tk.Toplevel):
             mapping, modes, selected_mode = import_gdtf_channel_mapping(path, start, mode)
             for field, channel in mapping.items():
                 if field in self.vars:
-                    self.vars[field].set(int(channel))
+                    self.vars[field].set(float(channel) if field in ('zoom_angle_at_0', 'zoom_angle_at_100') else int(channel))
             found = ', '.join(f'{k}={v}' for k, v in mapping.items())
             messagebox.showinfo(APP_NAME, f'Imported GDTF channel mapping. Check it against the manual.\n\nMode used: {modes[0] if modes else "default"}\n{found}', parent=self)
         except Exception as exc:
@@ -1135,7 +1258,13 @@ class DMXSetupDialog(tk.Toplevel):
         try:
             fixture = FixtureConfig(**asdict(self.fixture))
             for field, _label, _required in self.CHANNEL_FIELDS:
-                setattr(fixture, field, int(self.vars[field].get()))
+                if field in ('zoom_angle_at_0', 'zoom_angle_at_100'):
+                    value = float(self.vars[field].get())
+                    if value < 0:
+                        raise ValueError(f'{_label} cannot be negative')
+                    setattr(fixture, field, value)
+                else:
+                    setattr(fixture, field, int(self.vars[field].get()))
             self.app.require_calibration_dmx(fixture)
             self.app.validate_fixture(fixture)
             # Check conflicts against all other enabled fixtures before applying.
@@ -1443,6 +1572,8 @@ class App(tk.Tk):
         'zoom_master': float,
         'iris_master': float,
         'focus_master': float,
+        'zoom_mode': str,
+        'auto_beam_diameter_m': float,
     }
 
     FIXTURE_TYPES = {
@@ -1480,6 +1611,8 @@ class App(tk.Tk):
         'zoom_reverse': bool,
         'iris_reverse': bool,
         'focus_reverse': bool,
+        'zoom_angle_at_0': float,
+        'zoom_angle_at_100': float,
     }
 
     def __init__(self):
@@ -1631,15 +1764,16 @@ class App(tk.Tk):
         ttk.Label(header, text=f'v{APP_VERSION}').pack(side='right', anchor='s', pady=(0, 4))
 
         notebook = ttk.Notebook(self)
+        self.notebook = notebook
         notebook.pack(fill='both', expand=True, padx=8, pady=8)
         run_tab = ttk.Frame(notebook)
         lights_tab = ttk.Frame(notebook)
         io_tab = ttk.Frame(notebook)
         calibration_tab = ttk.Frame(notebook)
-        notebook.add(run_tab, text='Overview')
-        notebook.add(lights_tab, text='Lights')
-        notebook.add(io_tab, text='I/O')
-        notebook.add(calibration_tab, text='Calibration')
+        notebook.add(run_tab, text='Operator')
+        notebook.add(lights_tab, text='Setup: Lights')
+        notebook.add(io_tab, text='Setup: I/O')
+        notebook.add(calibration_tab, text='Setup: Calibration')
 
         # Run tab
         connection = ttk.LabelFrame(run_tab, text='Tracking and output')
@@ -1720,6 +1854,21 @@ class App(tk.Tk):
             value_label.grid(row=row, column=2, padx=5)
             self.beam_value_labels[attr] = value_label
         beam_box.columnconfigure(1, weight=1)
+        ttk.Separator(beam_box).grid(row=3, column=0, columnspan=3, sticky='ew', pady=(6, 4))
+        ttk.Label(beam_box, text='Zoom mode', width=10).grid(row=4, column=0, padx=5, pady=2, sticky='w')
+        self.zoom_mode_combo = ttk.Combobox(
+            beam_box, textvariable=self.var('zoom_mode'), values=['Manual', 'Auto beam size'],
+            state='readonly', width=18
+        )
+        self.zoom_mode_combo.grid(row=4, column=1, sticky='w', padx=5, pady=2)
+        self.zoom_mode_combo.bind('<<ComboboxSelected>>', lambda _e: self.update_zoom_mode_state())
+        ttk.Label(beam_box, text='Spot diameter').grid(row=5, column=0, padx=5, pady=2, sticky='w')
+        self.auto_beam_diameter_entry = ttk.Entry(
+            beam_box, textvariable=self.var('auto_beam_diameter_m', float), width=10
+        )
+        self.auto_beam_diameter_entry.grid(row=5, column=1, sticky='w', padx=5, pady=2)
+        self.auto_beam_status_label = ttk.Label(beam_box, text='Auto zoom unavailable until a fixture has beam-angle data', wraplength=460)
+        self.auto_beam_status_label.grid(row=6, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 4))
 
         overview_notebook = ttk.Notebook(run_right)
         overview_notebook.pack(fill='both', expand=True, pady=(8, 0))
@@ -1731,7 +1880,7 @@ class App(tk.Tk):
         overview_notebook.add(log_page, text='Log')
 
         self.overview_tree = ttk.Treeview(
-            lights_overview, columns=('marker', 'position', 'angles', 'distance', 'state'),
+            lights_overview, columns=('marker', 'position', 'angles', 'distance', 'zoom', 'state'),
             show='tree headings', height=13
         )
         self.overview_tree.heading('#0', text='Light')
@@ -1739,12 +1888,14 @@ class App(tk.Tk):
         self.overview_tree.heading('position', text='Marker XYZ')
         self.overview_tree.heading('angles', text='Pan / Tilt')
         self.overview_tree.heading('distance', text='Distance')
+        self.overview_tree.heading('zoom', text='Zoom')
         self.overview_tree.heading('state', text='State')
         self.overview_tree.column('#0', width=145)
         self.overview_tree.column('marker', width=65, anchor='center')
         self.overview_tree.column('position', width=145)
         self.overview_tree.column('angles', width=130)
         self.overview_tree.column('distance', width=75, anchor='e')
+        self.overview_tree.column('zoom', width=90, anchor='center')
         self.overview_tree.column('state', width=120)
         self.overview_tree.pack(fill='both', expand=True, padx=5, pady=5)
 
@@ -1852,6 +2003,17 @@ class App(tk.Tk):
         ttk.Checkbutton(direction_box, text='Reverse iris', variable=self.light_var('iris_reverse', bool)).pack(anchor='w', padx=6, pady=5)
         ttk.Checkbutton(direction_box, text='Reverse focus', variable=self.light_var('focus_reverse', bool)).pack(anchor='w', padx=6, pady=5)
         ttk.Label(direction_box, text="Use reverse when the fixture's\nDMX range runs opposite to the UI.", justify='left').pack(anchor='w', padx=6, pady=(8, 5))
+
+        beam_model = ttk.LabelFrame(dmx_page, text='Auto zoom beam model')
+        beam_model.pack(side='left', fill='y', padx=8, pady=8)
+        self.add_light_entry(beam_model, 0, 'Beam angle at zoom 0%', 'zoom_angle_at_0', float)
+        self.add_light_entry(beam_model, 1, 'Beam angle at zoom 100%', 'zoom_angle_at_100', float)
+        ttk.Label(
+            beam_model,
+            text='Used only by Operator → Auto beam size.\nGDTF import fills these when the file\ncontains Zoom PhysicalFrom/To values.\nLeave both 0 to disable auto zoom.',
+            justify='left', wraplength=230
+        ).grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+
         ttk.Label(
             dmx_page,
             text='All lights share the selected 512-channel output universe.\n'
@@ -1949,7 +2111,9 @@ class App(tk.Tk):
                 self.beam_value_labels[name].configure(text=f"{getattr(self, f'{name}_value') * 100:.1f}%")
         self.manual_changed(self.manual_scale_var.get())
         self.update_fader_mode()
+        self.update_zoom_mode_state()
         self.rebuild_light_tree(select_index=0)
+        self.update_zoom_mode_state()
 
     def _psn_discovered(self, tracker_id):
         self.psn_discovered.put(int(tracker_id))
@@ -2017,6 +2181,31 @@ class App(tk.Tk):
         mode = self.vars['fader_mode'].get() if 'fader_mode' in self.vars else 'Manual'
         if hasattr(self, 'manual_scale'):
             self.manual_scale.state(['!disabled'] if mode == 'Manual' else ['disabled'])
+
+    def zoom_auto_available(self):
+        return any(fixture.enabled and fixture_has_zoom_model(fixture) for fixture in self.settings.fixtures)
+
+    def update_zoom_mode_state(self):
+        available = self.zoom_auto_available()
+        if hasattr(self, 'zoom_mode_combo'):
+            if available:
+                self.zoom_mode_combo.state(['!disabled', 'readonly'])
+            else:
+                # No imported/manual beam angles: force Manual and grey out the auto option.
+                if 'zoom_mode' in self.vars:
+                    self.vars['zoom_mode'].set('Manual')
+                self.zoom_mode_combo.state(['disabled'])
+        if hasattr(self, 'auto_beam_diameter_entry'):
+            self.auto_beam_diameter_entry.state(['!disabled'] if available else ['disabled'])
+        if hasattr(self, 'auto_beam_status_label'):
+            if available:
+                self.auto_beam_status_label.configure(
+                    text='Auto beam size is available. FART will adjust each light with beam-angle data to maintain the requested spot diameter.'
+                )
+            else:
+                self.auto_beam_status_label.configure(
+                    text='Auto beam size is greyed out: no enabled fixture has zoom physical beam-angle data. Import a GDTF with Zoom PhysicalFrom/To or enter beam angles manually.'
+                )
 
     def rebuild_light_tree(self, select_index=None):
         self.loading_light_editor = True
@@ -2088,6 +2277,7 @@ class App(tk.Tk):
             if hasattr(self, 'light_marker_combo'):
                 self.light_marker_combo['values'] = sorted(self.psn_tracker_ids)
             self.calibration_light_label.configure(text=f'Selected light: {fixture.name}')
+            self.update_zoom_mode_state()
         finally:
             self.loading_light_editor = False
 
@@ -2123,6 +2313,8 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
         if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
             raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
+        if float(getattr(fixture, 'zoom_angle_at_0', 0.0)) < 0 or float(getattr(fixture, 'zoom_angle_at_100', 0.0)) < 0:
+            raise ValueError(f'{fixture.name}: zoom beam angles cannot be negative')
         if fixture.enabled and (fixture.pan_coarse == 0 or fixture.tilt_coarse == 0):
             raise ValueError(f'{fixture.name}: enabled lights require pan coarse and tilt coarse channels')
         if fixture.pan_fine and not fixture.pan_coarse:
@@ -2145,6 +2337,7 @@ class App(tk.Tk):
             self.settings.fixtures[self.selected_light_index] = fixture
             self.insert_or_update_light_row(self.selected_light_index, fixture)
             self.calibration_light_label.configure(text=f'Selected light: {fixture.name}')
+            self.update_zoom_mode_state()
             if not silent:
                 self.log(f'Applied changes to {fixture.name}')
             return True
@@ -2260,6 +2453,12 @@ class App(tk.Tk):
         for label, value in (('Zoom', settings.zoom_master), ('Iris', settings.iris_master), ('Focus', settings.focus_master)):
             if not 0 <= value <= 1:
                 raise ValueError(f'{label} master must be between 0 and 1')
+        if settings.zoom_mode not in ('Manual', 'Auto beam size'):
+            raise ValueError('Zoom mode must be Manual or Auto beam size')
+        if settings.auto_beam_diameter_m <= 0:
+            raise ValueError('Auto beam diameter must be greater than zero')
+        if settings.zoom_mode == 'Auto beam size' and not any(fixture.enabled and fixture_has_zoom_model(fixture) for fixture in settings.fixtures):
+            raise ValueError('Auto beam size requires at least one enabled fixture with zoom beam-angle data')
         if settings.osc_fader_arg < 0:
             raise ValueError('OSC argument index cannot be negative')
         if not 1 <= settings.artnet_input_channel <= 512:
@@ -2356,6 +2555,7 @@ class App(tk.Tk):
                     setattr(fixture, field, channel)
             self.settings.fixtures[self.selected_light_index] = fixture
             self.insert_or_update_light_row(self.selected_light_index, fixture)
+            self.update_zoom_mode_state()
             found = ', '.join(f'{k}={v}' for k, v in mapping.items())
             messagebox.showinfo(
                 APP_NAME,
@@ -2393,6 +2593,8 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
         if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
             raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
+        if float(getattr(fixture, 'zoom_angle_at_0', 0.0)) < 0 or float(getattr(fixture, 'zoom_angle_at_100', 0.0)) < 0:
+            raise ValueError(f'{fixture.name}: zoom beam angles cannot be negative')
         return True
 
     def open_dmx_setup_then_calibration(self):
@@ -2484,6 +2686,18 @@ class App(tk.Tk):
             settings.artnet_input_universe, settings.artnet_input_channel, self.fader, self.log
         )
 
+    def set_setup_tabs_enabled(self, enabled):
+        if not hasattr(self, 'notebook'):
+            return
+        state = 'normal' if enabled else 'disabled'
+        # Operator is tab 0; all other tabs are setup tabs and should not be
+        # edited while live output is running.
+        for tab_index in range(1, 4):
+            try:
+                self.notebook.tab(tab_index, state=state)
+            except Exception:
+                pass
+
     def start(self):
         if self.running:
             return
@@ -2500,6 +2714,7 @@ class App(tk.Tk):
                 self.fader_input.start()
             self.stop_evt.clear()
             self.running = True
+            self.set_setup_tabs_enabled(False)
             self.worker = threading.Thread(target=self.loop, daemon=True)
             self.worker.start()
             self.start_btn.configure(text='RUNNING')
@@ -2522,6 +2737,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
             self.psn = self.fader_input = self.output = None
+            self.set_setup_tabs_enabled(True)
             messagebox.showerror(APP_NAME, str(exc))
 
     def stop(self):
@@ -2548,6 +2764,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self.psn = self.fader_input = self.output = None
+        self.set_setup_tabs_enabled(True)
         self.start_btn.configure(text='START — DIMMER LOCKED')
         self.log('Stopped and blacked out all lights')
 
@@ -2583,14 +2800,22 @@ class App(tk.Tk):
                             fixture, sx, sy, sz, previous_pan.get(index)
                         )
                         previous_pan[index] = pan
+                        zoom_out = self.zoom_value
+                        zoom_angle = None
+                        zoom_auto = False
+                        if settings.zoom_mode == 'Auto beam size':
+                            zoom_out, zoom_angle, zoom_auto = auto_zoom_for_distance(
+                                fixture, distance, settings.auto_beam_diameter_m, self.zoom_value
+                            )
                         status = write_fixture_to_frame(
                             frame, fixture, pan, tilt, fader, blackout,
-                            self.zoom_value, self.iris_value, self.focus_value
+                            zoom_out, self.iris_value, self.focus_value
                         )
                         status.update({
                             'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'bearing': bearing, 'elevation': elevation, 'distance': distance,
+                            'zoom_value': zoom_out, 'zoom_angle': zoom_angle, 'zoom_auto': zoom_auto,
                             'stale': stale, 'blackout': blackout,
                         })
                         light_statuses.append(status)

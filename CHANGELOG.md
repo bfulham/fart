@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+
+- Renamed the live run page to Operator and setup pages to Setup: Lights/I/O/Calibration.
+- Added Auto beam size zoom mode.
+- Added per-fixture beam angle fields for zoom 0% and 100%.
+- GDTF import now attempts to import Zoom PhysicalFrom/PhysicalTo beam angles for the selected mode.
+- Auto beam mode is greyed out when no enabled fixture has usable beam-angle data.
+- Added automated tests for GDTF zoom physical import and auto zoom calculation.
+
 ## 1.0.2 - Production baseline
 
 - Rebuilt the repository as a clean GitHub-ready release with no generated caches or prototype leftovers.
