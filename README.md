@@ -2,7 +2,7 @@
 
 **Fixture Aiming and Remote Tracking**
 
-Version 1.2.0 keeps the production v1 baseline and adds automatic beam-size control using zoom first and iris assist when the requested spot is tighter than zoom can achieve. Auto mode still greys out unless at least one enabled fixture has physical zoom beam-angle data from GDTF or manual entry.
+Version 1.3.0 adds true multi-universe output. Each light can now target its own output universe; Art-Net and sACN transmit every universe in use, and Open DMX can drive multiple USB adapters with one software universe assigned to each adapter.
 
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
@@ -16,7 +16,7 @@ It supports:
 - Per-light PSN marker selection, allowing different lights to follow different markers
 - Independent fixture position, calibration, limits, channel mapping, and intensity scaling
 - Manual, OSC, or Art-Net intensity input
-- ENTTEC Open DMX USB, Art-Net, and sACN output
+- ENTTEC Open DMX USB, Art-Net, and sACN output, including multiple output universes
 - 8-bit or 16-bit dimmer mapping
 - Live shared zoom, iris, and focus controls with optional 16-bit zoom/focus output
 - Calibration wizard zoom and iris controls for small-beam aiming
@@ -118,33 +118,34 @@ Choose an Art-Net universe and one 8-bit DMX channel. Values `0–255` map to `0
 
 ### ENTTEC Open DMX USB
 
-Select **Open DMX** and choose the FTDI virtual COM port. The Open DMX is unbuffered, so Windows must generate the DMX break and all slots continuously. Art-Net, sACN, or a buffered interface is preferable for critical use.
+Select **Open DMX** and choose the FTDI virtual COM port. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` in **Open DMX adapters**. Open DMX adapters do not know about universes themselves, so FART maps each USB adapter to a software universe and sends that universe's 512-channel DMX frame to that adapter. Leave the mapping blank to use the single selected serial port for the default universe. The Open DMX is unbuffered, so Windows must generate the DMX break and all slots continuously. Art-Net, sACN, or a buffered interface is preferable for critical use.
 
 ### Art-Net
 
-Art-Net universe numbering starts at `0`. Unicast to the receiving node or visualiser where possible.
+Art-Net universe numbering starts at `0`. Unicast to the receiving node or visualiser where possible. FART sends one ArtDMX stream for each enabled fixture universe.
 
 ### sACN
 
-sACN uses multicast and universe numbering starts at `1`. Valid universes are `1–63999`.
+sACN uses multicast and universe numbering starts at `1`. Valid universes are `1–63999`. FART activates and transmits every enabled fixture universe.
 
 ## Adding lights
 
 Every enabled fixture chooses its own PSN marker and calculates its own aim from its configured optical centre. Several lights can share one marker, or different groups can follow different markers. For each light configure:
 
 - PSN marker ID
+- Output universe
 - Optical-centre/pan-tilt-pivot X, Y, and Z in OpenFollow coordinates
 - World bearing represented by physical pan zero
 - World elevation represented by physical tilt zero
 - Pan/tilt direction and trim
 - Mechanical/personality angle limits
-- Absolute DMX channels within the output universe
+- Absolute DMX channels within that light's output universe
 - Shutter-open value and optional 16-bit dimmer fine channel
 - Optional zoom, iris, and focus channels, including fine channels and per-light direction reversal
 
 Channel fields are **absolute DMX slots**, not fixture offsets. For a fixture starting at channel 101, an attribute at fixture offset 18 is absolute channel `118`.
 
-FART blocks startup if enabled fixtures overlap on any configured DMX channel.
+FART blocks startup if enabled fixtures overlap on any configured DMX channel within the same universe. The same channel numbers can be reused on different universes.
 
 
 ## Zoom, iris, and focus

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0
+
+- Added per-light output universe assignment.
+- Art-Net output now sends every enabled fixture universe in use.
+- sACN output now activates and sends every enabled fixture universe in use.
+- Open DMX now supports multiple USB adapters with `COMx=universe` mapping, for example `COM3=0, COM4=1`.
+- Channel-overlap validation is now per universe.
+- Calibration output and blackout now honour multi-universe routing.
+- Added automated tests for per-universe channel validation and Open DMX adapter parsing.
+
 ## 1.2.0
 
 - Added iris-assisted Auto beam size. FART now uses zoom first, then closes iris if the requested spot diameter is smaller than the tightest zoom beam.

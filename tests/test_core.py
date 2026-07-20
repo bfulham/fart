@@ -253,5 +253,21 @@ class GDTFImportTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
 
+class MultiUniverseTests(unittest.TestCase):
+    def test_channel_conflicts_are_per_universe(self):
+        a = fart.FixtureConfig(name='A', output_universe=1, pan_coarse=1, pan_fine=2, tilt_coarse=3, tilt_fine=4, dimmer=5)
+        b = fart.FixtureConfig(name='B', output_universe=2, pan_coarse=1, pan_fine=2, tilt_coarse=3, tilt_fine=4, dimmer=5)
+        # Duplicate slots on different universes are valid.
+        app_validate = getattr(fart.App, 'validate_channel_conflicts')
+        class Dummy: pass
+        app_validate(Dummy(), [a, b])
+
+    def test_open_dmx_adapter_parser(self):
+        mapping = fart.parse_open_dmx_adapter_map('COM3=0, COM4=1', 'COM9', 0)
+        self.assertEqual(mapping, {0: 'COM3', 1: 'COM4'})
+        fallback = fart.parse_open_dmx_adapter_map('', 'COM9', 7)
+        self.assertEqual(fallback, {7: 'COM9'})
+
+
 if __name__ == '__main__':
     unittest.main()

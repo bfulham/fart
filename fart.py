@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -69,6 +69,9 @@ class FixtureConfig:
     name: str = "Light 1"
     enabled: bool = True
     marker_id: int = 1
+    # Output universe used by this fixture. For Art-Net this is zero-based; for sACN this is one-based.
+    # Existing shows migrate to the global Settings.universe value if this is left unset by old configs.
+    output_universe: int = 0
 
     # Optical centre / pan-tilt pivot in OpenFollow world coordinates.
     x: float = 0.0
@@ -143,6 +146,9 @@ class Settings:
 
     output: str = "Open DMX"
     serial_port: str = "COM3"
+    # Optional multi-adapter Open DMX mapping, one per line or comma separated, e.g. COM3=0, COM4=1.
+    # When empty, serial_port drives the default universe for backwards compatibility.
+    open_dmx_adapters: str = ""
     artnet_ip: str = "255.255.255.255"
     universe: int = 0
     refresh_hz: int = 30
@@ -404,69 +410,106 @@ class ArtNetFaderReceiver:
 
 
 class Output:
-    def send(self, frame): pass
+    def send(self, frames): pass
     def close(self): pass
 
 
-class OpenDMX(Output):
-    """ENTTEC Open DMX USB via FTDI VCP.
+def _frames_to_dict(frames, default_universe=0):
+    """Accept either a legacy 512-byte frame or {universe: frame}."""
+    if isinstance(frames, dict):
+        return {int(k): bytes(v) for k, v in frames.items()}
+    return {int(default_universe): bytes(frames)}
 
-    Open DMX is an unbuffered adapter. The PC must generate BREAK, MAB and all
-    513 serial slots continuously. Timing is therefore best-effort under Windows,
-    but this is the standard VCP approach and is adequate for a rudimentary tool.
-    """
+
+class OpenDMXPort:
+    """One ENTTEC Open DMX USB adapter via FTDI VCP."""
     def __init__(self, port):
         if serial is None: raise RuntimeError("pyserial is missing")
-        self.s = serial.Serial(port=port, baudrate=250000, bytesize=8,
+        self.port = str(port).strip()
+        self.s = serial.Serial(port=self.port, baudrate=250000, bytesize=8,
                                parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_TWO,
                                timeout=0, write_timeout=0.25)
-    def send(self, frame):
-        # DMX512-A minimum BREAK 88 us and MAB 8 us. Windows scheduling is not
-        # microsecond deterministic, so use conservative values.
+    def send_frame(self, frame):
         self.s.break_condition = True
         time.sleep(0.00012)
         self.s.break_condition = False
         time.sleep(0.000012)
-        self.s.write(b"\x00" + frame)
+        self.s.write(b"\x00" + bytes(frame))
     def close(self):
         try: self.s.break_condition = True; time.sleep(0.02); self.s.close()
         except Exception: pass
 
 
+class OpenDMX(Output):
+    """One or more ENTTEC Open DMX USB adapters.
+
+    Open DMX adapters have no universe concept, so FART maps each serial adapter
+    to a software universe. Only frames for the adapter's assigned universe are
+    written to that adapter.
+    """
+    def __init__(self, port_or_map, default_universe=0):
+        self.default_universe = int(default_universe)
+        self.adapters = []
+        if isinstance(port_or_map, dict):
+            mapping = port_or_map
+        else:
+            mapping = {self.default_universe: str(port_or_map)}
+        for universe, port in sorted(mapping.items(), key=lambda item: int(item[0])):
+            port = str(port).strip()
+            if not port:
+                continue
+            self.adapters.append((int(universe), OpenDMXPort(port)))
+        if not self.adapters:
+            raise RuntimeError('No Open DMX adapters are configured')
+    def send(self, frames):
+        frames = _frames_to_dict(frames, self.default_universe)
+        blank = bytes(512)
+        for universe, adapter in self.adapters:
+            adapter.send_frame(frames.get(int(universe), blank))
+    def close(self):
+        for _universe, adapter in self.adapters:
+            adapter.close()
+
+
 class ArtNet(Output):
-    def __init__(self, ip, universe):
-        self.ip, self.u = ip, universe
+    def __init__(self, ip, default_universe=0):
+        self.ip, self.default_universe = ip, int(default_universe)
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    def send(self, frame):
-        hdr = (b"Art-Net\x00" + struct.pack("<H",0x5000) + struct.pack(">H",14) +
-               bytes((0,0)) + struct.pack("<H",self.u) + struct.pack(">H",512))
-        self.s.sendto(hdr + frame, (self.ip,6454))
+    def send(self, frames):
+        for universe, frame in _frames_to_dict(frames, self.default_universe).items():
+            if not 0 <= int(universe) <= 32767:
+                continue
+            hdr = (b"Art-Net\x00" + struct.pack("<H",0x5000) + struct.pack(">H",14) +
+                   bytes((0,0)) + struct.pack("<H",int(universe)) + struct.pack(">H",512))
+            self.s.sendto(hdr + bytes(frame), (self.ip,6454))
     def close(self): self.s.close()
 
 
 class SACN(Output):
-    """ANSI E1.31/sACN multicast output using the ``sacn`` package.
-
-    The package exposes active universes through ``sender[universe]``.  The
-    previous implementation called a non-existent ``get_output`` method and
-    also left multicast disabled, which made startup fail whenever sACN was
-    selected.
-    """
-    def __init__(self, universe, fps=30):
+    """ANSI E1.31/sACN multicast output using the ``sacn`` package."""
+    def __init__(self, universes, fps=30):
         if sACNsender is None:
             raise RuntimeError("sacn is missing")
-        if not 1 <= int(universe) <= 63999:
-            raise ValueError("sACN universe must be between 1 and 63999")
-
-        self.u = int(universe)
+        if isinstance(universes, (int, str)):
+            universes = [int(universes)]
+        self.universes = sorted({int(u) for u in universes})
+        if not self.universes:
+            raise ValueError('At least one sACN universe is required')
+        for universe in self.universes:
+            if not 1 <= int(universe) <= 63999:
+                raise ValueError("sACN universe must be between 1 and 63999")
+        self.default_universe = self.universes[0]
         self.s = sACNsender(source_name=APP_NAME, fps=max(1, min(100, int(fps))))
+        self.outputs = {}
         try:
             self.s.start()
-            self.s.activate_output(self.u)
-            self.out = self.s[self.u]
-            self.out.multicast = True
-            self.out.dmx_data = tuple([0] * 512)
+            for universe in self.universes:
+                self.s.activate_output(universe)
+                out = self.s[universe]
+                out.multicast = True
+                out.dmx_data = tuple([0] * 512)
+                self.outputs[universe] = out
         except Exception:
             try:
                 self.s.stop()
@@ -474,17 +517,18 @@ class SACN(Output):
                 pass
             raise
 
-    def send(self, frame):
-        if len(frame) != 512:
-            raise ValueError("sACN output frame must contain exactly 512 channels")
-        self.out.dmx_data = tuple(frame)
+    def send(self, frames):
+        frames = _frames_to_dict(frames, self.default_universe)
+        blank = tuple([0] * 512)
+        for universe, out in self.outputs.items():
+            frame = frames.get(universe)
+            out.dmx_data = tuple(frame) if frame is not None else blank
 
     def close(self):
         try:
             self.s.stop()
         except Exception:
             pass
-
 
 
 def calculate_aim(fixture: FixtureConfig, x, y, z, previous_pan=None):
@@ -537,6 +581,47 @@ def fixture_channels(fixture: FixtureConfig):
         'focus fine': fixture.focus_fine,
     }
 
+
+
+def enabled_output_universes(settings):
+    universes = sorted({int(f.output_universe) for f in settings.fixtures if f.enabled})
+    return universes or [int(settings.universe)]
+
+
+def blank_frames_for_settings(settings):
+    return {int(u): bytearray(512) for u in enabled_output_universes(settings)}
+
+
+def parse_open_dmx_adapter_map(text, fallback_port, default_universe):
+    """Parse user mapping like 'COM3=0, COM4=1' into {universe: port}.
+
+    The universe is the FART software universe assigned to that Open DMX dongle.
+    Duplicate universes or duplicate ports are rejected by validation.
+    """
+    text = (text or '').strip()
+    if not text:
+        return {int(default_universe): str(fallback_port).strip()}
+    mapping = {}
+    normalized = text.replace('\n', ',').replace(';', ',')
+    for part in normalized.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' not in part:
+            raise ValueError('Open DMX adapters must use COMx=universe, e.g. COM3=0, COM4=1')
+        port, universe = part.split('=', 1)
+        port = port.strip()
+        if not port:
+            raise ValueError('Open DMX adapter mapping has a blank serial port')
+        universe = int(universe.strip())
+        if universe in mapping:
+            raise ValueError(f'Open DMX universe {universe} is assigned to more than one adapter')
+        if port.lower() in [p.lower() for p in mapping.values()]:
+            raise ValueError(f'Open DMX adapter {port} is assigned more than once')
+        mapping[universe] = port
+    if not mapping:
+        raise ValueError('No Open DMX adapters were configured')
+    return mapping
 
 
 def _strip_ns(tag):
@@ -1296,7 +1381,7 @@ class DMXSetupDialog(tk.Toplevel):
 
         out = ttk.LabelFrame(self, text='Output currently selected')
         out.pack(fill='x', padx=10, pady=5)
-        ttk.Label(out, text=f'Output: {self.app.vars["output"].get()}   Universe: {self.app.vars["universe"].get()}').pack(anchor='w', padx=8, pady=6)
+        ttk.Label(out, text=f'Output: {self.app.vars["output"].get()}   Default universe: {self.app.vars["universe"].get()}').pack(anchor='w', padx=8, pady=6)
         ttk.Label(out, text='Change Art-Net/sACN/Open DMX output settings on the Setup tab before starting calibration output.').pack(anchor='w', padx=8, pady=(0, 6))
 
         frame = ttk.LabelFrame(self, text=f'Channels for {self.fixture.name}')
@@ -1590,7 +1675,7 @@ class CalibrationWizard(tk.Toplevel):
         self.output_running = False
         if self.output:
             try:
-                self.output.send(bytes(512)); self.output.close()
+                self.output.send(blank_frames_for_settings(self.app.settings)); self.output.close()
             except Exception:
                 pass
             self.output = None
@@ -1599,13 +1684,14 @@ class CalibrationWizard(tk.Toplevel):
     def output_tick(self):
         if self.output_running and self.output:
             try:
-                frame = bytearray(512)
+                frames = blank_frames_for_settings(self.app.settings)
                 for idx in self.light_indices:
                     fixture = self.fixtures[idx]
                     vars_ = self.control_vars[idx]
+                    frame = frames.setdefault(int(fixture.output_universe), bytearray(512))
                     write_fixture_to_frame(frame, fixture, vars_['pan'].get(), vars_['tilt'].get(), vars_['level'].get(), False,
                                            vars_['zoom'].get(), vars_['iris'].get(), self.app.focus_value)
-                self.output.send(bytes(frame))
+                self.output.send(frames)
             except Exception as exc:
                 self.status_var.set('Output error: ' + str(exc)); self.output_running = False
         if self.winfo_exists():
@@ -1658,6 +1744,7 @@ class App(tk.Tk):
         'artnet_input_channel': int,
         'output': str,
         'serial_port': str,
+        'open_dmx_adapters': str,
         'artnet_ip': str,
         'universe': int,
         'refresh_hz': int,
@@ -1674,6 +1761,7 @@ class App(tk.Tk):
         'name': str,
         'enabled': bool,
         'marker_id': int,
+        'output_universe': int,
         'x': float,
         'y': float,
         'z': float,
@@ -1784,6 +1872,8 @@ class App(tk.Tk):
                         filtered = {k: v for k, v in item.items() if k in FixtureConfig.__dataclass_fields__}
                         if 'marker_id' not in filtered:
                             filtered['marker_id'] = int(data.get('marker_id', 1))
+                        if 'output_universe' not in filtered:
+                            filtered['output_universe'] = int(data.get('universe', 0))
                         fixtures.append(FixtureConfig(**filtered))
 
             # Migrate all pre-0.3 single-light settings automatically.
@@ -1801,7 +1891,7 @@ class App(tk.Tk):
                     'dimmer': 'dimmer', 'shutter': 'shutter',
                     'shutter_open': 'shutter_open',
                 }
-                migrated = {'name': 'Light 1', 'marker_id': int(data.get('marker_id', 1))}
+                migrated = {'name': 'Light 1', 'marker_id': int(data.get('marker_id', 1)), 'output_universe': int(data.get('universe', 0))}
                 for old, new in old_map.items():
                     if old in data:
                         migrated[new] = data[old]
@@ -2013,20 +2103,22 @@ class App(tk.Tk):
         self.logbox.pack(fill='both', expand=True)
 
         # Lights tab
-        list_frame = ttk.LabelFrame(lights_tab, text='Lights in output universe')
+        list_frame = ttk.LabelFrame(lights_tab, text='Lights')
         list_frame.pack(side='left', fill='y', padx=8, pady=8)
         self.light_tree = ttk.Treeview(
-            list_frame, columns=('enabled', 'marker', 'position', 'channels'), show='tree headings',
+            list_frame, columns=('enabled', 'marker', 'universe', 'position', 'channels'), show='tree headings',
             selectmode='extended', height=22
         )
         self.light_tree.heading('#0', text='Name')
         self.light_tree.heading('enabled', text='On')
         self.light_tree.heading('marker', text='Marker')
+        self.light_tree.heading('universe', text='Universe')
         self.light_tree.heading('position', text='Position X,Y,Z')
         self.light_tree.heading('channels', text='Pan/Tilt')
         self.light_tree.column('#0', width=130)
         self.light_tree.column('enabled', width=40, anchor='center')
         self.light_tree.column('marker', width=60, anchor='center')
+        self.light_tree.column('universe', width=70, anchor='center')
         self.light_tree.column('position', width=145)
         self.light_tree.column('channels', width=90)
         self.light_tree.pack(fill='both', expand=True, padx=5, pady=5)
@@ -2056,10 +2148,11 @@ class App(tk.Tk):
         marker_var = self.light_var('marker_id', int)
         self.light_marker_combo = ttk.Combobox(identity, textvariable=marker_var, width=16)
         self.light_marker_combo.grid(row=2, column=1, sticky='ew', padx=4, pady=3)
-        self.add_light_entry(identity, 3, 'Optical centre X', 'x')
-        self.add_light_entry(identity, 4, 'Optical centre Y', 'y')
-        self.add_light_entry(identity, 5, 'Optical centre Z', 'z')
-        self.add_light_entry(identity, 6, 'Intensity scale', 'intensity_scale')
+        self.add_light_entry(identity, 3, 'Output universe', 'output_universe', int)
+        self.add_light_entry(identity, 4, 'Optical centre X', 'x')
+        self.add_light_entry(identity, 5, 'Optical centre Y', 'y')
+        self.add_light_entry(identity, 6, 'Optical centre Z', 'z')
+        self.add_light_entry(identity, 7, 'Intensity scale', 'intensity_scale')
 
         mapping = ttk.LabelFrame(geometry_page, text='Physical angle mapping')
         mapping.pack(side='left', fill='y', padx=6, pady=6)
@@ -2114,8 +2207,8 @@ class App(tk.Tk):
 
         ttk.Label(
             dmx_page,
-            text='All lights share the selected 512-channel output universe.\n'
-                 'The app rejects overlapping enabled channels so one light cannot overwrite another.',
+            text='Each light can target its own output universe.\n'
+                 'Channel overlap checks are per universe, so addresses can be reused safely on different universes.',
             justify='left'
         ).pack(side='left', anchor='n', padx=12, pady=12)
 
@@ -2149,14 +2242,19 @@ class App(tk.Tk):
         ttk.Button(output_settings, text='Refresh ports', command=self.refresh_ports).grid(
             row=1, column=0, columnspan=2, sticky='ew', padx=4, pady=3
         )
-        self.add_entry(output_settings, 2, 'Art-Net target IP', 'artnet_ip', str, 18)
-        self.add_entry(output_settings, 3, 'Universe', 'universe', int)
+        self.add_entry(output_settings, 2, 'Default universe', 'universe', int)
+        self.add_entry(output_settings, 3, 'Art-Net target IP', 'artnet_ip', str, 18)
+        ttk.Label(output_settings, text='Open DMX adapters').grid(row=4, column=0, sticky='nw', padx=4, pady=3)
+        ttk.Entry(output_settings, textvariable=self.var('open_dmx_adapters', str), width=32).grid(
+            row=4, column=1, sticky='ew', padx=4, pady=3
+        )
         ttk.Label(
             output_settings,
-            text='Open DMX requires the FTDI Virtual COM Port driver.\n'
-                 'Art-Net universe is zero-based; sACN universe is one-based.',
-            justify='left'
-        ).grid(row=4, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+            text='Open DMX mapping example: COM3=0, COM4=1.\n'
+                 'Leave blank to use Serial port for the default universe.\n'
+                 'Art-Net universes are zero-based; sACN universes are one-based.',
+            justify='left', wraplength=280
+        ).grid(row=5, column=0, columnspan=2, sticky='w', padx=4, pady=8)
 
         # Calibration tab
         calibration = ttk.LabelFrame(calibration_tab, text='Selected-light pointing verification')
@@ -2329,7 +2427,7 @@ class App(tk.Tk):
         iid = str(index)
         position = f'{fixture.x:g}, {fixture.y:g}, {fixture.z:g}'
         pan_tilt = f'{fixture.pan_coarse}/{fixture.tilt_coarse}'
-        values = ('Yes' if fixture.enabled else 'No', fixture.marker_id, position, pan_tilt)
+        values = ('Yes' if fixture.enabled else 'No', fixture.marker_id, fixture.output_universe, position, pan_tilt)
         if self.light_tree.exists(iid):
             self.light_tree.item(iid, text=fixture.name, values=values)
         else:
@@ -2405,6 +2503,8 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: pan and tilt directions must be +1 or -1')
         if fixture.marker_id < 0 or fixture.marker_id > 65535:
             raise ValueError(f'{fixture.name}: PSN marker ID must be 0–65535')
+        if fixture.output_universe < 0:
+            raise ValueError(f'{fixture.name}: output universe cannot be negative')
         if fixture.intensity_scale < 0:
             raise ValueError(f'{fixture.name}: intensity scale cannot be negative')
         if not 0 <= fixture.shutter_open <= 255:
@@ -2565,10 +2665,16 @@ class App(tk.Tk):
             raise ValueError('OSC argument index cannot be negative')
         if not 1 <= settings.artnet_input_channel <= 512:
             raise ValueError('Art-Net input channel must be 1–512')
-        if settings.output == 'Art-Net' and not 0 <= settings.universe <= 32767:
-            raise ValueError('Art-Net universe must be between 0 and 32767')
-        if settings.output == 'sACN' and not 1 <= settings.universe <= 63999:
-            raise ValueError('sACN universe must be between 1 and 63999')
+        for universe in enabled_output_universes(settings):
+            if settings.output == 'Art-Net' and not 0 <= universe <= 32767:
+                raise ValueError('Art-Net fixture output universes must be between 0 and 32767')
+            if settings.output == 'sACN' and not 1 <= universe <= 63999:
+                raise ValueError('sACN fixture output universes must be between 1 and 63999')
+        if settings.output == 'Open DMX':
+            mapping = parse_open_dmx_adapter_map(settings.open_dmx_adapters, settings.serial_port, settings.universe)
+            missing = [u for u in enabled_output_universes(settings) if u not in mapping]
+            if missing:
+                raise ValueError('Open DMX needs an adapter for every enabled output universe. Missing: ' + ', '.join(map(str, missing)))
         if not any(fixture.enabled for fixture in settings.fixtures):
             raise ValueError('At least one light must be enabled')
         for fixture in settings.fixtures:
@@ -2582,6 +2688,7 @@ class App(tk.Tk):
             if not fixture.enabled:
                 continue
             local = {}
+            universe = int(fixture.output_universe)
             for label, channel in fixture_channels(fixture).items():
                 if channel == 0:
                     continue
@@ -2590,12 +2697,13 @@ class App(tk.Tk):
                         f'{fixture.name}: DMX channel {channel} is assigned to both {local[channel]} and {label}'
                     )
                 local[channel] = label
-                if channel in owners:
-                    other_name, other_label = owners[channel]
+                key = (universe, channel)
+                if key in owners:
+                    other_name, other_label = owners[key]
                     raise ValueError(
-                        f'DMX channel {channel} overlaps: {other_name} {other_label} and {fixture.name} {label}'
+                        f'Universe {universe} DMX channel {channel} overlaps: {other_name} {other_label} and {fixture.name} {label}'
                     )
-                owners[channel] = (fixture.name, label)
+                owners[key] = (fixture.name, label)
 
     def save(self):
         try:
@@ -2773,11 +2881,13 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
 
     def make_output(self, settings):
+        universes = enabled_output_universes(settings)
         if settings.output == 'Open DMX':
-            return OpenDMX(settings.serial_port)
+            mapping = parse_open_dmx_adapter_map(settings.open_dmx_adapters, settings.serial_port, settings.universe)
+            return OpenDMX(mapping, settings.universe)
         if settings.output == 'Art-Net':
             return ArtNet(settings.artnet_ip, settings.universe)
-        return SACN(settings.universe, settings.refresh_hz)
+        return SACN(universes, settings.refresh_hz)
 
     def make_fader_input(self, settings):
         if settings.fader_mode == 'Manual':
@@ -2864,7 +2974,7 @@ class App(tk.Tk):
                 pass
         if self.output:
             try:
-                self.output.send(bytes(512))
+                self.output.send(blank_frames_for_settings(self.settings))
                 time.sleep(0.05)
                 self.output.close()
             except Exception:
@@ -2884,7 +2994,7 @@ class App(tk.Tk):
                 fader, _fader_time = self.fader.get()
                 smoothing = clamp(settings.smoothing, 0.0, 0.95)
                 alpha = 1.0 - smoothing
-                frame = bytearray(512)
+                frames = blank_frames_for_settings(settings)
                 light_statuses = []
 
                 for index, fixture in enumerate(settings.fixtures):
@@ -2915,12 +3025,13 @@ class App(tk.Tk):
                             zoom_out, iris_out, zoom_angle, zoom_auto, iris_auto = auto_beam_for_distance(
                                 fixture, distance, settings.auto_beam_diameter_m, self.zoom_value, self.iris_value
                             )
+                        frame = frames.setdefault(int(fixture.output_universe), bytearray(512))
                         status = write_fixture_to_frame(
                             frame, fixture, pan, tilt, fader, blackout,
                             zoom_out, iris_out, self.focus_value
                         )
                         status.update({
-                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
+                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id, 'output_universe': fixture.output_universe,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'bearing': bearing, 'elevation': elevation, 'distance': distance,
                             'zoom_value': zoom_out, 'iris_value': iris_out, 'zoom_angle': zoom_angle, 'zoom_auto': zoom_auto, 'iris_auto': iris_auto,
@@ -2929,13 +3040,13 @@ class App(tk.Tk):
                         light_statuses.append(status)
                     except ValueError as exc:
                         light_statuses.append({
-                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
+                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id, 'output_universe': fixture.output_universe,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'error': str(exc), 'stale': stale, 'blackout': True,
                             'pan_limit': False, 'tilt_limit': False,
                         })
 
-                self.output.send(bytes(frame))
+                self.output.send(frames)
                 self.live = {
                     'fader': fader,
                     'blackout': not self.arm_var.get(),
