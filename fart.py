@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -834,62 +834,187 @@ def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5,
     }
 
 
+
+def _solve_3x3(matrix, vector):
+    """Small dependency-free 3x3 linear solver for calibration."""
+    a = [list(map(float, row)) + [float(vector[i])] for i, row in enumerate(matrix)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda row: abs(a[row][col]))
+        if abs(a[pivot][col]) < 1e-9:
+            raise ValueError('Calibration geometry is degenerate; use wider-spaced target points')
+        if pivot != col:
+            a[col], a[pivot] = a[pivot], a[col]
+        div = a[col][col]
+        for j in range(col, 4):
+            a[col][j] /= div
+        for row in range(3):
+            if row == col:
+                continue
+            factor = a[row][col]
+            for j in range(col, 4):
+                a[row][j] -= factor * a[col][j]
+    return [a[i][3] for i in range(3)]
+
+
+def _direction_from_bearing_elevation(bearing, elevation):
+    b = math.radians(bearing)
+    e = math.radians(elevation)
+    ce = math.cos(e)
+    return (math.sin(b) * ce, math.cos(b) * ce, math.sin(e))
+
+
+def _closest_point_to_lines(line_points, line_dirs):
+    """Return the point closest to all 3D lines using normal equations."""
+    m = [[0.0, 0.0, 0.0] for _ in range(3)]
+    v = [0.0, 0.0, 0.0]
+    for point, direction in zip(line_points, line_dirs):
+        dx, dy, dz = direction
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length < 1e-9:
+            continue
+        dx, dy, dz = dx / length, dy / length, dz / length
+        # Projection matrix onto the plane perpendicular to the line.
+        proj = [
+            [1.0 - dx * dx, -dx * dy, -dx * dz],
+            [-dy * dx, 1.0 - dy * dy, -dy * dz],
+            [-dz * dx, -dz * dy, 1.0 - dz * dz],
+        ]
+        px, py, pz = point
+        for r in range(3):
+            for c in range(3):
+                m[r][c] += proj[r][c]
+            v[r] += proj[r][0] * px + proj[r][1] * py + proj[r][2] * pz
+    return _solve_3x3(m, v)
+
+
 def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
-    """Estimate fixture position and zero-angle mapping from aimed samples."""
+    """Estimate fixture position and zero-angle mapping from aimed samples.
+
+    The v1.0.1 solver uses the captured pan/tilt values as rays aimed at known
+    points. For a candidate pan-zero and tilt-zero, it triangulates the fixture
+    position as the closest point to all reverse rays, then scores the result.
+    This is more stable than the original unconstrained five-parameter hill
+    climb, which could occasionally find mathematically valid but physically
+    ridiculous solutions such as a 100 m fixture height.
+    """
     if len(samples) < 4:
         raise ValueError('At least four calibration points are required')
     points = [(float(x), float(y), float(z), float(pan), float(tilt)) for x, y, z, pan, tilt in samples]
-    avg_x = sum(p[0] for p in points) / len(points)
-    avg_y = sum(p[1] for p in points) / len(points)
-    avg_z = sum(p[2] for p in points) / len(points)
+    target_points = [(p[0], p[1], p[2]) for p in points]
+    min_x, max_x = min(p[0] for p in points), max(p[0] for p in points)
+    min_y, max_y = min(p[1] for p in points), max(p[1] for p in points)
+    min_z, max_z = min(p[2] for p in points), max(p[2] for p in points)
 
-    def make_fixture(params):
+    # Generous physical sanity bounds. They prevent false minima while still
+    # supporting unusually high truss positions. Users can seed the existing
+    # fixture height before calibration if their rig is taller than this.
+    xy_margin = 60.0
+    if base_fixture.z > max_z + 1.0:
+        z_low = max(-2.0, min(max_z + 0.2, base_fixture.z - 20.0))
+        z_high = max(max_z + 35.0, base_fixture.z + 20.0)
+    else:
+        z_low = -2.0
+        z_high = max(max_z + 35.0, base_fixture.z + 20.0, 20.0)
+
+    def make_fixture(position, pan_zero, tilt_zero):
         f = FixtureConfig(**asdict(base_fixture))
-        f.x, f.y, f.z, f.pan_zero_bearing, f.tilt_zero_elevation = params
+        f.x, f.y, f.z = position
+        f.pan_zero_bearing = wrap180(pan_zero)
+        f.tilt_zero_elevation = tilt_zero
         f.pan_offset = 0.0
         f.tilt_offset = 0.0
         return f
 
-    def loss(params):
-        f = make_fixture(params)
+    def candidate_from_zeros(pan_zero, tilt_zero):
+        dirs = []
+        for _tx, _ty, _tz, observed_pan, observed_tilt in points:
+            bearing = pan_zero + (observed_pan - base_fixture.pan_offset) / (base_fixture.pan_direction or 1)
+            elevation = tilt_zero + (observed_tilt - base_fixture.tilt_offset) / (base_fixture.tilt_direction or 1)
+            dirs.append(_direction_from_bearing_elevation(bearing, elevation))
+        position = _closest_point_to_lines(target_points, dirs)
+        return position, dirs
+
+    def loss_for_zeros(pan_zero, tilt_zero):
+        try:
+            position, dirs = candidate_from_zeros(pan_zero, tilt_zero)
+        except Exception:
+            return 1e12, None
+        x, y, z = position
         total = 0.0
-        for tx, ty, tz, observed_pan, observed_tilt in points:
+        # Ray-distance error: every known point should lie on the ray from the
+        # solved fixture position in the decoded pan/tilt direction.
+        for (tx, ty, tz, observed_pan, observed_tilt), direction in zip(points, dirs):
+            vx, vy, vz = tx - x, ty - y, tz - z
+            dx, dy, dz = direction
+            along = vx * dx + vy * dy + vz * dz
+            closest = (x + dx * along, y + dy * along, z + dz * along)
+            err = math.dist((tx, ty, tz), closest)
+            total += err * err
+            if along <= 0:
+                total += 5000.0 + abs(along) * 100.0
+            # Retain angular scoring too, so pan wrap and tilt sign mistakes are obvious.
+            f = make_fixture(position, pan_zero, tilt_zero)
             try:
                 _b, _e, pan, tilt, _d = calculate_aim(f, tx, ty, tz, observed_pan)
+                total += (wrap180(pan - observed_pan) * 0.05) ** 2 + ((tilt - observed_tilt) * 0.05) ** 2
             except Exception:
-                return 1e12
-            total += wrap180(pan - observed_pan) ** 2 + (tilt - observed_tilt) ** 2
-        total += max(0.0, -params[2]) ** 2 * 0.1
-        total += (abs(params[0] - avg_x) + abs(params[1] - avg_y) + abs(params[2] - avg_z)) * 0.001
-        return total / len(points)
+                total += 1e6
+        # Strong but soft bounds. A bad calibration should fail loudly rather
+        # than silently applying a fixture 100 m in the air.
+        if not (min_x - xy_margin <= x <= max_x + xy_margin):
+            total += (min(abs(x - (min_x - xy_margin)), abs(x - (max_x + xy_margin))) * 50.0) ** 2
+        if not (min_y - xy_margin <= y <= max_y + xy_margin):
+            total += (min(abs(y - (min_y - xy_margin)), abs(y - (max_y + xy_margin))) * 50.0) ** 2
+        if z < z_low:
+            total += ((z_low - z) * 80.0) ** 2
+        if z > z_high:
+            total += ((z - z_high) * 80.0) ** 2
+        if base_fixture.z > max_z + 0.5:
+            total += ((z - base_fixture.z) / 12.0) ** 2
+        return total / len(points), position
 
+    # Search around likely zero orientations. Include the current fixture
+    # values and the common downward-hung moving-head case around -90 degrees.
     starts = []
-    for sx in (base_fixture.x, avg_x, 0.0, min(p[0] for p in points) - 5.0, max(p[0] for p in points) + 5.0):
-        for sy in (base_fixture.y, avg_y - 8.0, avg_y + 8.0, -8.0, 8.0):
-            for sz in (base_fixture.z, max(avg_z + 4.0, 3.0), 6.0, 10.0):
-                starts.append([sx, sy, sz, base_fixture.pan_zero_bearing, base_fixture.tilt_zero_elevation])
+    for p0 in (base_fixture.pan_zero_bearing, 0.0, 90.0, -90.0, 180.0, -180.0):
+        for t0 in (base_fixture.tilt_zero_elevation, -90.0, 0.0, 90.0):
+            starts.append((wrap180(p0), t0))
+
     best = None
     best_loss = float('inf')
-    for start in starts:
-        params = [float(v) for v in start]
-        steps = [4.0, 4.0, 3.0, 35.0, 20.0]
-        current = loss(params)
-        for _ in range(120):
+    for start_pan, start_tilt in starts:
+        params = [float(start_pan), float(start_tilt)]
+        steps = [45.0, 30.0]
+        current, pos = loss_for_zeros(*params)
+        for _ in range(140):
             improved = False
-            for i in range(5):
+            for i in range(2):
                 for sign in (1.0, -1.0):
                     trial = params[:]
                     trial[i] += steps[i] * sign
-                    value = loss(trial)
+                    if i == 0:
+                        trial[i] = wrap180(trial[i])
+                    value, trial_pos = loss_for_zeros(*trial)
                     if value < current:
-                        params, current, improved = trial, value, True
+                        params, current, pos, improved = trial, value, trial_pos, True
             if not improved:
                 steps = [step * 0.55 for step in steps]
-                if max(steps) < 0.005:
+                if max(steps) < 0.002:
                     break
-        if current < best_loss:
-            best, best_loss = params, current
-    solved = make_fixture(best)
+        if current < best_loss and pos is not None:
+            best = (params[:], pos)
+            best_loss = current
+
+    if best is None:
+        raise ValueError('Calibration failed; check captured points and pan/tilt directions')
+    (pan_zero, tilt_zero), position = best
+    x, y, z = position
+    if z > z_high + 0.5 or z < z_low - 0.5:
+        raise ValueError(
+            f'Calibration result was physically implausible: Z={z:.2f} m. '
+            'Check tilt direction and capture points, or seed the fixture with an approximate height first.'
+        )
+    solved = make_fixture(position, pan_zero, tilt_zero)
     solved.x = round(solved.x, 4)
     solved.y = round(solved.y, 4)
     solved.z = round(solved.z, 4)
@@ -897,7 +1022,8 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
     solved.tilt_zero_elevation = round(solved.tilt_zero_elevation, 4)
     solved.pan_offset = 0.0
     solved.tilt_offset = 0.0
-    return solved, math.sqrt(best_loss)
+    rms_metres = math.sqrt(max(best_loss, 0.0))
+    return solved, rms_metres
 
 
 

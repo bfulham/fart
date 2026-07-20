@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 - Production baseline
+## 1.0.1 - Production baseline
 
 - Rebuilt the repository as a clean GitHub-ready release with no generated caches or prototype leftovers.
 - Kept existing tested functionality: PSN marker tracking, per-light marker assignment, multi-light aiming, manual/OSC/Art-Net fader modes, Art-Net/sACN/Open DMX output, GDTF import, beam controls, and multi-fixture calibration.
