@@ -2,7 +2,7 @@
 
 **Fixture Aiming and Remote Tracking**
 
-Version 1.1.0 keeps the production v1 baseline and adds a clearer Operator/Setup UI split plus automatic beam-size zoom control when fixture beam-angle data is available from GDTF or manual entry.
+Version 1.2.0 keeps the production v1 baseline and adds automatic beam-size control using zoom first and iris assist when the requested spot is tighter than zoom can achieve. Auto mode still greys out unless at least one enabled fixture has physical zoom beam-angle data from GDTF or manual entry.
 
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
@@ -149,7 +149,7 @@ FART blocks startup if enabled fixtures overlap on any configured DMX channel.
 
 ## Zoom, iris, and focus
 
-The **Operator** tab includes live controls for zoom, iris, and focus. Zoom can run in **Manual** mode, where the shared 0–100% zoom slider is sent to every enabled light with a zoom channel, or **Auto beam size** mode, where FART calculates a zoom value per fixture so the beam is roughly the requested diameter at the marker. Auto mode is greyed out until at least one enabled fixture has beam-angle data.
+The **Operator** tab includes live controls for zoom, iris, and focus. Zoom can run in **Manual** mode, where the shared 0–100% zoom slider is sent to every enabled light with a zoom channel, or **Auto beam size** mode, where FART calculates a zoom value per fixture so the beam is roughly the requested diameter at the marker. If the zoom reaches its tightest beam and the GDTF/manual iris model provides physical aperture values, FART then closes the iris just enough to approximate the remaining size reduction. Auto mode is greyed out until at least one enabled fixture has zoom beam-angle data.
 
 - Zoom supports an optional fine channel for 16-bit output.
 - Iris is 8-bit.
@@ -224,6 +224,6 @@ FART is released under the [MIT License](LICENSE).
 
 FART can import a DMX channel map from a `.gdtf` fixture file from either the main light editor or the DMX setup step before calibration. When a GDTF contains multiple DMX modes, FART asks which mode to import so it can match the mode patched in MA3 or on the real fixture.
 
-The importer fills common attributes where they are present in the selected mode: pan, tilt, dimmer, shutter, zoom, iris, focus, and supported fine channels. It also attempts to derive practical defaults from the GDTF channel ranges, including a shutter-open value, an iris 100% cap so the iris slider does not run into pulse/pattern/effect ranges, and zoom physical beam angles from GDTF `PhysicalFrom`/`PhysicalTo` data when present.
+The importer fills common attributes where they are present in the selected mode: pan, tilt, dimmer, shutter, zoom, iris, focus, and supported fine channels. It also attempts to derive practical defaults from the GDTF channel ranges, including a shutter-open value, an iris 100% cap so the iris slider does not run into pulse/pattern/effect ranges, zoom physical beam angles from GDTF `PhysicalFrom`/`PhysicalTo` data, and iris physical aperture values such as `1` open to `0` closed when present.
 
 Use GDTF import as a setup helper only: always verify the imported channels and values against the fixture manual before moving real fixtures. Complex GDTF personalities may still need manual correction.

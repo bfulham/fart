@@ -126,6 +126,25 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNone(angle)
         self.assertAlmostEqual(value, 0.42)
 
+    def test_auto_beam_uses_iris_when_zoom_not_tight_enough(self):
+        fixture = fart.FixtureConfig(
+            zoom=10,
+            iris=11,
+            zoom_angle_at_0=2.0,
+            zoom_angle_at_100=45.0,
+            iris_physical_at_0=1.0,
+            iris_physical_at_100=0.0,
+        )
+        zoom, iris, angle, zoom_available, iris_used = fart.auto_beam_for_distance(
+            fixture, distance=100.0, target_diameter_m=1.0, fallback_zoom=0.5, fallback_iris=1.0
+        )
+        self.assertTrue(zoom_available)
+        self.assertTrue(iris_used)
+        self.assertAlmostEqual(zoom, 0.0)
+        self.assertGreater(iris, 0.0)
+        self.assertLess(iris, 1.0)
+        self.assertAlmostEqual(angle, math.degrees(2.0 * math.atan(0.5 / 100.0)), places=6)
+
 
 class PSNTests(unittest.TestCase):
     def test_openfollow_flagged_position_leaf_is_decoded(self):
@@ -198,7 +217,7 @@ class ChannelTests(unittest.TestCase):
 
 class GDTFImportTests(unittest.TestCase):
     def make_gdtf(self):
-        xml = '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n    <DMXMode Name="Basic">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" /></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n    <DMXMode Name="Extended">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Shutter1"><ChannelFunction Name="Shutter closed" Attribute="Shutter1" DMXFrom="0/1" DMXTo="19/1"/><ChannelFunction Name="Shutter open" Attribute="Shutter1" DMXFrom="20/1" DMXTo="49/1"/><ChannelFunction Name="Strobe" Attribute="Shutter1" DMXFrom="50/1" DMXTo="200/1"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="2 3"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="14 15"><LogicalChannel Attribute="Zoom"><ChannelFunction Name="Zoom" Attribute="Zoom" DMXFrom="0/2" DMXTo="65535/2" PhysicalFrom="2" PhysicalTo="45"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="16 17"><LogicalChannel Attribute="Focus"><ChannelFunction Name="Focus" Attribute="Focus" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="18 19"><LogicalChannel Attribute="Pan"><ChannelFunction Name="Pan" Attribute="Pan" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="20 21"><LogicalChannel Attribute="Tilt"><ChannelFunction Name="Tilt" Attribute="Tilt" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="13"><LogicalChannel Attribute="Iris"><ChannelFunction Name="Iris" Attribute="Iris" DMXFrom="0/1" DMXTo="191/1"/><ChannelFunction Name="Iris pulse effect" Attribute="Iris" DMXFrom="192/1" DMXTo="255/1"/></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n  </DMXModes>\n</FixtureType>\n'
+        xml = '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n    <DMXMode Name="Basic">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" /></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n    <DMXMode Name="Extended">\n      <DMXChannels>\n        <DMXChannel Offset="1"><LogicalChannel Attribute="Shutter1"><ChannelFunction Name="Shutter closed" Attribute="Shutter1" DMXFrom="0/1" DMXTo="19/1"/><ChannelFunction Name="Shutter open" Attribute="Shutter1" DMXFrom="20/1" DMXTo="49/1"/><ChannelFunction Name="Strobe" Attribute="Shutter1" DMXFrom="50/1" DMXTo="200/1"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="2 3"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="14 15"><LogicalChannel Attribute="Zoom"><ChannelFunction Name="Zoom" Attribute="Zoom" DMXFrom="0/2" DMXTo="65535/2" PhysicalFrom="2" PhysicalTo="45"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="16 17"><LogicalChannel Attribute="Focus"><ChannelFunction Name="Focus" Attribute="Focus" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="18 19"><LogicalChannel Attribute="Pan"><ChannelFunction Name="Pan" Attribute="Pan" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="20 21"><LogicalChannel Attribute="Tilt"><ChannelFunction Name="Tilt" Attribute="Tilt" DMXFrom="0/2" DMXTo="65535/2"/></LogicalChannel></DMXChannel>\n        <DMXChannel Offset="13"><LogicalChannel Attribute="Iris"><ChannelFunction Name="Iris" Attribute="Iris" DMXFrom="0/1" DMXTo="191/1" PhysicalFrom="1" PhysicalTo="0"/><ChannelFunction Name="Iris pulse effect" Attribute="Iris" DMXFrom="192/1" DMXTo="255/1"/></LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n  </DMXModes>\n</FixtureType>\n'
         tmp = tempfile.NamedTemporaryFile(suffix='.gdtf', delete=False)
         tmp.close()
         with zipfile.ZipFile(tmp.name, 'w') as zf:
@@ -218,6 +237,8 @@ class GDTFImportTests(unittest.TestCase):
             self.assertEqual(mapping['dimmer_fine'], 103)
             self.assertEqual(mapping['iris'], 113)
             self.assertEqual(mapping['iris_100_dmx'], 191)
+            self.assertEqual(mapping['iris_physical_at_0'], 1.0)
+            self.assertEqual(mapping['iris_physical_at_100'], 0.0)
             self.assertEqual(mapping['zoom'], 114)
             self.assertEqual(mapping['zoom_fine'], 115)
             self.assertEqual(mapping['zoom_angle_at_0'], 2.0)

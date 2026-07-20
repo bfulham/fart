@@ -1,6 +1,14 @@
 # Changelog
 
-## 1.1.0
+## 1.2.0
+
+- Added iris-assisted Auto beam size. FART now uses zoom first, then closes iris if the requested spot diameter is smaller than the tightest zoom beam.
+- Added per-fixture iris physical model fields: Iris physical at 0% and Iris physical at 100%.
+- GDTF import now reads Iris `PhysicalFrom` / `PhysicalTo` values when available, including common `1=open` to `0=closed` files.
+- Operator overview now shows auto beam zoom and iris values.
+- Added automated tests for iris-assisted beam sizing and GDTF iris physical import.
+
+## 1.2.0
 
 - Renamed the live run page to Operator and setup pages to Setup: Lights/I/O/Calibration.
 - Added Auto beam size zoom mode.

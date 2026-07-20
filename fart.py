@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -105,6 +105,12 @@ class FixtureConfig:
     zoom_fine: int = 0
     iris: int = 0
     iris_100_dmx: int = 255
+    # Optional physical iris model used by automatic beam-size assist.
+    # Values describe the relative clear beam diameter at iris UI 0% and 100%.
+    # Typical GDTF iris PhysicalFrom/To values are 1.0=open and 0.0=closed.
+    # Leave both as 0 to disable automatic iris assist for that fixture.
+    iris_physical_at_0: float = 0.0
+    iris_physical_at_100: float = 0.0
     focus: int = 0
     focus_fine: int = 0
     zoom_reverse: bool = False
@@ -713,6 +719,59 @@ def auto_zoom_for_distance(fixture, distance, target_diameter_m, fallback_zoom=0
     return clamp(value, 0.0, 1.0), required, True
 
 
+def fixture_has_iris_model(fixture):
+    try:
+        p0 = float(getattr(fixture, 'iris_physical_at_0', 0.0))
+        p100 = float(getattr(fixture, 'iris_physical_at_100', 0.0))
+    except Exception:
+        return False
+    return int(getattr(fixture, 'iris', 0)) > 0 and abs(p100 - p0) > 0.001
+
+
+def _iris_control_for_physical(fixture, desired_physical, fallback_iris=1.0):
+    """Return normalized iris control for a desired physical aperture fraction.
+
+    Physical values are relative clear beam diameter, usually 1.0 fully open and
+    0.0 fully closed. The returned value is the UI/control value before the
+    existing iris_reverse DMX mapping is applied by write_fixture_to_frame().
+    """
+    if not fixture_has_iris_model(fixture):
+        return clamp(fallback_iris, 0.0, 1.0), False
+    p0 = float(fixture.iris_physical_at_0)
+    p100 = float(fixture.iris_physical_at_100)
+    if getattr(fixture, 'iris_reverse', False):
+        p0, p100 = p100, p0
+    value = (float(desired_physical) - p0) / (p100 - p0)
+    return clamp(value, 0.0, 1.0), True
+
+
+def auto_beam_for_distance(fixture, distance, target_diameter_m, fallback_zoom=0.5, fallback_iris=1.0):
+    """Return automatic zoom and iris values for a desired spot diameter.
+
+    Zoom is used first. If the target beam angle is smaller than the tightest
+    available zoom angle, and the fixture has an iris physical model, the iris is
+    closed just enough to approximate the remaining reduction. Returns:
+
+        zoom, iris, required_angle, zoom_available, iris_used
+    """
+    zoom, required, available = auto_zoom_for_distance(fixture, distance, target_diameter_m, fallback_zoom)
+    if not available or required is None:
+        return zoom, clamp(fallback_iris, 0.0, 1.0), required, False, False
+
+    a0 = float(fixture.zoom_angle_at_0)
+    a100 = float(fixture.zoom_angle_at_100)
+    achieved_angle = a0 + (a100 - a0) * zoom
+
+    desired_physical = 1.0
+    iris_used = False
+    if achieved_angle > required + 0.0001 and achieved_angle > 0:
+        desired_physical = clamp(required / achieved_angle, 0.0, 1.0)
+        iris_used = True
+
+    iris, iris_available = _iris_control_for_physical(fixture, desired_physical, fallback_iris)
+    return zoom, iris, required, True, bool(iris_used and iris_available)
+
+
 def _gdtf_range_from_node(node):
     start = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXFrom', ''))
     end = _parse_gdtf_dmx_value(_xml_attr(node, 'DMXTo', ''))
@@ -786,6 +845,35 @@ def _derive_iris_100_value(dmx_channel):
     if useful:
         return int(clamp(max(e for _s, e, _n in useful), 0, 255))
     return None
+
+
+def _derive_iris_physical_values(dmx_channel):
+    """Return physical iris values at control 0% and 100% when available.
+
+    GDTF iris functions often use PhysicalFrom=1 and PhysicalTo=0 for full
+    open to full closed. Prefer the widest non-effect iris function.
+    """
+    candidates = []
+    effect_words = ('effect', 'macro', 'pulse', 'random', 'strobe', 'shake', 'pattern', 'animation')
+    for node in dmx_channel.iter():
+        tag = _strip_ns(node.tag)
+        if tag not in ('ChannelFunction', 'LogicalChannel'):
+            continue
+        attr_text = ' '.join(filter(None, [_xml_attr(node, 'Attribute', ''), _xml_attr(node, 'Name', '')])).lower()
+        if 'iris' not in attr_text:
+            continue
+        if any(word in attr_text for word in effect_words):
+            continue
+        physical_from = _parse_gdtf_physical(_xml_attr(node, 'PhysicalFrom', ''))
+        physical_to = _parse_gdtf_physical(_xml_attr(node, 'PhysicalTo', ''))
+        if physical_from is None or physical_to is None:
+            continue
+        r = _gdtf_range_from_node(node) or (0, 255)
+        candidates.append((abs(r[1] - r[0]), float(physical_from), float(physical_to)))
+    if not candidates:
+        return None
+    _span, p0, p100 = max(candidates, key=lambda item: item[0])
+    return p0, p100
 
 
 def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
@@ -874,6 +962,10 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
                 found['zoom_angle_at_100'] = round(float(zoom_angles[1]), 4)
         elif kind == 'iris':
             found['iris'] = abs_offsets[0]
+            iris_physical = _derive_iris_physical_values(dmx_channel)
+            if iris_physical:
+                found['iris_physical_at_0'] = round(float(iris_physical[0]), 4)
+                found['iris_physical_at_100'] = round(float(iris_physical[1]), 4)
         elif kind == 'focus':
             found['focus'] = abs_offsets[0]
             if len(abs_offsets) > 1:
@@ -1175,6 +1267,8 @@ class DMXSetupDialog(tk.Toplevel):
         ('zoom_angle_at_100', 'Beam angle at zoom 100%', False),
         ('iris', 'Iris', False),
         ('iris_100_dmx', 'Iris 100% DMX', False),
+        ('iris_physical_at_0', 'Iris physical at 0%', False),
+        ('iris_physical_at_100', 'Iris physical at 100%', False),
         ('focus', 'Focus coarse', False),
         ('focus_fine', 'Focus fine', False),
     ]
@@ -1209,7 +1303,7 @@ class DMXSetupDialog(tk.Toplevel):
         frame.pack(fill='both', expand=True, padx=10, pady=8)
         for row, (field, label, required) in enumerate(self.CHANNEL_FIELDS):
             ttk.Label(frame, text=label + (' *' if required else '')).grid(row=row, column=0, sticky='w', padx=8, pady=4)
-            if field in ('zoom_angle_at_0', 'zoom_angle_at_100'):
+            if field in ('zoom_angle_at_0', 'zoom_angle_at_100', 'iris_physical_at_0', 'iris_physical_at_100'):
                 var = tk.DoubleVar(value=float(getattr(self.fixture, field)))
             else:
                 var = tk.IntVar(value=int(getattr(self.fixture, field)))
@@ -1248,7 +1342,7 @@ class DMXSetupDialog(tk.Toplevel):
             mapping, modes, selected_mode = import_gdtf_channel_mapping(path, start, mode)
             for field, channel in mapping.items():
                 if field in self.vars:
-                    self.vars[field].set(float(channel) if field in ('zoom_angle_at_0', 'zoom_angle_at_100') else int(channel))
+                    self.vars[field].set(float(channel) if field in ('zoom_angle_at_0', 'zoom_angle_at_100', 'iris_physical_at_0', 'iris_physical_at_100') else int(channel))
             found = ', '.join(f'{k}={v}' for k, v in mapping.items())
             messagebox.showinfo(APP_NAME, f'Imported GDTF channel mapping. Check it against the manual.\n\nMode used: {modes[0] if modes else "default"}\n{found}', parent=self)
         except Exception as exc:
@@ -1258,7 +1352,7 @@ class DMXSetupDialog(tk.Toplevel):
         try:
             fixture = FixtureConfig(**asdict(self.fixture))
             for field, _label, _required in self.CHANNEL_FIELDS:
-                if field in ('zoom_angle_at_0', 'zoom_angle_at_100'):
+                if field in ('zoom_angle_at_0', 'zoom_angle_at_100', 'iris_physical_at_0', 'iris_physical_at_100'):
                     value = float(self.vars[field].get())
                     if value < 0:
                         raise ValueError(f'{_label} cannot be negative')
@@ -1613,6 +1707,8 @@ class App(tk.Tk):
         'focus_reverse': bool,
         'zoom_angle_at_0': float,
         'zoom_angle_at_100': float,
+        'iris_physical_at_0': float,
+        'iris_physical_at_100': float,
     }
 
     def __init__(self):
@@ -2008,11 +2104,13 @@ class App(tk.Tk):
         beam_model.pack(side='left', fill='y', padx=8, pady=8)
         self.add_light_entry(beam_model, 0, 'Beam angle at zoom 0%', 'zoom_angle_at_0', float)
         self.add_light_entry(beam_model, 1, 'Beam angle at zoom 100%', 'zoom_angle_at_100', float)
+        self.add_light_entry(beam_model, 2, 'Iris physical at 0%', 'iris_physical_at_0', float)
+        self.add_light_entry(beam_model, 3, 'Iris physical at 100%', 'iris_physical_at_100', float)
         ttk.Label(
             beam_model,
-            text='Used only by Operator → Auto beam size.\nGDTF import fills these when the file\ncontains Zoom PhysicalFrom/To values.\nLeave both 0 to disable auto zoom.',
-            justify='left', wraplength=230
-        ).grid(row=2, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+            text='Used by Operator → Auto beam size.\nGDTF import fills Zoom PhysicalFrom/To for beam angles.\nIris PhysicalFrom/To can provide 1=open to 0=closed, so FART closes iris only when zoom is not tight enough.\nLeave zoom angles at 0 to disable auto mode.',
+            justify='left', wraplength=250
+        ).grid(row=4, column=0, columnspan=2, sticky='w', padx=4, pady=8)
 
         ttk.Label(
             dmx_page,
@@ -2200,11 +2298,11 @@ class App(tk.Tk):
         if hasattr(self, 'auto_beam_status_label'):
             if available:
                 self.auto_beam_status_label.configure(
-                    text='Auto beam size is available. FART will adjust each light with beam-angle data to maintain the requested spot diameter.'
+                    text='Auto beam size is available. FART uses zoom first; if zoom cannot get tight enough and an iris physical model is available, it closes iris to finish the requested spot size.'
                 )
             else:
                 self.auto_beam_status_label.configure(
-                    text='Auto beam size is greyed out: no enabled fixture has zoom physical beam-angle data. Import a GDTF with Zoom PhysicalFrom/To or enter beam angles manually.'
+                    text='Auto beam size is greyed out: no enabled fixture has zoom physical beam-angle data. Import a GDTF with Zoom PhysicalFrom/To or enter beam angles manually. Iris assist is optional and only used after zoom reaches its tightest beam.'
                 )
 
     def rebuild_light_tree(self, select_index=None):
@@ -2313,6 +2411,10 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
         if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
             raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
+        for label, value in (('iris physical at 0%', getattr(fixture, 'iris_physical_at_0', 0.0)), ('iris physical at 100%', getattr(fixture, 'iris_physical_at_100', 0.0))):
+            value = float(value)
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f'{fixture.name}: {label} must be between 0 and 1')
         if float(getattr(fixture, 'zoom_angle_at_0', 0.0)) < 0 or float(getattr(fixture, 'zoom_angle_at_100', 0.0)) < 0:
             raise ValueError(f'{fixture.name}: zoom beam angles cannot be negative')
         if fixture.enabled and (fixture.pan_coarse == 0 or fixture.tilt_coarse == 0):
@@ -2593,6 +2695,10 @@ class App(tk.Tk):
             raise ValueError(f'{fixture.name}: shutter open value must be 0–255')
         if not 0 <= int(getattr(fixture, 'iris_100_dmx', 255)) <= 255:
             raise ValueError(f'{fixture.name}: iris 100% DMX value must be 0–255')
+        for label, value in (('iris physical at 0%', getattr(fixture, 'iris_physical_at_0', 0.0)), ('iris physical at 100%', getattr(fixture, 'iris_physical_at_100', 0.0))):
+            value = float(value)
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f'{fixture.name}: {label} must be between 0 and 1')
         if float(getattr(fixture, 'zoom_angle_at_0', 0.0)) < 0 or float(getattr(fixture, 'zoom_angle_at_100', 0.0)) < 0:
             raise ValueError(f'{fixture.name}: zoom beam angles cannot be negative')
         return True
@@ -2801,21 +2907,23 @@ class App(tk.Tk):
                         )
                         previous_pan[index] = pan
                         zoom_out = self.zoom_value
+                        iris_out = self.iris_value
                         zoom_angle = None
                         zoom_auto = False
+                        iris_auto = False
                         if settings.zoom_mode == 'Auto beam size':
-                            zoom_out, zoom_angle, zoom_auto = auto_zoom_for_distance(
-                                fixture, distance, settings.auto_beam_diameter_m, self.zoom_value
+                            zoom_out, iris_out, zoom_angle, zoom_auto, iris_auto = auto_beam_for_distance(
+                                fixture, distance, settings.auto_beam_diameter_m, self.zoom_value, self.iris_value
                             )
                         status = write_fixture_to_frame(
                             frame, fixture, pan, tilt, fader, blackout,
-                            zoom_out, self.iris_value, self.focus_value
+                            zoom_out, iris_out, self.focus_value
                         )
                         status.update({
                             'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'bearing': bearing, 'elevation': elevation, 'distance': distance,
-                            'zoom_value': zoom_out, 'zoom_angle': zoom_angle, 'zoom_auto': zoom_auto,
+                            'zoom_value': zoom_out, 'iris_value': iris_out, 'zoom_angle': zoom_angle, 'zoom_auto': zoom_auto, 'iris_auto': iris_auto,
                             'stale': stale, 'blackout': blackout,
                         })
                         light_statuses.append(status)
@@ -2922,7 +3030,13 @@ class App(tk.Tk):
                     state = 'DIMMER LOCKED'
                 else:
                     state = 'LIVE'
-            values = (item.get('marker_id'), position, angles, distance, state)
+            if item.get('zoom_auto'):
+                beam = f"Z {item.get('zoom_value', 0.0) * 100:.0f}%"
+                if item.get('iris_auto'):
+                    beam += f" / I {item.get('iris_value', 0.0) * 100:.0f}%"
+            else:
+                beam = f"Z {self.zoom_value * 100:.0f}% / I {self.iris_value * 100:.0f}%"
+            values = (item.get('marker_id'), position, angles, distance, beam, state)
             if self.overview_tree.exists(iid):
                 self.overview_tree.item(iid, text=item.get('name'), values=values)
             else:
