@@ -85,6 +85,30 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(frame[10], 191)
         self.assertEqual(frame[11], 0)
 
+    def test_calibration_solver_recovers_fixture_position(self):
+        true_fixture = fart.FixtureConfig(
+            x=0.0, y=-8.0, z=5.0,
+            pan_zero_bearing=5.0, tilt_zero_elevation=-2.0,
+            pan_min=-270.0, pan_max=270.0, tilt_min=-135.0, tilt_max=135.0,
+        )
+        targets = [(0, 0, 0), (5, 0, 0), (-5, 0, 0), (0, 5, 0), (0, -5, 0), (0, 0, 1.7)]
+        samples = []
+        for target in targets:
+            _bearing, _elevation, pan, tilt, _distance = fart.calculate_aim(true_fixture, *target)
+            samples.append((*target, pan, tilt))
+        start_fixture = fart.FixtureConfig(
+            x=0.0, y=-8.0, z=5.0,
+            pan_zero_bearing=0.0, tilt_zero_elevation=0.0,
+            pan_min=-270.0, pan_max=270.0, tilt_min=-135.0, tilt_max=135.0,
+        )
+        solved, rms = fart.solve_fixture_calibration(start_fixture, samples)
+        self.assertLess(rms, 0.1)
+        self.assertAlmostEqual(solved.x, true_fixture.x, delta=0.05)
+        self.assertAlmostEqual(solved.y, true_fixture.y, delta=0.05)
+        self.assertAlmostEqual(solved.z, true_fixture.z, delta=0.1)
+        self.assertAlmostEqual(solved.pan_zero_bearing, true_fixture.pan_zero_bearing, delta=0.1)
+        self.assertAlmostEqual(solved.tilt_zero_elevation, true_fixture.tilt_zero_elevation, delta=0.3)
+
 
 class PSNTests(unittest.TestCase):
     def test_openfollow_flagged_position_leaf_is_decoded(self):

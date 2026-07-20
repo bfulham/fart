@@ -14,3 +14,17 @@ Calibrate each fixture independently with its lamp disabled or shutter closed.
 10. Only arm dimmers after every fixture follows correctly with intensity disabled.
 
 The software calculates the exact line from each fixture pivot to the marker. Correct pointing still depends on accurate fixture positions, channel maps, zero directions, and personality angle ranges.
+
+
+## Calibration wizard workflow
+
+1. Stop the main output.
+2. Select the fixture in the Lights tab.
+3. Click **Calibrate selected light** or choose calibration when adding a new fixture.
+4. Start calibration output with the dimmer kept low.
+5. Select a known point, move the pan/tilt faders until the beam hits it, then click **Capture this point**.
+6. Repeat for at least four points. Five or six points are recommended. Use points spread left/right, upstage/downstage, centre, and one raised point if possible.
+7. Click **Solve and apply**.
+8. Check the 3D preview and MA3/visualiser, then save settings.
+
+The solver estimates the fixture optical-centre XYZ, pan-zero bearing, and tilt-zero elevation. Pan and tilt trims are reset to zero when the solve is applied. Reverse pan/tilt direction still needs to be correct before solving.

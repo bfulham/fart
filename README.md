@@ -23,6 +23,15 @@ It supports:
 
 > **Safety warning:** FART is experimental software, not a safety-rated tracking or motion-control system. Test with shutters closed or lamps disabled, use conservative movement limits, and keep an operator able to remove DMX or power immediately. Never use it where unexpected movement or light output could injure people.
 
+
+### Fixture calibration wizard
+
+When adding a fixture, FART now asks whether to set it up manually or calibrate it. Manual setup is the existing workflow: type the fixture XYZ position, zero bearings, directions, trims, limits, and DMX channels yourself.
+
+Calibration mode is intended for users who do not know the fixture's exact installed position. It opens a wizard with pan and tilt faders. Aim the real or visualised light at several known stage points, such as `(5, 0, 0)`, `(-5, 0, 0)`, `(0, 0, 0)`, upstage/downstage points, and a raised point. Capture the pan/tilt reading for each point, then solve. FART estimates the fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation.
+
+The old "set current bearing/elevation as zero" buttons have been removed because they were easy to misunderstand.
+
 ## Quick start
 
 ### Use the standalone Windows build

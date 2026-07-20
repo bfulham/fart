@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - 2026-07-20
+
+- Replaced confusing set-zero calibration buttons with a fixture calibration wizard.
+- New fixtures now prompt for manual setup or calibration.
+- Calibration mode provides pan/tilt faders, aiming output, fixed/custom target points, capture workflow, and solver.
+- Solver estimates fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation from captured aim samples.
+- Added automated calibration-solver test.
+
 All notable changes to FART are documented here.
 
 ## 0.6.0 - 2026-07-05
