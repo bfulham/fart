@@ -2,11 +2,11 @@
 
 **Fixture Aiming and Remote Tracking**
 
-[![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
+[![Build Windows and macOS](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
 
-FART is a Windows GUI application that receives live marker positions from OpenFollow over PosiStageNet (PSN), calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX to aim them. It's meant to sit in the signal path for a lighting console that doesn't do 3D position tracking natively — the console still owns the show; FART owns the aiming math for whichever fixtures are following a tracked performer.
+FART is a GUI application (Windows and macOS) that receives live marker positions from OpenFollow over PosiStageNet (PSN), calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX to aim them. It's meant to sit in the signal path for a lighting console that doesn't do 3D position tracking natively — the console still owns the show; FART owns the aiming math for whichever fixtures are following a tracked performer. FART is developed primarily on Windows; the macOS build is newer and less battle-tested.
 
 See [CHANGELOG.md](CHANGELOG.md) for what's new in each release.
 
@@ -46,22 +46,38 @@ Several lights can follow the same marker, or different lights can follow differ
 
 ## Quick start
 
-### Use the standalone Windows build
+### Use a standalone build
 
-Download `FART-Windows-x64.zip` from the [latest release](https://github.com/bfulham/fart/releases/latest), extract `FART.exe`, then run it. Windows SmartScreen may warn because community builds are not code-signed.
+Download the archive for your platform from the [latest release](https://github.com/bfulham/fart/releases/latest):
+
+- **Windows**: `FART-Windows-x64.zip` → extract `FART.exe` and run it. Windows SmartScreen may warn because community builds are not code-signed.
+- **macOS (Apple Silicon)**: `FART-macOS-arm64.zip` → extract `FART.app` and open it. Gatekeeper will refuse to open an unsigned app from an unidentified developer the first time — right-click (or Control-click) `FART.app`, choose **Open**, then confirm in the dialog that appears; this is only needed once. Intel Macs are not currently built or tested.
 
 ### Run from source
 
-Install Python 3.10 or newer, then either double-click `run_source.bat` or run:
+Install Python 3.10 or newer, then:
+
+**Windows** — double-click `run_source.bat`, or run:
 
 ```powershell
 py -3 -m pip install -r requirements.txt
 py -3 fart.py
 ```
 
-### Build a single-file EXE
+**macOS** — double-click `run_source_macos.command`, or run:
 
-Double-click `build_windows_exe.bat`. The resulting executable is `dist\FART.exe`.
+```bash
+python3 -m pip install -r requirements.txt
+python3 fart.py
+```
+
+Use a Python that includes Tk — the official [python.org macOS installer](https://www.python.org/downloads/macos/) does; some other distributions (for example a plain `pyenv` build) do not, and will fail with `No module named '_tkinter'`.
+
+### Build a standalone app yourself
+
+**Windows** — double-click `build_windows_exe.bat`. The resulting executable is `dist\FART.exe`.
+
+**macOS** — run `./build_macos_app.sh` (same Tk requirement as above). The resulting app is `dist/FART.app`.
 
 ## Recommended workflow
 
@@ -125,7 +141,7 @@ GDTF import is a setup helper, not a source of truth: always verify the imported
 
 Calibration estimates a fixture's real-world optical-centre position and its pan-zero/tilt-zero angles by aiming it at several known points and solving for the geometry that fits. See **[docs/CALIBRATION.md](docs/CALIBRATION.md)** for the full step-by-step workflow, including the required DMX setup, capture workflow, and how to read the solver's fit-quality warnings.
 
-In short: from the Lights tab, select one or more fixtures and click **Calibrate selected light**, or **Open fixture calibration wizard** from the Setup: Calibration tab. FART asks for pan/tilt/dimmer (and optional shutter) DMX channels first, since the wizard's faders drive the real fixture directly. Aim at least four known points (five or six is better, spread across left/right, upstage/downstage, centre, and one raised point), capturing each with **Capture point for all fixtures**, then click **Solve and apply all**. Multiple selected fixtures are solved independently against the same shared point list, and the multi-fixture solve runs in the background so the wizard (including its own blackout button) stays responsive.
+In short: from the Lights tab, select one or more fixtures and click **Calibrate selected light**, or **Open fixture calibration wizard** from the Setup: Calibration tab. FART asks for pan/tilt/dimmer (and optional shutter) DMX channels first, since the wizard's faders drive the real fixture directly. Aim at least four known points (five or six is better, spread across house left/right, upstage/downstage, centre, and one raised point), capturing each with **Capture point for all fixtures**, then click **Solve and apply all**. Multiple selected fixtures are solved independently against the same shared point list, and the multi-fixture solve runs in the background so the wizard (including its own blackout button) stays responsive.
 
 ## Intensity input (fader modes)
 
@@ -155,7 +171,7 @@ Set the output mode on the Setup: I/O tab.
 
 ### ENTTEC Open DMX USB
 
-Select **Open DMX** and choose the FTDI virtual COM port. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` in **Open DMX adapters**. Open DMX adapters have no universe concept of their own, so FART maps each USB adapter to a software universe and sends that universe's 512-channel frame to that adapter; leave the mapping blank to use the single selected serial port for the default universe. Open DMX is unbuffered, so Windows must generate the DMX break and all slots continuously — prefer Art-Net, sACN, or a buffered interface for anything critical.
+Select **Open DMX** and choose the FTDI virtual serial port — on Windows a `COMx` port, on macOS a `/dev/cu.usbserial-*`-style device. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` (or the macOS equivalent device paths) in **Open DMX adapters**. Open DMX adapters have no universe concept of their own, so FART maps each USB adapter to a software universe and sends that universe's 512-channel frame to that adapter; leave the mapping blank to use the single selected serial port for the default universe. Open DMX is unbuffered, so the OS must generate the DMX break and all slots continuously — this has only been verified on Windows so far. Prefer Art-Net, sACN, or a buffered interface for anything critical, especially on macOS until Open DMX timing is confirmed there.
 
 ### Art-Net
 
@@ -232,13 +248,13 @@ See **[docs/GRANDMA3_TESTING.md](docs/GRANDMA3_TESTING.md)** for a complete exam
 
 ## Development
 
-Run the tests:
+Run the tests (`py -3` on Windows, `python3` on macOS):
 
 ```powershell
 py -3 -m unittest discover -s tests -v
 ```
 
-The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) runs the tests, builds `FART.exe` on Windows, and uploads it as a workflow artifact on every push and pull request. Pushing a tag beginning with `v` also builds and attaches the ZIP to a GitHub release matching that tag (see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the full release process).
+The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application and builds both `FART.exe` (Windows) and `FART.app` (macOS, Apple Silicon) as workflow artifacts on every push and pull request. Pushing a tag beginning with `v` also creates or updates a GitHub release with both builds attached (see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the full release process).
 
 ## Contributing and support
 

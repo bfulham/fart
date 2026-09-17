@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows and macOS
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -44,14 +44,62 @@ jobs:
           path: FART-Windows-x64.zip
           if-no-files-found: error
 
+  build-macos:
+    # macos-latest is an Apple Silicon (arm64) runner; this build is not
+    # tested on Intel Macs and may need Rosetta there.
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build FART.app
+        run: python -m PyInstaller --noconfirm --clean FART.spec
+
+      - name: Package app bundle
+        run: ditto -c -k --keepParent dist/FART.app FART-macOS-arm64.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FART-macOS-arm64
+          path: FART-macOS-arm64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Create or update tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ github.ref_name }}" 2>$null
-          if ($LASTEXITCODE -ne 0) {
+          if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
             gh release create "${{ github.ref_name }}" --generate-notes --title "FART ${{ github.ref_name }}"
-          }
-          gh release upload "${{ github.ref_name }}" FART-Windows-x64.zip --clobber
+          fi
+          gh release upload "${{ github.ref_name }}" \
+            artifacts/FART-Windows-x64/FART-Windows-x64.zip \
+            artifacts/FART-macOS-arm64/FART-macOS-arm64.zip \
+            --clobber
