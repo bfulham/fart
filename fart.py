@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
@@ -130,6 +130,34 @@ class FixtureConfig:
     blackout_on_limit: bool = False
     limit_blackout_zoom_100: bool = False
     limit_blackout_iris_100: bool = False
+
+    # Optional live console control. Patch this fixture's real personality
+    # normally, then patch a companion "FART control" fixture immediately
+    # after it on the same output_universe exposing just these channels.
+    # 0 disables console relay entirely for this fixture: it always behaves
+    # exactly as it does without this feature (FART always computes pan/tilt
+    # and always drives dimmer/zoom/iris/focus from its own inputs).
+    console_mode_channel: int = 0
+    console_marker_channel: int = 0
+    # How this fixture's dimmer behaves when its own data source goes stale.
+    # "Blackout" forces dimmer to 0 (and shutter closed); "Keep current
+    # intensity" leaves dimmer alone while pan/tilt stays frozen at the last
+    # known position, same as it already does today.
+    on_tracking_loss: str = 'Blackout'
+    # Only relevant when console_mode_channel is set. "Blackout" and "Keep
+    # tracking, force dimmer off" both zero the dimmer (the difference is
+    # whether pan/tilt keeps following live PSN while dark, so the fixture
+    # is already aimed correctly once the console signal returns, instead
+    # of needing to swing into place while lit). "Keep tracking, hold last
+    # dimmer" leaves dimmer and every other console-driven channel exactly
+    # as they were in the last frame received, which can leave a light lit
+    # indefinitely if the console signal never returns — an explicit,
+    # opt-in risk, not the default.
+    on_console_loss: str = 'Blackout'
+    # Dimmer is forced off for this many seconds after a live console
+    # marker reassignment, so the fixture can swing to the new target while
+    # dark instead of sweeping across the space while lit.
+    marker_change_blackout_s: float = 0.5
 
 
 @dataclass
@@ -394,6 +422,24 @@ class OSCFaderReceiver:
             self.server.shutdown(); self.server.server_close()
 
 
+def parse_artnet_dmx(data):
+    """Parse an Art-Net ArtDMX UDP packet.
+
+    Returns (universe, dmx_bytes) or None if this is not a well-formed
+    ArtDMX packet. Shared by ArtNetFaderReceiver and ConsoleInputReceiver so
+    the two Art-Net-input paths agree on what counts as valid.
+    """
+    if len(data) < 18 or data[:8] != b'Art-Net\x00':
+        return None
+    if struct.unpack_from('<H', data, 8)[0] != 0x5000:
+        return None
+    universe = struct.unpack_from('<H', data, 14)[0]
+    length = struct.unpack_from('>H', data, 16)[0]
+    if 18 + length > len(data):
+        return None
+    return universe, bytes(data[18:18 + length])
+
+
 class ArtNetFaderReceiver:
     def __init__(self, universe, channel, fader, log):
         self.universe, self.channel, self.fader, self.log = universe, channel, fader, log
@@ -430,18 +476,79 @@ class ArtNetFaderReceiver:
         while not self.stop_evt.is_set():
             try:
                 data, _ = self.sock.recvfrom(2048)
-                if len(data) < 18 or data[:8] != b'Art-Net\x00':
+                parsed = parse_artnet_dmx(data)
+                if not parsed:
                     continue
-                if struct.unpack_from('<H', data, 8)[0] != 0x5000:
-                    continue
-                universe = struct.unpack_from('<H', data, 14)[0]
-                length = struct.unpack_from('>H', data, 16)[0]
-                if universe == self.universe and self.channel <= length and 18 + length <= len(data):
-                    self.fader.update(data[18 + self.channel - 1] / 255.0)
+                universe, dmx = parsed
+                if universe == self.universe and self.channel <= len(dmx):
+                    self.fader.update(dmx[self.channel - 1] / 255.0)
             except socket.timeout:
                 continue
             except OSError:
                 break
+    def stop(self):
+        self.stop_evt.set()
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+
+
+class ConsoleInputBank:
+    """Thread-safe store of the latest full 512-channel DMX frame received
+    per universe, from a console patched to relay live control of fixtures
+    whose console_mode_channel/console_marker_channel is configured.
+
+    Art-Net only for now: sACN input would need its own multicast-join
+    receiver (like PSNReceiver) rather than this simple UDP socket.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frames = {}
+
+    def update(self, universe, dmx_bytes):
+        universe = int(universe)
+        frame = bytearray(512)
+        frame[:min(512, len(dmx_bytes))] = dmx_bytes[:512]
+        with self.lock:
+            self.frames[universe] = (bytes(frame), time.monotonic())
+
+    def get(self, universe):
+        with self.lock:
+            return self.frames.get(int(universe), (None, 0.0))
+
+
+class ConsoleInputReceiver:
+    """Receives Art-Net from a lighting console for universes FART relays.
+
+    Shares UDP port 6454 with ArtNetFaderReceiver (both use SO_REUSEADDR,
+    which on Windows — FART's primary platform — lets multiple sockets each
+    receive their own copy of the same broadcast traffic).
+    """
+    def __init__(self, bank, log):
+        self.bank, self.log = bank, log
+        self.sock = None
+        self.stop_evt = threading.Event()
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('', 6454))
+        self.sock.settimeout(0.3)
+        threading.Thread(target=self._loop, daemon=True).start()
+        self.log('Console input: listening for Art-Net on UDP 6454')
+
+    def _loop(self):
+        while not self.stop_evt.is_set():
+            try:
+                data, _ = self.sock.recvfrom(2048)
+                parsed = parse_artnet_dmx(data)
+                if parsed:
+                    self.bank.update(*parsed)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
     def stop(self):
         self.stop_evt.set()
         if self.sock:
@@ -619,6 +726,8 @@ def fixture_channels(fixture: FixtureConfig):
         'iris': fixture.iris,
         'focus': fixture.focus,
         'focus fine': fixture.focus_fine,
+        'console mode': getattr(fixture, 'console_mode_channel', 0),
+        'console marker': getattr(fixture, 'console_marker_channel', 0),
     }
 
 
@@ -630,6 +739,48 @@ def enabled_output_universes(settings):
 
 def blank_frames_for_settings(settings):
     return {int(u): bytearray(512) for u in enabled_output_universes(settings)}
+
+
+def universe_uses_console_relay(settings, universe):
+    """True if any enabled fixture on this universe relays console DMX."""
+    universe = int(universe)
+    return any(
+        f.enabled and int(f.output_universe) == universe and int(getattr(f, 'console_mode_channel', 0)) > 0
+        for f in settings.fixtures
+    )
+
+
+def resolve_console_mode(fixture, universe_frame):
+    """Return 'auto' or 'manual' for this fixture's console_mode_channel.
+
+    console_mode_channel == 0 disables console relay for this fixture, so
+    it is always 'auto' (FART always computes its own aim, exactly as
+    fixtures behave without this feature). Missing/short frame data with a
+    channel configured also falls back to 'auto': a stale or absent console
+    signal cannot be trusted to mean "manual" either, since that would mean
+    blindly relaying old or absent pan/tilt data instead of tracking.
+    """
+    channel = int(getattr(fixture, 'console_mode_channel', 0))
+    if channel <= 0 or universe_frame is None or channel > len(universe_frame):
+        return 'auto'
+    return 'manual' if universe_frame[channel - 1] < 128 else 'auto'
+
+
+def resolve_live_marker_id(fixture, universe_frame):
+    """Return the marker ID this fixture should follow this cycle.
+
+    console_marker_channel == 0, a missing/short frame, or a DMX value of 0
+    on that channel all mean "use the fixture's configured default
+    marker_id". A nonzero DMX value is used directly as the marker ID, not
+    as an index into the discovered-tracker list — the latter would
+    silently change meaning if a tracker dropped out mid-show and shifted
+    every later index.
+    """
+    channel = int(getattr(fixture, 'console_marker_channel', 0))
+    if channel <= 0 or universe_frame is None or channel > len(universe_frame):
+        return int(fixture.marker_id)
+    value = universe_frame[channel - 1]
+    return int(value) if value > 0 else int(fixture.marker_id)
 
 
 def parse_open_dmx_adapter_map(text, fallback_port, default_universe):
@@ -1156,34 +1307,48 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
         raise ValueError('No usable pan/tilt/dimmer/beam channels were found in that GDTF mode')
     return found, mode_names, selected_mode
 
-def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5):
+def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5, iris=1.0, focus=0.5,
+                            intensity_passthrough=False, beam_passthrough=False):
+    """Write one fixture's channels into a 512-byte DMX frame.
+
+    intensity_passthrough/beam_passthrough are for console-relayed fixtures:
+    when set, dimmer/shutter (intensity_passthrough) or zoom/iris/focus
+    (beam_passthrough) are left exactly as they already are in `frame` —
+    presumably the console's own live values — instead of being written by
+    FART, *except* when a safety condition (blackout, or a limit-blackout
+    zoom/iris-to-100% override) needs that specific channel regardless.
+    """
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
     tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
     pan_limit = not math.isclose(pan, plim, abs_tol=1e-9)
     tilt_limit = not math.isclose(tilt, tlim, abs_tol=1e-9)
     limit_blackout = bool((pan_limit or tilt_limit) and getattr(fixture, 'blackout_on_limit', False))
-    if limit_blackout and getattr(fixture, 'limit_blackout_zoom_100', False):
+    force_zoom_100 = limit_blackout and getattr(fixture, 'limit_blackout_zoom_100', False)
+    force_iris_100 = limit_blackout and getattr(fixture, 'limit_blackout_iris_100', False)
+    if force_zoom_100:
         zoom = 1.0
-    if limit_blackout and getattr(fixture, 'limit_blackout_iris_100', False):
+    if force_iris_100:
         iris = 1.0
     pan_fraction = (plim - fixture.pan_min) / (fixture.pan_max - fixture.pan_min)
     tilt_fraction = (tlim - fixture.tilt_min) / (fixture.tilt_max - fixture.tilt_min)
     pc, pf = dmx16(pan_fraction)
     tc, tf = dmx16(tilt_fraction)
 
-    intensity = 0.0 if (blackout or limit_blackout) else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
-    dc, df = dmx16(intensity)
     values = [
         (fixture.pan_coarse, pc),
         (fixture.pan_fine, pf),
         (fixture.tilt_coarse, tc),
         (fixture.tilt_fine, tf),
-        (fixture.dimmer, dc),
     ]
-    if fixture.dimmer_fine:
-        values.append((fixture.dimmer_fine, df))
-    if fixture.shutter:
-        values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
+
+    if not (intensity_passthrough and not blackout and not limit_blackout):
+        intensity = 0.0 if (blackout or limit_blackout) else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
+        dc, df = dmx16(intensity)
+        values.append((fixture.dimmer, dc))
+        if fixture.dimmer_fine:
+            values.append((fixture.dimmer_fine, df))
+        if fixture.shutter:
+            values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
 
     def add_parameter(coarse_channel, fine_channel, value, reverse=False):
         if not coarse_channel:
@@ -1196,18 +1361,20 @@ def write_fixture_to_frame(frame, fixture, pan, tilt, fader, blackout, zoom=0.5,
         if fine_channel:
             values.append((fine_channel, fine))
 
-    add_parameter(fixture.zoom, fixture.zoom_fine, zoom, fixture.zoom_reverse)
+    if not beam_passthrough or force_zoom_100:
+        add_parameter(fixture.zoom, fixture.zoom_fine, zoom, fixture.zoom_reverse)
 
     # Iris is intentionally capped by a per-fixture "100%" DMX point.
     # Many fixtures put iris effects/macros above the useful manual iris range.
-    if fixture.iris:
+    if fixture.iris and (not beam_passthrough or force_iris_100):
         iris_fraction = clamp(float(iris), 0.0, 1.0)
         if fixture.iris_reverse:
             iris_fraction = 1.0 - iris_fraction
         iris_cap = int(clamp(getattr(fixture, 'iris_100_dmx', 255), 0, 255))
         values.append((fixture.iris, round(iris_fraction * iris_cap)))
 
-    add_parameter(fixture.focus, fixture.focus_fine, focus, fixture.focus_reverse)
+    if not beam_passthrough:
+        add_parameter(fixture.focus, fixture.focus_fine, focus, fixture.focus_reverse)
 
     for channel, value in values:
         if 1 <= channel <= 512:
@@ -1979,7 +2146,15 @@ class App(tk.Tk):
         'blackout_on_limit': bool,
         'limit_blackout_zoom_100': bool,
         'limit_blackout_iris_100': bool,
+        'console_mode_channel': int,
+        'console_marker_channel': int,
+        'on_tracking_loss': str,
+        'on_console_loss': str,
+        'marker_change_blackout_s': float,
     }
+
+    ON_TRACKING_LOSS_OPTIONS = ['Blackout', 'Keep current intensity']
+    ON_CONSOLE_LOSS_OPTIONS = ['Blackout', 'Keep tracking, force dimmer off', 'Keep tracking, hold last dimmer']
 
     def __init__(self):
         super().__init__()
@@ -1991,6 +2166,8 @@ class App(tk.Tk):
         self.settings = self.load_settings()
         self.trackers = TrackerBank()
         self.fader = FaderState()
+        self.console_input_bank = ConsoleInputBank()
+        self.console_input = None
         self.running = False
         self.psn = None
         self.psn_scanner = None
@@ -2136,6 +2313,12 @@ class App(tk.Tk):
         ttk.Entry(parent, textvariable=self.light_var(name, typ), width=width).grid(
             row=row, column=column + 1, sticky='ew', padx=4, pady=3
         )
+
+    def add_light_combo(self, parent, row, label, name, values, width=22, column=0):
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky='w', padx=4, pady=3)
+        ttk.Combobox(
+            parent, textvariable=self.light_var(name, str), values=values, state='readonly', width=width
+        ).grid(row=row, column=column + 1, sticky='ew', padx=4, pady=3)
 
     def build_ui(self):
         header = ttk.Frame(self)
@@ -2420,6 +2603,29 @@ class App(tk.Tk):
             text='Used by Operator → Auto beam size.\nGDTF import fills Zoom PhysicalFrom/To for beam angles.\nIris PhysicalFrom/To can provide 1=open to 0=closed, so FART closes iris only when zoom is not tight enough.\nLeave zoom angles at 0 to disable auto mode.',
             justify='left', wraplength=250
         ).grid(row=4, column=0, columnspan=2, sticky='w', padx=4, pady=8)
+
+        console = ttk.LabelFrame(dmx_page, text='Live console control (optional)')
+        console.pack(side='left', fill='y', padx=8, pady=8)
+        self.add_light_entry(console, 0, 'Mode channel', 'console_mode_channel', int)
+        self.add_light_entry(console, 1, 'Marker-select channel', 'console_marker_channel', int)
+        self.add_light_combo(console, 2, 'On tracking loss', 'on_tracking_loss', self.ON_TRACKING_LOSS_OPTIONS)
+        self.add_light_combo(console, 3, 'On console signal loss', 'on_console_loss', self.ON_CONSOLE_LOSS_OPTIONS)
+        self.add_light_entry(console, 4, 'Marker-change blackout (s)', 'marker_change_blackout_s', float)
+        ttk.Label(
+            console,
+            text=(
+                'Patch this fixture normally, then patch a companion "FART\n'
+                'control" fixture right after it on the same output universe\n'
+                'exposing just these two channels. Mode <128 = manual\n'
+                'passthrough (the console drives this fixture directly,\n'
+                'FART does not touch it); >=128 = auto-follow. Marker-select\n'
+                '0 = use the configured marker above; a nonzero value is used\n'
+                'directly as the PSN marker ID to follow. Leave mode channel\n'
+                'at 0 to disable console relay: this fixture then behaves\n'
+                'exactly as it does without this feature. Art-Net input only.'
+            ),
+            justify='left', wraplength=300,
+        ).grid(row=5, column=0, columnspan=2, sticky='w', padx=4, pady=8)
 
         ttk.Label(
             dmx_page,
@@ -2792,6 +2998,12 @@ class App(tk.Tk):
         for label, channel in fixture_channels(fixture).items():
             if not 0 <= channel <= 512:
                 raise ValueError(f'{fixture.name}: {label} channel must be 0–512')
+        if getattr(fixture, 'on_tracking_loss', 'Blackout') not in self.ON_TRACKING_LOSS_OPTIONS:
+            raise ValueError(f'{fixture.name}: invalid "on tracking loss" option')
+        if getattr(fixture, 'on_console_loss', 'Blackout') not in self.ON_CONSOLE_LOSS_OPTIONS:
+            raise ValueError(f'{fixture.name}: invalid "on console signal loss" option')
+        if float(getattr(fixture, 'marker_change_blackout_s', 0.0)) < 0:
+            raise ValueError(f'{fixture.name}: marker-change blackout cannot be negative')
 
     def apply_selected_light(self, silent=False):
         try:
@@ -3174,6 +3386,9 @@ class App(tk.Tk):
             self.fader_input = self.make_fader_input(self.settings)
             if self.fader_input:
                 self.fader_input.start()
+            if any(int(getattr(f, 'console_mode_channel', 0)) > 0 for f in self.settings.fixtures if f.enabled):
+                self.console_input = ConsoleInputReceiver(self.console_input_bank, self.log)
+                self.console_input.start()
             self.stop_evt.clear()
             self.running = True
             self.set_setup_tabs_enabled(False)
@@ -3188,6 +3403,11 @@ class App(tk.Tk):
                     self.fader_input.stop()
                 except Exception:
                     pass
+            if self.console_input:
+                try:
+                    self.console_input.stop()
+                except Exception:
+                    pass
             if self.psn:
                 try:
                     self.psn.stop()
@@ -3198,7 +3418,7 @@ class App(tk.Tk):
                     self.output.close()
                 except Exception:
                     pass
-            self.psn = self.fader_input = self.output = None
+            self.psn = self.fader_input = self.output = self.console_input = None
             self.set_setup_tabs_enabled(True)
             messagebox.showerror(APP_NAME, str(exc))
 
@@ -3218,6 +3438,11 @@ class App(tk.Tk):
                 self.fader_input.stop()
             except Exception:
                 pass
+        if self.console_input:
+            try:
+                self.console_input.stop()
+            except Exception:
+                pass
         if self.output:
             try:
                 self.output.send(blank_frames_for_settings(self.settings))
@@ -3225,7 +3450,7 @@ class App(tk.Tk):
                 self.output.close()
             except Exception:
                 pass
-        self.psn = self.fader_input = self.output = None
+        self.psn = self.fader_input = self.output = self.console_input = None
         self.set_setup_tabs_enabled(True)
         self.start_btn.configure(text='START — DIMMER LOCKED')
         self.log('Stopped and blacked out all lights')
@@ -3234,6 +3459,9 @@ class App(tk.Tk):
         smoothed = {}
         previous_pan = {}
         was_stale = {}
+        previous_marker = {}
+        previous_mode = {}
+        marker_change_until = {}
         try:
             while not self.stop_evt.is_set():
                 cycle_start = time.monotonic()
@@ -3241,30 +3469,93 @@ class App(tk.Tk):
                 fader, _fader_time = self.fader.get()
                 smoothing = clamp(settings.smoothing, 0.0, 0.95)
                 alpha = 1.0 - smoothing
-                frames = blank_frames_for_settings(settings)
                 light_statuses = []
+
+                # Universes with at least one console-relay fixture start from
+                # the console's own latest frame (so untouched channels like
+                # color/gobo/dimmer pass straight through); everything else
+                # starts blank, exactly as without this feature.
+                frames = {}
+                console_frame_for_universe = {}
+                console_stale_for_universe = {}
+                for universe in enabled_output_universes(settings):
+                    if universe_uses_console_relay(settings, universe):
+                        raw, ts = self.console_input_bank.get(universe)
+                        console_frame_for_universe[universe] = raw
+                        console_stale_for_universe[universe] = raw is None or (cycle_start - ts) > settings.timeout_s
+                        frames[universe] = bytearray(raw) if raw is not None else bytearray(512)
+                    else:
+                        frames[universe] = bytearray(512)
 
                 for index, fixture in enumerate(settings.fixtures):
                     if not fixture.enabled:
                         continue
+                    universe = int(fixture.output_universe)
+                    console_relay = int(getattr(fixture, 'console_mode_channel', 0)) > 0
+                    universe_frame = console_frame_for_universe.get(universe)
+                    console_stale = console_stale_for_universe.get(universe, False)
+                    mode = resolve_console_mode(fixture, universe_frame) if console_relay else 'auto'
+
+                    if console_relay and mode == 'manual' and not console_stale:
+                        # Full passthrough: this fixture's bytes already came
+                        # from the console's own frame above; FART does not
+                        # compute or touch anything for it this cycle.
+                        marker_xyz = self.trackers.get(int(fixture.marker_id))[:3]
+                        light_statuses.append({
+                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id,
+                            'output_universe': fixture.output_universe,
+                            'marker_xyz': marker_xyz, 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
+                            'error': 'MANUAL (console)', 'stale': False, 'blackout': False,
+                            'pan_limit': False, 'tilt_limit': False,
+                        })
+                        previous_mode[index] = 'manual'
+                        continue
+
+                    effective_marker_id = resolve_live_marker_id(fixture, universe_frame) if console_relay else int(fixture.marker_id)
+                    marker_switched = previous_marker.get(index) is not None and previous_marker[index] != effective_marker_id
+                    resumed_from_manual = previous_mode.get(index) == 'manual'
+                    if marker_switched or resumed_from_manual:
+                        # Live marker reassignment, or coming back from manual
+                        # passthrough (the fixture could be sitting anywhere
+                        # under manual control): force a fresh snap instead of
+                        # blending from whatever this fixture was previously
+                        # doing, and hold blackout while it swings to the new
+                        # target instead of sweeping across the space while lit.
+                        was_stale.pop(effective_marker_id, None)
+                        smoothed.pop(effective_marker_id, None)
+                        marker_change_until[index] = cycle_start + float(getattr(fixture, 'marker_change_blackout_s', 0.5))
+                    previous_marker[index] = effective_marker_id
+                    previous_mode[index] = 'auto'
+
                     lead_lag_s = float(getattr(settings, 'lead_lag_ms', 0.0)) / 1000.0
-                    x, y, z, tracker_time = self.trackers.predict(fixture.marker_id, lead_lag_s) if abs(lead_lag_s) > 0.0001 else self.trackers.get(fixture.marker_id)
+                    x, y, z, tracker_time = self.trackers.predict(effective_marker_id, lead_lag_s) if abs(lead_lag_s) > 0.0001 else self.trackers.get(effective_marker_id)
                     stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
                     # Snap the smoothed position instead of blending when tracking
                     # just reacquired after being stale: otherwise a marker that
                     # reappears somewhere else drags a lit beam across the space
                     # over several seconds while the smoothing filter catches up.
-                    reacquired = was_stale.get(fixture.marker_id, False) and not stale
-                    was_stale[fixture.marker_id] = stale
-                    previous_xyz = smoothed.get(fixture.marker_id)
+                    reacquired = was_stale.get(effective_marker_id, False) and not stale
+                    was_stale[effective_marker_id] = stale
+                    previous_xyz = smoothed.get(effective_marker_id)
                     if previous_xyz is None or reacquired:
                         sx, sy, sz = x, y, z
                     else:
                         sx = previous_xyz[0] + (x - previous_xyz[0]) * alpha
                         sy = previous_xyz[1] + (y - previous_xyz[1]) * alpha
                         sz = previous_xyz[2] + (z - previous_xyz[2]) * alpha
-                    smoothed[fixture.marker_id] = (sx, sy, sz)
-                    blackout = stale or not self.armed
+                    smoothed[effective_marker_id] = (sx, sy, sz)
+
+                    tracking_lost_blackout = stale and getattr(fixture, 'on_tracking_loss', 'Blackout') != 'Keep current intensity'
+                    console_lost_blackout = (
+                        console_relay and console_stale
+                        and getattr(fixture, 'on_console_loss', 'Blackout') != 'Keep tracking, hold last dimmer'
+                    )
+                    in_marker_change_window = cycle_start < marker_change_until.get(index, 0.0)
+                    blackout = tracking_lost_blackout or console_lost_blackout or in_marker_change_window or not self.armed
+                    intensity_passthrough = console_relay and not console_stale
+                    beam_passthrough = console_relay and not (
+                        settings.zoom_mode == 'Auto beam size' and fixture_has_zoom_model(fixture)
+                    )
                     try:
                         bearing, elevation, pan, tilt, distance = calculate_aim(
                             fixture, sx, sy, sz, previous_pan.get(index)
@@ -3279,13 +3570,14 @@ class App(tk.Tk):
                             zoom_out, iris_out, zoom_angle, zoom_auto, iris_auto = auto_beam_for_distance(
                                 fixture, distance, settings.auto_beam_diameter_m, self.zoom_value, self.iris_value
                             )
-                        frame = frames.setdefault(int(fixture.output_universe), bytearray(512))
+                        frame = frames.setdefault(universe, bytearray(512))
                         status = write_fixture_to_frame(
                             frame, fixture, pan, tilt, fader, blackout,
-                            zoom_out, iris_out, self.focus_value
+                            zoom_out, iris_out, self.focus_value,
+                            intensity_passthrough=intensity_passthrough, beam_passthrough=beam_passthrough,
                         )
                         status.update({
-                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id, 'output_universe': fixture.output_universe,
+                            'index': index, 'name': fixture.name, 'marker_id': effective_marker_id, 'output_universe': fixture.output_universe,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'bearing': bearing, 'elevation': elevation, 'distance': distance,
                             'zoom_value': zoom_out, 'iris_value': iris_out, 'zoom_angle': zoom_angle, 'zoom_auto': zoom_auto, 'iris_auto': iris_auto,
@@ -3294,7 +3586,7 @@ class App(tk.Tk):
                         light_statuses.append(status)
                     except ValueError as exc:
                         light_statuses.append({
-                            'index': index, 'name': fixture.name, 'marker_id': fixture.marker_id, 'output_universe': fixture.output_universe,
+                            'index': index, 'name': fixture.name, 'marker_id': effective_marker_id, 'output_universe': fixture.output_universe,
                             'marker_xyz': (sx, sy, sz), 'fixture_xyz': (fixture.x, fixture.y, fixture.z),
                             'error': str(exc), 'stale': stale, 'blackout': True,
                             'pan_limit': False, 'tilt_limit': False,
