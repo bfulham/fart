@@ -4,11 +4,11 @@
 
 Version 1.5.0 adds optional live console control: a fixture can be handed to a lighting console (Art-Net) for manual passthrough or live marker reassignment mid-show, with independent, configurable dimmer behaviour for PSN loss vs. console-signal loss. It also fixes a worker-thread Tk-safety issue, a smoothing bug that could sweep a lit fixture across the space on tracking reacquisition, and a calibration-solve UI freeze.
 
-[![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
+[![Build Windows and macOS](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
 
-FART is a Windows GUI application that receives live marker positions from OpenFollow over PosiStageNet, calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX.
+FART is a GUI application (Windows and macOS) that receives live marker positions from OpenFollow over PosiStageNet, calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX. It is developed primarily on Windows; the macOS build is newer and less battle-tested.
 
 It supports:
 
@@ -54,32 +54,38 @@ The old "set current bearing/elevation as zero" buttons have been removed becaus
 
 ## Quick start
 
-### Use the standalone Windows build
+### Use a standalone build
 
-Download `FART-Windows-x64.zip` from the [latest release](https://github.com/bfulham/fart/releases/latest), extract `FART.exe`, then run it. Windows SmartScreen may warn because community builds are not code-signed.
+Download the archive for your platform from the [latest release](https://github.com/bfulham/fart/releases/latest):
+
+- **Windows**: `FART-Windows-x64.zip` → extract `FART.exe` and run it. Windows SmartScreen may warn because community builds are not code-signed.
+- **macOS (Apple Silicon)**: `FART-macOS-arm64.zip` → extract `FART.app` and open it. Gatekeeper will refuse to open an unsigned app from an unidentified developer the first time — right-click (or Control-click) `FART.app`, choose **Open**, then confirm in the dialog that appears; this is only needed once. Intel Macs are not currently built or tested.
 
 ### Run from source
 
-Install Python 3.10 or newer, then either double-click `run_source.bat` or run:
+Install Python 3.10 or newer, then:
+
+**Windows** — double-click `run_source.bat`, or run:
 
 ```powershell
 py -3 -m pip install -r requirements.txt
 py -3 fart.py
 ```
 
-### Build a single-file EXE
+**macOS** — double-click `run_source_macos.command`, or run:
 
-Double-click:
-
-```text
-build_windows_exe.bat
+```bash
+python3 -m pip install -r requirements.txt
+python3 fart.py
 ```
 
-The resulting executable is:
+Use a Python that includes Tk — the official [python.org macOS installer](https://www.python.org/downloads/macos/) does; some other distributions (for example a plain `pyenv` build) do not, and will fail with `No module named '_tkinter'`.
 
-```text
-dist\FART.exe
-```
+### Build a standalone app yourself
+
+**Windows** — double-click `build_windows_exe.bat`. The resulting executable is `dist\FART.exe`.
+
+**macOS** — run `./build_macos_app.sh` (same Tk requirement as above). The resulting app is `dist/FART.app`.
 
 ## OpenFollow / PSN
 
@@ -119,7 +125,7 @@ Choose an Art-Net universe and one 8-bit DMX channel. Values `0–255` map to `0
 
 ### ENTTEC Open DMX USB
 
-Select **Open DMX** and choose the FTDI virtual COM port. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` in **Open DMX adapters**. Open DMX adapters do not know about universes themselves, so FART maps each USB adapter to a software universe and sends that universe's 512-channel DMX frame to that adapter. Leave the mapping blank to use the single selected serial port for the default universe. The Open DMX is unbuffered, so Windows must generate the DMX break and all slots continuously. Art-Net, sACN, or a buffered interface is preferable for critical use.
+Select **Open DMX** and choose the FTDI virtual serial port — on Windows a `COMx` port, on macOS a `/dev/cu.usbserial-*`-style device. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` (or the macOS equivalent device paths) in **Open DMX adapters**. Open DMX adapters do not know about universes themselves, so FART maps each USB adapter to a software universe and sends that universe's 512-channel DMX frame to that adapter. Leave the mapping blank to use the single selected serial port for the default universe. Open DMX is unbuffered, so the OS must generate the DMX break and all slots continuously; this has only been verified on Windows so far. Art-Net, sACN, or a buffered interface is preferable for critical use, especially on macOS until Open DMX timing is confirmed there.
 
 ### Art-Net
 
@@ -229,13 +235,13 @@ An example four-fixture MAC Quantum Profile configuration is included at [exampl
 
 ## Development
 
-Run the tests:
+Run the tests (`py -3` on Windows, `python3` on macOS):
 
 ```powershell
 py -3 -m unittest discover -s tests -v
 ```
 
-The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application, builds `FART.exe` on Windows, and uploads a ZIP artifact. Pushing a tag beginning with `v` creates or updates a GitHub release automatically.
+The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application and builds both `FART.exe` (Windows) and `FART.app` (macOS, Apple Silicon) as workflow artifacts on every push and pull request. Pushing a tag beginning with `v` also creates or updates a GitHub release with both builds attached.
 
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests can be submitted through [GitHub Issues](https://github.com/bfulham/fart/issues).
 

@@ -14,12 +14,24 @@ Use the [bug report](https://github.com/bfulham/fart/issues/new?template=bug_rep
 
 ## Development setup
 
+Windows:
+
 ```powershell
 py -3 -m venv .venv
 .venv\Scripts\activate
 py -3 -m pip install -r requirements-dev.txt
 py -3 -m unittest discover -s tests -v
 py -3 fart.py
+```
+
+macOS: use a Python that includes Tk (the official [python.org installer](https://www.python.org/downloads/macos/) does; a plain `pyenv` build typically does not and will fail with `No module named '_tkinter'`).
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements-dev.txt
+python3 -m unittest discover -s tests -v
+python3 fart.py
 ```
 
 ## Pull requests
