@@ -256,6 +256,10 @@ py -3 -m unittest discover -s tests -v
 
 The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application and builds both `FART.exe` (Windows) and `FART.app` (macOS, Apple Silicon) as workflow artifacts on every push and pull request. Pushing a tag beginning with `v` also creates or updates a GitHub release with both builds attached (see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the full release process).
 
+### Testing without OpenFollow or a fixture
+
+[tools/fart_test_tool.py](tools/fart_test_tool.py) is a standalone script that sends synthetic OpenFollow-style PSN positions and decodes FART's own Art-Net output, so tracking (and [live console control](#live-console-control-optional)) can be exercised end to end without OpenFollow, a real console, or a physical fixture. See [tools/README.md](tools/README.md).
+
 ## Contributing and support
 
 Contributions are welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)** for development setup and pull request expectations. Bugs and feature requests go through [GitHub Issues](https://github.com/bfulham/fart/issues); if you believe you've found a safety-relevant issue (unexpected movement or intensity), see **[SECURITY.md](SECURITY.md)** first.
