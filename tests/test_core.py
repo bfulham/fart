@@ -212,6 +212,8 @@ class ChannelTests(unittest.TestCase):
             'iris': 194,
             'focus': 197,
             'focus fine': 198,
+            'console mode': 0,
+            'console marker': 0,
         })
 
 
@@ -267,6 +269,107 @@ class MultiUniverseTests(unittest.TestCase):
         self.assertEqual(mapping, {0: 'COM3', 1: 'COM4'})
         fallback = fart.parse_open_dmx_adapter_map('', 'COM9', 7)
         self.assertEqual(fallback, {7: 'COM9'})
+
+
+def artnet_packet(universe, dmx_bytes):
+    header = (
+        b'Art-Net\x00' + struct.pack('<H', 0x5000) + struct.pack('>H', 14)
+        + bytes((0, 0)) + struct.pack('<H', universe) + struct.pack('>H', len(dmx_bytes))
+    )
+    return header + dmx_bytes
+
+
+class ConsoleRelayTests(unittest.TestCase):
+    def test_parse_artnet_dmx_roundtrip(self):
+        packet = artnet_packet(3, bytes([10, 20, 30]))
+        result = fart.parse_artnet_dmx(packet)
+        self.assertEqual(result, (3, bytes([10, 20, 30])))
+
+    def test_parse_artnet_dmx_rejects_malformed_packets(self):
+        self.assertIsNone(fart.parse_artnet_dmx(b'not art-net'))
+        self.assertIsNone(fart.parse_artnet_dmx(b'Art-Net\x00' + b'\x00' * 9))
+        truncated = artnet_packet(1, bytes([1, 2, 3]))[:-1]
+        self.assertIsNone(fart.parse_artnet_dmx(truncated))
+
+    def test_console_input_bank_pads_and_reports_staleness(self):
+        bank = fart.ConsoleInputBank()
+        missing, ts = bank.get(5)
+        self.assertIsNone(missing)
+        self.assertEqual(ts, 0.0)
+        bank.update(5, bytes([1, 2, 3]))
+        frame, ts = bank.get(5)
+        self.assertEqual(len(frame), 512)
+        self.assertEqual(frame[:3], bytes([1, 2, 3]))
+        self.assertEqual(frame[3], 0)
+        self.assertGreater(ts, 0.0)
+
+    def test_resolve_console_mode(self):
+        fixture = fart.FixtureConfig(console_mode_channel=5)
+        auto_frame = bytearray(512)
+        auto_frame[4] = 200
+        manual_frame = bytearray(512)
+        manual_frame[4] = 50
+        self.assertEqual(fart.resolve_console_mode(fixture, auto_frame), 'auto')
+        self.assertEqual(fart.resolve_console_mode(fixture, manual_frame), 'manual')
+        # No frame data, or the feature disabled: always falls back to auto.
+        self.assertEqual(fart.resolve_console_mode(fixture, None), 'auto')
+        self.assertEqual(fart.resolve_console_mode(fart.FixtureConfig(console_mode_channel=0), manual_frame), 'auto')
+        short_frame = bytearray(2)
+        self.assertEqual(fart.resolve_console_mode(fixture, short_frame), 'auto')
+
+    def test_resolve_live_marker_id(self):
+        fixture = fart.FixtureConfig(marker_id=7, console_marker_channel=10)
+        frame = bytearray(512)
+        frame[9] = 42
+        self.assertEqual(fart.resolve_live_marker_id(fixture, frame), 42)
+        frame[9] = 0
+        self.assertEqual(fart.resolve_live_marker_id(fixture, frame), 7)
+        self.assertEqual(fart.resolve_live_marker_id(fixture, None), 7)
+        self.assertEqual(fart.resolve_live_marker_id(fart.FixtureConfig(marker_id=7, console_marker_channel=0), frame), 7)
+
+    def test_universe_uses_console_relay(self):
+        relay = fart.FixtureConfig(name='A', output_universe=1, enabled=True, console_mode_channel=3)
+        plain = fart.FixtureConfig(name='B', output_universe=1, enabled=True, console_mode_channel=0)
+        disabled_relay = fart.FixtureConfig(name='C', output_universe=2, enabled=False, console_mode_channel=3)
+        settings = fart.Settings(fixtures=[relay, plain, disabled_relay])
+        self.assertTrue(fart.universe_uses_console_relay(settings, 1))
+        self.assertFalse(fart.universe_uses_console_relay(settings, 2))
+
+    def test_intensity_passthrough_preserves_console_dimmer_unless_blacked_out(self):
+        fixture = fart.FixtureConfig(dimmer=5, shutter=6, shutter_open=30)
+        frame = bytearray(512)
+        frame[4] = 200  # console's own dimmer value already in the frame
+        frame[5] = 30
+        fart.write_fixture_to_frame(frame, fixture, 0.0, 0.0, 1.0, False, intensity_passthrough=True)
+        self.assertEqual(frame[4], 200, "dimmer should pass through untouched when not blacked out")
+        self.assertEqual(frame[5], 30, "shutter should pass through untouched when not blacked out")
+
+        fart.write_fixture_to_frame(frame, fixture, 0.0, 0.0, 1.0, True, intensity_passthrough=True)
+        self.assertEqual(frame[4], 0, "blackout must still force dimmer to 0 even with passthrough enabled")
+        self.assertEqual(frame[5], 0, "blackout must still force shutter closed even with passthrough enabled")
+
+    def test_beam_passthrough_preserves_zoom_iris_focus_unless_at_limit(self):
+        fixture = fart.FixtureConfig(
+            dimmer=0, shutter=0, zoom=10, zoom_fine=11, iris=12, focus=13,
+            blackout_on_limit=True, limit_blackout_zoom_100=True,
+            pan_min=-10.0, pan_max=10.0, tilt_min=-10.0, tilt_max=10.0,
+        )
+        frame = bytearray(512)
+        frame[9] = 111   # console-driven zoom coarse
+        frame[10] = 222  # console-driven zoom fine
+        frame[11] = 133  # console-driven iris
+        frame[12] = 144  # console-driven focus
+        fart.write_fixture_to_frame(frame, fixture, 0.0, 0.0, 1.0, False, zoom=0.9, iris=0.9, focus=0.9, beam_passthrough=True)
+        self.assertEqual((frame[9], frame[10], frame[11], frame[12]), (111, 222, 133, 144),
+                         "zoom/iris/focus should pass through untouched when beam_passthrough is set")
+
+        # Pan pushed past its limit with blackout_on_limit + zoom-to-100% on
+        # limit: zoom must still be forced open even though beam_passthrough
+        # is set, since that is a safety override, not a normal auto-beam value.
+        fart.write_fixture_to_frame(frame, fixture, 50.0, 0.0, 1.0, False, zoom=0.9, iris=0.9, focus=0.9, beam_passthrough=True)
+        self.assertEqual((frame[9], frame[10]), (255, 255), "zoom must be forced to 100% on limit blackout regardless of passthrough")
+        self.assertEqual(frame[11], 133, "iris has no limit-blackout override configured, so it stays passed through")
+        self.assertEqual(frame[12], 144, "focus has no limit-blackout concept at all, so it stays passed through")
 
 
 if __name__ == '__main__':

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0
+
+- Add optional live console control (Art-Net only): patch a fixture normally, then patch a companion "FART control" fixture on the same output universe exposing a mode channel and a marker-select channel. Mode <128 relays that fixture's own channels straight through from the console untouched; >=128 hands pan/tilt (and zoom/iris, unless Auto beam size applies) back to FART while dimmer keeps passing through from the console.
+- Add per-fixture "On tracking loss" (Blackout / Keep current intensity) and "On console signal loss" (Blackout / Keep tracking, force dimmer off / Keep tracking, hold last dimmer) policies, so losing PSN tracking and losing the console's own signal can be handled independently.
+- Live console marker reassignment: switching which PSN marker a fixture follows (or returning from manual passthrough to auto-follow) now forces a fresh snap and a brief configurable blackout window instead of sweeping across the space while lit.
+- Fix worker-thread Tk access in the live output loop that could intermittently crash the whole running session.
+- Fix position smoothing continuing to blend through a tracking dropout, which could sweep a lit fixture across the space once tracking reacquired somewhere else.
+- Fix the multi-fixture calibration solver freezing the wizard UI (and the live calibration DMX tick) while solving; it now runs on a background thread.
+- Relabel "stage right/left" as "house right/left" in the calibration wizard and documentation, to avoid confusion with the opposite, traditional actor-perspective meaning of "stage right/left".
+- Remove dead "set current bearing/elevation as zero" code and stale repository files (`fart.py.bak`, committed bytecode).
+
 ## 1.4.1
 
 - Import pan and tilt physical limits from GDTF files when available.

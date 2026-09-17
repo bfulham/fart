@@ -2,7 +2,7 @@
 
 **Fixture Aiming and Remote Tracking**
 
-Version 1.4.1 improves fixture setup, operator control, and safety: GDTF imports pan/tilt physical limits when available, the 3D preview keeps fixture positions fixed, spot diameter can be adjusted live, zoom/iris sliders lock out during Auto Beam mode, fixtures can blackout when hitting pan/tilt limits, setup tab locking is optional, and lead/lag prediction is available for fast-moving markers.
+Version 1.5.0 adds optional live console control: a fixture can be handed to a lighting console (Art-Net) for manual passthrough or live marker reassignment mid-show, with independent, configurable dimmer behaviour for PSN loss vs. console-signal loss. It also fixes a worker-thread Tk-safety issue, a smoothing bug that could sweep a lit fixture across the space on tracking reacquisition, and a calibration-solve UI freeze.
 
 [![Build Windows EXE](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
@@ -22,7 +22,8 @@ It supports:
 - Calibration wizard zoom and iris controls for small-beam aiming
 - Coarse and fine pan/tilt calibration controls
 - Multi-fixture calibration against the same set of known points
-- Tracking-loss blackout and explicit dimmer arming
+- Tracking-loss blackout and explicit dimmer arming, with independent policies for PSN loss vs. console-signal loss
+- Optional live console control per fixture (Art-Net), for handing a fixture to a lighting console for manual passthrough or reassigning its followed marker mid-show
 - Multi-light overview table and lightweight interactive 3D preview
 - Configuration import/export through JSON
 
@@ -146,6 +147,26 @@ Every enabled fixture chooses its own PSN marker and calculates its own aim from
 Channel fields are **absolute DMX slots**, not fixture offsets. For a fixture starting at channel 101, an attribute at fixture offset 18 is absolute channel `118`.
 
 FART blocks startup if enabled fixtures overlap on any configured DMX channel within the same universe. The same channel numbers can be reused on different universes.
+
+## Live console control (optional)
+
+FART is meant to sit in the signal path where a lighting console that doesn't do 3D tracking natively (for example Onyx) still owns the show. A fixture can be handed to a console for live control during a run, instead of always being fully computed by FART:
+
+1. Dedicate one output universe to FART and route the console's own output for it to FART instead of straight to the node — FART both receives (Art-Net input, listening on UDP 6454) and re-sends that universe.
+2. Patch the real fixture's own personality on that universe as usual.
+3. Patch a small companion "FART control" fixture immediately after it, exposing just two channels: **Mode** (below 128 = manual passthrough, 128 and above = auto-follow) and **Marker select** (`0` = use the fixture's configured default marker; a nonzero value is used directly as the PSN marker ID to follow).
+4. Set the fixture's **Mode channel** and **Marker-select channel** fields (Lights tab → DMX channels → Live console control) to that control fixture's two addresses. Leave the mode channel at `0` to disable this entirely — the fixture then behaves exactly as it does without this feature.
+
+In **manual** mode FART does not touch that fixture's DMX at all: every channel — pan, tilt, dimmer, color, gobo, effects — passes straight through from the console's own frame. In **auto-follow** mode FART takes over pan/tilt (and zoom/iris, unless a per-fixture Auto beam size model applies) while dimmer keeps passing through from the console — the control fixture needs no intensity channel of its own, since intensity always comes from the real fixture's own dimmer.
+
+Two independent policies decide what happens to dimmer when a fixture's own data source goes stale, since PSN loss and console-signal loss are different failures and one being fine doesn't mean the other is:
+
+- **On tracking loss** — `Blackout` (default) forces dimmer to 0; `Keep current intensity` leaves dimmer alone while pan/tilt freezes at the last known position, same as always.
+- **On console signal loss** (only relevant with a mode channel configured) — `Blackout` and `Keep tracking, force dimmer off` both force dimmer to 0, but the latter keeps computing pan/tilt from live PSN so the fixture is already aimed correctly once the console signal returns, instead of swinging into place while lit. `Keep tracking, hold last dimmer` leaves dimmer and every other console-driven channel exactly as they were in the last frame received — an explicit, opt-in risk (a light could stay lit indefinitely if the console signal never returns), not the default.
+
+Reassigning a fixture's marker live, or returning it from manual to auto-follow, always forces a fresh snap to the new target and a brief configurable blackout (**Marker-change blackout**, default 0.5&nbsp;s) instead of sweeping across the space while lit.
+
+This has been built and unit-tested but not verified against a real console or physical fixtures — test thoroughly with shutters closed before relying on it in a show, per the safety warning above.
 
 
 ## Zoom, iris, and focus
