@@ -1649,7 +1649,8 @@ class CalibrationWizard(tk.Toplevel):
         ttk.Label(out_buttons, textvariable=self.status_var).pack(side='left', padx=12)
         cap_buttons = ttk.Frame(right); cap_buttons.pack(fill='x', padx=8, pady=8)
         ttk.Button(cap_buttons, text='Capture point for all fixtures', command=self.capture).pack(side='left', padx=3)
-        ttk.Button(cap_buttons, text='Solve and apply all', command=self.solve_apply).pack(side='left', padx=3)
+        self.solve_button = ttk.Button(cap_buttons, text='Solve and apply all', command=self.solve_apply)
+        self.solve_button.pack(side='left', padx=3)
         ttk.Button(cap_buttons, text='Close', command=self.close).pack(side='left', padx=3)
         self.sample_tree = ttk.Treeview(right, columns=('fixture','target','pan','tilt'), show='headings', height=9)
         for col, text, width in (('fixture','Fixture',150), ('target','Captured point',300), ('pan','Pan',80), ('tilt','Tilt',80)):
@@ -1803,20 +1804,101 @@ class CalibrationWizard(tk.Toplevel):
         self.solution_var.set(f'Captured point for all selected fixtures. Samples: {counts}. Capture at least 4 per fixture, preferably 5–6.')
 
     def solve_apply(self):
-        try:
-            messages = []
-            first_index = self.light_indices[0]
-            for idx in self.light_indices:
-                solved, rms = solve_fixture_calibration(self.fixtures[idx], self.samples[idx])
-                self.app.settings.fixtures[idx] = solved
-                self.app.insert_or_update_light_row(idx, solved)
-                messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, pan dir={solved.pan_direction:+d}, tilt dir={solved.tilt_direction:+d}, fit={rms:.3f} m')
-                self.app.log('Calibration applied to ' + messages[-1])
-            self.app.rebuild_light_tree(first_index)
-            self.app.load_light_editor(first_index)
-            self.solution_var.set('Applied solutions:\n' + '\n'.join(messages))
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, str(exc), parent=self)
+        if getattr(self, '_solving', False):
+            return
+        self._solving = True
+        self.solve_button.state(['disabled'])
+        self.solution_var.set('Solving…')
+        # Block interaction with the main App window while solving: the
+        # solve reads/writes app.settings.fixtures by index, so a concurrent
+        # edit, add, or remove elsewhere in the app while it runs could
+        # corrupt or misapply the result. The previous synchronous solve got
+        # this for free by blocking the whole Tk main loop; grab_set() gives
+        # the same "nothing else can be edited meanwhile" guarantee without
+        # freezing the UI (the wizard's own widgets, including Stop
+        # output/blackout, stay interactive).
+        self.grab_set()
+
+        # The hill-climbing solver in solve_fixture_calibration() can take a
+        # noticeable amount of time per fixture. Running it on the Tk main
+        # thread would freeze the whole wizard (including the blackout button
+        # and the live calibration output_tick) for the duration, so it runs
+        # on a worker thread instead; results come back through a queue and
+        # are only applied to the UI from the main thread via this polling.
+        indices = list(self.light_indices)
+        fixtures = {idx: self.fixtures[idx] for idx in indices}
+        samples = {idx: list(self.samples[idx]) for idx in indices}
+        results_queue = queue.Queue()
+
+        def worker():
+            results = []
+            for idx in indices:
+                try:
+                    solved, rms = solve_fixture_calibration(fixtures[idx], samples[idx])
+                    results.append((idx, solved, rms, None))
+                except Exception as exc:
+                    results.append((idx, None, None, str(exc)))
+                    break
+            results_queue.put(results)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                results = results_queue.get_nowait()
+            except queue.Empty:
+                # Poll via self.app (the main window, which outlives this
+                # wizard) rather than self, so a solve started before the
+                # wizard is closed still finishes and gets applied instead
+                # of being silently dropped once self stops existing.
+                self.app.after(100, poll)
+                return
+
+            wizard_open = self.winfo_exists()
+            self._solving = False
+            if wizard_open:
+                try:
+                    self.grab_release()
+                except Exception:
+                    pass
+                self.solve_button.state(['!disabled'])
+
+            try:
+                messages = []
+                error = None
+                applied_indices = []
+                for idx, solved, rms, err in results:
+                    if err:
+                        error = err
+                        break
+                    # Applied to the main App window, which outlives this wizard.
+                    self.app.settings.fixtures[idx] = solved
+                    self.app.insert_or_update_light_row(idx, solved)
+                    messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, pan dir={solved.pan_direction:+d}, tilt dir={solved.tilt_direction:+d}, fit={rms:.3f} m')
+                    self.app.log('Calibration applied to ' + messages[-1])
+                    applied_indices.append(idx)
+
+                # Refresh the tree/editor for whatever was actually applied,
+                # even on partial failure, so the UI never lags behind
+                # settings that have already been mutated.
+                if applied_indices:
+                    self.app.rebuild_light_tree(applied_indices[0])
+                    self.app.load_light_editor(applied_indices[0])
+
+                if error:
+                    if wizard_open:
+                        summary = ('Applied solutions:\n' + '\n'.join(messages) + '\n\n') if messages else ''
+                        self.solution_var.set(summary + f'Error on remaining fixture(s): {error}')
+                        messagebox.showerror(APP_NAME, error, parent=self)
+                    return
+                if wizard_open:
+                    self.solution_var.set('Applied solutions:\n' + '\n'.join(messages))
+            except Exception as exc:
+                if wizard_open:
+                    messagebox.showerror(APP_NAME, str(exc), parent=self)
+                    self.solution_var.set('No solution yet')
+
+        self.app.after(100, poll)
 
     def close(self):
         self.stop_output(); self.destroy()
@@ -1915,6 +1997,7 @@ class App(tk.Tk):
         self.fader_input = None
         self.output = None
         self.worker = None
+        self.worker_crashed = False
         self.stop_evt = threading.Event()
         self.logs = queue.Queue()
         self.psn_discovered = queue.Queue()
@@ -1923,6 +2006,9 @@ class App(tk.Tk):
         self.zoom_value = self.settings.zoom_master
         self.iris_value = self.settings.iris_master
         self.focus_value = self.settings.focus_master
+        # Plain attribute mirroring arm_var so the output worker thread never
+        # has to call into Tk (BooleanVar.get() is not safe off the main thread).
+        self.armed = False
         self.vars = {}
         self.light_vars = {}
         self.selected_light_index = 0
@@ -2105,6 +2191,7 @@ class App(tk.Tk):
         self.start_btn = ttk.Button(connection, text='START — DIMMER LOCKED', command=self.start)
         self.start_btn.grid(row=12, column=0, columnspan=2, sticky='ew', padx=4, pady=(15, 4))
         self.arm_var = tk.BooleanVar(value=False)
+        self.arm_var.trace_add('write', lambda *_args: setattr(self, 'armed', bool(self.arm_var.get())))
         ttk.Checkbutton(connection, text='Arm all light dimmers', variable=self.arm_var).grid(
             row=13, column=0, columnspan=2, sticky='w', padx=4, pady=4
         )
@@ -3024,33 +3111,6 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
-    def current_selected_aim(self):
-        if not self.apply_selected_light(silent=True):
-            raise ValueError('Selected light settings are invalid')
-        fixture = self.settings.fixtures[self.selected_light_index]
-        x, y, z, timestamp = self.trackers.get(fixture.marker_id)
-        if timestamp == 0:
-            raise ValueError('No live PSN position has been received')
-        return fixture, calculate_aim(fixture, x, y, z)
-
-    def cal_pan_zero(self):
-        try:
-            fixture, (bearing, _elevation, _pan, _tilt, _distance) = self.current_selected_aim()
-            self.light_vars['pan_zero_bearing'].set(round(bearing, 3))
-            self.light_vars['pan_offset'].set(0.0)
-            self.apply_selected_light()
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, str(exc))
-
-    def cal_tilt_zero(self):
-        try:
-            fixture, (_bearing, elevation, _pan, _tilt, _distance) = self.current_selected_aim()
-            self.light_vars['tilt_zero_elevation'].set(round(elevation, 3))
-            self.light_vars['tilt_offset'].set(0.0)
-            self.apply_selected_light()
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, str(exc))
-
     def make_output(self, settings):
         universes = enabled_output_universes(settings)
         if settings.output == 'Open DMX':
@@ -3094,6 +3154,11 @@ class App(tk.Tk):
     def start(self):
         if self.running:
             return
+        # Clear any crash flag from a previous run: otherwise a worker that
+        # crashed just before Stop/Start (before ui_tick's next 100ms poll
+        # observes the flag) would tear the freshly started session back
+        # down as soon as that stale poll fires.
+        self.worker_crashed = False
         try:
             self.settings = self.collect()
             self.output = self.make_output(self.settings)
@@ -3164,6 +3229,7 @@ class App(tk.Tk):
     def loop(self):
         smoothed = {}
         previous_pan = {}
+        was_stale = {}
         try:
             while not self.stop_evt.is_set():
                 cycle_start = time.monotonic()
@@ -3179,16 +3245,22 @@ class App(tk.Tk):
                         continue
                     lead_lag_s = float(getattr(settings, 'lead_lag_ms', 0.0)) / 1000.0
                     x, y, z, tracker_time = self.trackers.predict(fixture.marker_id, lead_lag_s) if abs(lead_lag_s) > 0.0001 else self.trackers.get(fixture.marker_id)
+                    stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
+                    # Snap the smoothed position instead of blending when tracking
+                    # just reacquired after being stale: otherwise a marker that
+                    # reappears somewhere else drags a lit beam across the space
+                    # over several seconds while the smoothing filter catches up.
+                    reacquired = was_stale.get(fixture.marker_id, False) and not stale
+                    was_stale[fixture.marker_id] = stale
                     previous_xyz = smoothed.get(fixture.marker_id)
-                    if previous_xyz is None:
+                    if previous_xyz is None or reacquired:
                         sx, sy, sz = x, y, z
                     else:
                         sx = previous_xyz[0] + (x - previous_xyz[0]) * alpha
                         sy = previous_xyz[1] + (y - previous_xyz[1]) * alpha
                         sz = previous_xyz[2] + (z - previous_xyz[2]) * alpha
                     smoothed[fixture.marker_id] = (sx, sy, sz)
-                    stale = tracker_time == 0 or cycle_start - tracker_time > settings.timeout_s
-                    blackout = stale or not self.arm_var.get()
+                    blackout = stale or not self.armed
                     try:
                         bearing, elevation, pan, tilt, distance = calculate_aim(
                             fixture, sx, sy, sz, previous_pan.get(index)
@@ -3227,7 +3299,7 @@ class App(tk.Tk):
                 self.output.send(frames)
                 self.live = {
                     'fader': fader,
-                    'blackout': not self.arm_var.get(),
+                    'blackout': not self.armed,
                     'lights': light_statuses,
                     'trackers': self.trackers.snapshot(),
                 }
@@ -3235,9 +3307,16 @@ class App(tk.Tk):
                 time.sleep(max(0.0, sleep_time))
         except Exception as exc:
             self.log('OUTPUT ERROR: ' + str(exc))
-            self.after(0, self.stop)
+            # Do not touch Tk (self.after/self.stop) from this worker thread.
+            # ui_tick(), which already runs on the main thread, polls this flag.
+            self.worker_crashed = True
 
     def ui_tick(self):
+        if self.worker_crashed:
+            self.worker_crashed = False
+            if self.running:
+                self.stop()
+
         while True:
             try:
                 message = self.logs.get_nowait()
