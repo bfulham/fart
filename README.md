@@ -169,7 +169,9 @@ The **3D preview** is intentionally lightweight and uses only Tkinter. It displa
 
 FART assumes:
 
-- `+X`: stage right
+- `+X`: house right — the audience's/FOH right, facing the stage. This is the
+  opposite side from traditional theatrical "stage right," which is defined
+  from the performer's perspective.
 - `+Y`: away from the audience / upstage
 - `+Z`: upward
 - Bearing `0°`: `+Y`
