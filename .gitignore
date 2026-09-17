@@ -25,3 +25,7 @@ Thumbs.db
 FART.json
 fart-settings.json
 *.local.json
+
+# Backups and scratch files
+*.bak
+*.tmp
