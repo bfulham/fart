@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.0
+
+- Add a macOS build (Apple Silicon), alongside the existing Windows build: `FART.spec` now produces a proper `FART.app` bundle on macOS (onedir + `BUNDLE()`, distinct from Windows' onefile `EXE`), CI builds and tests on both platforms and attaches both zips to tagged releases, and new `build_macos_app.sh`/`run_source_macos.command` scripts mirror the existing Windows ones. Not yet verified on real macOS hardware — CI-built and launched successfully in CI, but no real console, Open DMX interface, or physical fixture testing has been done on macOS yet.
+- Rewrite README.md and the supporting docs (`docs/CALIBRATION.md`, `docs/GRANDMA3_TESTING.md`, `docs/RELEASE_CHECKLIST.md`, `CONTRIBUTING.md`, `SECURITY.md`) for structure and accuracy — no behavioural changes.
+
 ## 1.5.0
 
 - Add optional live console control (Art-Net only): patch a fixture normally, then patch a companion "FART control" fixture on the same output universe exposing a mode channel and a marker-select channel. Mode <128 relays that fixture's own channels straight through from the console untouched; >=128 hands pan/tilt (and zoom/iris, unless Auto beam size applies) back to FART while dimmer keeps passing through from the console.
