@@ -1560,8 +1560,8 @@ class DMXSetupDialog(tk.Toplevel):
 class CalibrationWizard(tk.Toplevel):
     DEFAULT_TARGETS = [
         ('Centre floor', 0.0, 0.0, 0.0),
-        ('Stage right floor', 5.0, 0.0, 0.0),
-        ('Stage left floor', -5.0, 0.0, 0.0),
+        ('House right floor', 5.0, 0.0, 0.0),
+        ('House left floor', -5.0, 0.0, 0.0),
         ('Upstage floor', 0.0, 5.0, 0.0),
         ('Downstage floor', 0.0, -5.0, 0.0),
         ('Centre at head height', 0.0, 0.0, 1.7),
@@ -1625,7 +1625,7 @@ class CalibrationWizard(tk.Toplevel):
             ttk.Label(custom, text=label).grid(row=row, column=0, sticky='w', padx=4, pady=2)
             ttk.Entry(custom, textvariable=var, width=10).grid(row=row, column=1, padx=4, pady=2)
         ttk.Button(custom, text='Add point', command=self.add_custom_point).grid(row=3, column=0, columnspan=2, sticky='ew', padx=4, pady=4)
-        ttk.Label(left, text='Tip: spread points across the area.\nUse left, right, upstage, downstage,\ncentre and at least one raised point.', justify='left').pack(anchor='w', padx=8, pady=8)
+        ttk.Label(left, text='Tip: spread points across the area.\nUse house left, house right, upstage, downstage,\ncentre and at least one raised point.', justify='left').pack(anchor='w', padx=8, pady=8)
 
         right = ttk.LabelFrame(body, text='Aim selected fixtures')
         right.pack(side='left', fill='both', expand=True)
@@ -2420,8 +2420,12 @@ class App(tk.Tk):
         )
         ttk.Label(
             calibration_tab,
-            text='World convention: +X right, +Y away/upstage, +Z up. Bearing 0° is +Y; +90° is +X.',
-            justify='left'
+            text=(
+                'World convention: +X house right (audience/FOH right, facing the stage — '
+                'the opposite side from traditional actor-perspective "stage right"), '
+                '+Y away/upstage, +Z up. Bearing 0° is +Y; +90° is +X.'
+            ),
+            justify='left', wraplength=680,
         ).pack(anchor='w', padx=12, pady=12)
         self.refresh_ports()
 
