@@ -1809,6 +1809,15 @@ class CalibrationWizard(tk.Toplevel):
         self._solving = True
         self.solve_button.state(['disabled'])
         self.solution_var.set('Solving…')
+        # Block interaction with the main App window while solving: the
+        # solve reads/writes app.settings.fixtures by index, so a concurrent
+        # edit, add, or remove elsewhere in the app while it runs could
+        # corrupt or misapply the result. The previous synchronous solve got
+        # this for free by blocking the whole Tk main loop; grab_set() gives
+        # the same "nothing else can be edited meanwhile" guarantee without
+        # freezing the UI (the wizard's own widgets, including Stop
+        # output/blackout, stay interactive).
+        self.grab_set()
 
         # The hill-climbing solver in solve_fixture_calibration() can take a
         # noticeable amount of time per fixture. Running it on the Tk main
@@ -1835,39 +1844,61 @@ class CalibrationWizard(tk.Toplevel):
         threading.Thread(target=worker, daemon=True).start()
 
         def poll():
-            wizard_open = self.winfo_exists()
             try:
                 results = results_queue.get_nowait()
             except queue.Empty:
-                if wizard_open:
-                    self.after(100, poll)
+                # Poll via self.app (the main window, which outlives this
+                # wizard) rather than self, so a solve started before the
+                # wizard is closed still finishes and gets applied instead
+                # of being silently dropped once self stops existing.
+                self.app.after(100, poll)
                 return
+
+            wizard_open = self.winfo_exists()
             self._solving = False
             if wizard_open:
+                try:
+                    self.grab_release()
+                except Exception:
+                    pass
                 self.solve_button.state(['!disabled'])
-            messages = []
-            error = None
-            for idx, solved, rms, err in results:
-                if err:
-                    error = err
-                    break
-                # Applied to the main App window, which outlives this wizard.
-                self.app.settings.fixtures[idx] = solved
-                self.app.insert_or_update_light_row(idx, solved)
-                messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, pan dir={solved.pan_direction:+d}, tilt dir={solved.tilt_direction:+d}, fit={rms:.3f} m')
-                self.app.log('Calibration applied to ' + messages[-1])
-            if error:
-                if wizard_open:
-                    messagebox.showerror(APP_NAME, error, parent=self)
-                    self.solution_var.set('No solution yet')
-                return
-            first_index = indices[0]
-            self.app.rebuild_light_tree(first_index)
-            self.app.load_light_editor(first_index)
-            if wizard_open:
-                self.solution_var.set('Applied solutions:\n' + '\n'.join(messages))
 
-        self.after(100, poll)
+            try:
+                messages = []
+                error = None
+                applied_indices = []
+                for idx, solved, rms, err in results:
+                    if err:
+                        error = err
+                        break
+                    # Applied to the main App window, which outlives this wizard.
+                    self.app.settings.fixtures[idx] = solved
+                    self.app.insert_or_update_light_row(idx, solved)
+                    messages.append(f'{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, pan dir={solved.pan_direction:+d}, tilt dir={solved.tilt_direction:+d}, fit={rms:.3f} m')
+                    self.app.log('Calibration applied to ' + messages[-1])
+                    applied_indices.append(idx)
+
+                # Refresh the tree/editor for whatever was actually applied,
+                # even on partial failure, so the UI never lags behind
+                # settings that have already been mutated.
+                if applied_indices:
+                    self.app.rebuild_light_tree(applied_indices[0])
+                    self.app.load_light_editor(applied_indices[0])
+
+                if error:
+                    if wizard_open:
+                        summary = ('Applied solutions:\n' + '\n'.join(messages) + '\n\n') if messages else ''
+                        self.solution_var.set(summary + f'Error on remaining fixture(s): {error}')
+                        messagebox.showerror(APP_NAME, error, parent=self)
+                    return
+                if wizard_open:
+                    self.solution_var.set('Applied solutions:\n' + '\n'.join(messages))
+            except Exception as exc:
+                if wizard_open:
+                    messagebox.showerror(APP_NAME, str(exc), parent=self)
+                    self.solution_var.set('No solution yet')
+
+        self.app.after(100, poll)
 
     def close(self):
         self.stop_output(); self.destroy()
@@ -3123,6 +3154,11 @@ class App(tk.Tk):
     def start(self):
         if self.running:
             return
+        # Clear any crash flag from a previous run: otherwise a worker that
+        # crashed just before Stop/Start (before ui_tick's next 100ms poll
+        # observes the flag) would tear the freshly started session back
+        # down as soon as that stale poll fires.
+        self.worker_crashed = False
         try:
             self.settings = self.collect()
             self.output = self.make_output(self.settings)
