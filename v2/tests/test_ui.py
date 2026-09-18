@@ -3,6 +3,7 @@ widgets, entirely in-process (QT_QPA_PLATFORM=offscreen) -- unlike v1's
 Tkinter UI, which needed OS-level Accessibility permission to automate and
 so was never actually click-tested this session.
 """
+import errno
 import os
 import socket
 import struct
@@ -23,6 +24,20 @@ from PySide6.QtWidgets import QApplication
 from fart.ui.main_window import MainWindow
 
 _app = QApplication.instance() or QApplication(sys.argv)
+
+
+def multicast_sendto(sock, data, addr):
+    """Some sandboxed CI network namespaces (seen on GitHub's hosted macOS
+    runner) have no route to any multicast destination at all -- not even
+    via loopback -- and every sendto() there fails immediately with
+    ENETUNREACH/EHOSTUNREACH, unlike a real machine, where it's delivered
+    over loopback normally. Skip rather than fail when that's the case."""
+    try:
+        sock.sendto(data, addr)
+    except OSError as exc:
+        if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            raise unittest.SkipTest(f"real multicast send unavailable in this environment: {exc}") from exc
+        raise
 
 
 def psn_chunk(chunk_id, payload, sub=False):
@@ -195,7 +210,7 @@ class LiveEndToEndUITests(WindowTestCase):
         seen_live_row = False
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
-            sock.sendto(packet, (settings.psn_in.multicast, settings.psn_in.port))
+            multicast_sendto(sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
             self.window._on_ui_tick()
             table = self.window.operator_tab.overview_table
             if table.rowCount() > 0:

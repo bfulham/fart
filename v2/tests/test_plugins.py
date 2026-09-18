@@ -3,6 +3,7 @@ just the pure parse/build helpers. This is the load-bearing test file for
 the hand-rolled sACN implementation in particular, since nothing else in
 this project has ever exercised it before.
 """
+import errno
 import struct
 import sys
 import time
@@ -29,6 +30,20 @@ def wait_until(predicate, timeout=2.0, interval=0.02):
             return True
         time.sleep(interval)
     return predicate()
+
+
+def multicast_sendto(sock, data, addr):
+    """Some sandboxed CI network namespaces (seen on GitHub's hosted macOS
+    runner) have no route to any multicast destination at all -- not even
+    via loopback -- and every sendto() there fails immediately with
+    ENETUNREACH/EHOSTUNREACH, unlike a real machine, where it's delivered
+    over loopback normally. Skip rather than fail when that's the case."""
+    try:
+        sock.sendto(data, addr)
+    except OSError as exc:
+        if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            raise unittest.SkipTest(f"real multicast send unavailable in this environment: {exc}") from exc
+        raise
 
 
 def psn_chunk(chunk_id, payload, sub=False):
@@ -89,7 +104,7 @@ class PSNPluginLoopbackTests(unittest.TestCase):
             deadline = time.monotonic() + 2.0
             x = y = z = None
             while time.monotonic() < deadline:
-                sock.sendto(packet, (config.multicast, config.port))
+                multicast_sendto(sock, packet, (config.multicast, config.port))
                 _x, _y, _z, t = positions.get(7)
                 if t > 0:
                     x, y, z = _x, _y, _z
@@ -143,7 +158,13 @@ class SACNPluginLoopbackTests(unittest.TestCase):
             frame[1] = 55
 
             def attempt():
-                sender.send({63: frame})
+                try:
+                    sender.send({63: frame})
+                except OSError as exc:
+                    if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                        raise unittest.SkipTest(
+                            f"real multicast send unavailable in this environment: {exc}") from exc
+                    raise
                 return bus.get(63)[0] is not None
 
             found = wait_until(attempt, timeout=3.0)

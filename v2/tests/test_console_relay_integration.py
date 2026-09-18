@@ -17,6 +17,7 @@ and binding a second socket there to sniff outgoing unicast traffic would
 race the Runner's real receiver for the same port, the same class of bug
 this whole plugin architecture exists to rule out at the config level.
 """
+import errno
 import socket
 import struct
 import sys
@@ -32,6 +33,24 @@ from fart.engine import calculate_aim
 from fart.plugins._artnet import ARTNET_PORT, build_artnet_dmx, parse_artnet_dmx
 from fart.plugins._sacn import SACN_PORT, build_sacn_dmx, parse_sacn_dmx, sacn_multicast_group
 from fart.runner import Runner
+
+
+def multicast_sendto(sock, data, addr):
+    """Some sandboxed CI network namespaces (seen on GitHub's hosted macOS
+    runner) have no route to any multicast destination at all -- not even
+    via loopback -- and every sendto() there fails immediately with
+    ENETUNREACH/EHOSTUNREACH, unlike a real machine (dev or GitHub's
+    Windows runner), where it's delivered over loopback normally. Treat
+    that specific failure as "this environment can't run a real multicast
+    test" and skip rather than fail, instead of forcing a workaround (an
+    earlier attempt to pin the send to the loopback interface explicitly
+    made things worse: it broke real delivery on a normal Mac outright)."""
+    try:
+        sock.sendto(data, addr)
+    except OSError as exc:
+        if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            raise unittest.SkipTest(f"real multicast send unavailable in this environment: {exc}") from exc
+        raise
 
 
 def psn_chunk(chunk_id, payload, sub=False):
@@ -120,7 +139,7 @@ class ConsoleSACNSender:
     def send(self, universe, frame):
         packet = build_sacn_dmx(self.cid, "test console", self.seq, universe, frame)
         self.seq = (self.seq + 1) & 0xFF
-        self.sock.sendto(packet, (sacn_multicast_group(universe), SACN_PORT))
+        multicast_sendto(self.sock, packet, (sacn_multicast_group(universe), SACN_PORT))
 
     def close(self):
         self.sock.close()
@@ -134,7 +153,7 @@ class PSNSender:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 
     def send(self, marker_id, x, y, z):
-        self.sock.sendto(build_psn_packet(marker_id, x, y, z), (self.multicast, self.port))
+        multicast_sendto(self.sock, build_psn_packet(marker_id, x, y, z), (self.multicast, self.port))
 
     def close(self):
         self.sock.close()

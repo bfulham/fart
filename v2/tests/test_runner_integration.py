@@ -2,6 +2,7 @@
 sACN) frames out, through the actual Runner wiring real plugins to the
 real engine -- no mocks anywhere in this path.
 """
+import errno
 import socket
 import struct
 import sys
@@ -24,6 +25,24 @@ def wait_until(predicate, timeout=3.0, interval=0.02):
             return True
         time.sleep(interval)
     return predicate()
+
+
+def multicast_sendto(sock, data, addr):
+    """Some sandboxed CI network namespaces (seen on GitHub's hosted macOS
+    runner) have no route to any multicast destination at all -- not even
+    via loopback -- and every sendto() there fails immediately with
+    ENETUNREACH/EHOSTUNREACH, unlike a real machine (dev or GitHub's
+    Windows runner), where it's delivered over loopback normally. Treat
+    that specific failure as "this environment can't run a real multicast
+    test" and skip rather than fail, instead of forcing a workaround (an
+    earlier attempt to pin the send to the loopback interface explicitly
+    made things worse: it broke real delivery on a normal Mac outright)."""
+    try:
+        sock.sendto(data, addr)
+    except OSError as exc:
+        if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            raise unittest.SkipTest(f"real multicast send unavailable in this environment: {exc}") from exc
+        raise
 
 
 def psn_chunk(chunk_id, payload, sub=False):
@@ -81,7 +100,7 @@ class RunnerEndToEndTests(unittest.TestCase):
             actual_pan = actual_tilt = None
             deadline = time.monotonic() + 4.0
             while time.monotonic() < deadline:
-                psn_sock.sendto(packet, (settings.psn_in.multicast, settings.psn_in.port))
+                multicast_sendto(psn_sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
                 try:
                     data, _addr = sniffer.recvfrom(2048)
                 except socket.timeout:
@@ -131,7 +150,7 @@ class RunnerEndToEndTests(unittest.TestCase):
             received = None
             deadline = time.monotonic() + 4.0
             while time.monotonic() < deadline and received is None:
-                psn_sock.sendto(packet, (settings.psn_in.multicast, settings.psn_in.port))
+                multicast_sendto(psn_sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
                 try:
                     data, _addr = sniffer.recvfrom(2048)
                 except socket.timeout:
