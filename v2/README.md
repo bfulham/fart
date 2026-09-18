@@ -44,6 +44,13 @@ avoided by convention -- it's not a state the system can be in.
     the third-party `sacn` PyPI package. Same wire-format module (`_sacn.py`)
     as `sacn_in.py`, so the two directions can't drift apart from each other.
   - `open_dmx_out.py` -- ported from v1's `OpenDMX`/`OpenDMXPort`.
+- `fart/calibration.py` -- the multi-fixture calibration solver, ported
+  from v1's `solve_fixture_calibration` with behaviour unchanged.
+- `fart/gdtf.py` -- GDTF (.gdtf) fixture file import, ported from v1's
+  `import_gdtf_channel_mapping` and its helpers, minus the Tk mode-selection
+  dialog (`select_gdtf_mode` in v1) -- picking a mode when a GDTF has more
+  than one is a UI concern for whatever calls this, not part of the import
+  logic itself.
 
 OSC support is dropped entirely (was only ever an intensity-fader input
 option in v1; not needed going forward).
@@ -53,9 +60,6 @@ option in v1; not needed going forward).
 - Any UI at all (planned: PySide6, replacing v1's Tkinter). This branch is
   engine/plugins first, verified working headlessly, before UI is built on
   top of it.
-- The calibration solver and GDTF import (still only in v1's `fart.py`).
-  Not needed to prove the architecture; will be ported before v2 replaces
-  v1.
 - Real hardware testing for `open_dmx_out.py` (no Open DMX USB adapter
   available to test against here).
 
@@ -76,6 +80,11 @@ resulting Art-Net (and separately sACN) output against an independently
 computed expected pan/tilt -- proving the full pipeline end to end, not
 just each piece in isolation.
 
+`tests/test_calibration.py` and `tests/test_gdtf.py` are carried over
+directly from v1's test suite (same fixture geometry, same synthetic GDTF
+file), confirming the ported solver and importer still produce the same
+results.
+
 Run the tests:
 
 ```bash
@@ -83,4 +92,4 @@ cd v2
 python3 -m unittest discover -s tests -v
 ```
 
-40/40 passing as of this writing.
+44/44 passing as of this writing.
