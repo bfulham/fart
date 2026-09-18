@@ -126,6 +126,26 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(self.window.settings.fixtures[0].name, "Spot 1")
         self.assertEqual(tab.list_widget.item(0).text(), "Spot 1")
 
+    def test_reclicking_the_only_fixture_switches_editor_back_from_type_view(self):
+        """Real bug: with only one fixture, clicking it after the editor had
+        switched to showing a fixture type doesn't change the Fixtures
+        list's current row (it was already row 0), so Qt's
+        currentRowChanged signal never fires and the editor stays stuck on
+        the type view. itemClicked (fires on every click, not just row
+        changes) is what actually fixes this."""
+        tab = self.window.fixtures_tab
+        while len(self.window.settings.fixtures) > 1:
+            tab._on_remove()
+        self.assertEqual(tab.list_widget.count(), 1)
+
+        tab._on_duplicate_type()
+        self.assertEqual(tab.editor_mode, "type")
+
+        rect = tab.list_widget.visualItemRect(tab.list_widget.item(0))
+        QTest.mouseClick(tab.list_widget.viewport(), Qt.MouseButton.LeftButton, pos=rect.center())
+        self.assertEqual(tab.editor_mode, "fixture",
+                          "clicking the only (already-current) fixture must still switch the editor back")
+
 
 class DMXInTabTests(WindowTestCase):
     def test_switching_protocol_preserves_both_universes(self):

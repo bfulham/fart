@@ -35,6 +35,12 @@ class FixturesTab(QWidget):
         left.addWidget(QLabel("Fixtures"))
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self._on_selection_changed)
+        # currentRowChanged only fires on an actual row-index change, not on
+        # re-clicking an already-current row -- with only one fixture (or
+        # re-clicking the same one after the editor switched away to show a
+        # fixture type), that left the editor stuck on whatever was loaded
+        # last. itemClicked fires on every click regardless.
+        self.list_widget.itemClicked.connect(lambda item: self._load_fixture(self.list_widget.row(item)))
         left.addWidget(self.list_widget)
         buttons = QHBoxLayout()
         add_button = QPushButton("Add")
@@ -50,6 +56,7 @@ class FixturesTab(QWidget):
         left.addWidget(QLabel("Fixture Types"))
         self.type_list_widget = QListWidget()
         self.type_list_widget.currentRowChanged.connect(self._on_type_selection_changed)
+        self.type_list_widget.itemClicked.connect(lambda item: self._load_type(self.type_list_widget.row(item)))
         left.addWidget(self.type_list_widget)
         type_buttons = QHBoxLayout()
         add_type_button = QPushButton("Add")
