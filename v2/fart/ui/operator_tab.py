@@ -70,8 +70,9 @@ class OperatorTab(QWidget):
             self.status_labels[key] = label
         right.addWidget(status_box)
 
-        self.overview_table = QTableWidget(0, 6)
-        self.overview_table.setHorizontalHeaderLabels(["Light", "Marker", "Marker XYZ", "Pan/Tilt", "Distance", "State"])
+        self.overview_table = QTableWidget(0, 8)
+        self.overview_table.setHorizontalHeaderLabels(
+            ["Light", "Marker", "Marker XYZ", "Pan/Tilt", "Distance", "DMX In Mode", "DMX In Marker", "State"])
         self.overview_table.horizontalHeader().setStretchLastSection(True)
         right.addWidget(self.overview_table, stretch=1)
 
@@ -161,12 +162,16 @@ class OperatorTab(QWidget):
                     state = "DIMMER LOCKED"
                 else:
                     state = "LIVE"
+            dmx_mode = item.get("dmx_mode")
+            dmx_marker = item.get("dmx_marker")
             values = [
                 item.get("name", ""),
                 str(item.get("marker_id", "")),
                 f"{marker_xyz[0]:.2f}, {marker_xyz[1]:.2f}, {marker_xyz[2]:.2f}",
                 angles,
                 distance,
+                dmx_mode.capitalize() if dmx_mode else "—",
+                str(dmx_marker) if dmx_marker is not None else "—",
                 state,
             ]
             for col, value in enumerate(values):

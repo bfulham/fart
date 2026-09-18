@@ -217,7 +217,7 @@ class LiveEndToEndUITests(WindowTestCase):
             self.window._on_ui_tick()
             table = self.window.operator_tab.overview_table
             if table.rowCount() > 0:
-                state_item = table.item(0, 5)
+                state_item = table.item(0, 7)  # column order: Light, Marker, Marker XYZ, Pan/Tilt, Distance, DMX In Mode, DMX In Marker, State
                 if state_item and state_item.text() == "LIVE":
                     seen_live_row = True
                     break
@@ -304,6 +304,95 @@ class DMXMonitorTests(WindowTestCase):
         psn_sock.close()
 
         self.assertTrue(seen, "DMX Out tab's channel grid never showed real sent data")
+
+
+class OperatorOverviewDMXInColumnsTests(WindowTestCase):
+    """Real end-to-end proof for the Operator tab's "DMX In Mode"/"DMX In
+    Marker" columns: a fixture with console relay configured should show
+    the console's actual live mode/marker selection, and a plain fixture
+    with no relay configured should show "--" for both, not a misleading
+    guess."""
+
+    def test_console_relay_fixture_shows_live_mode_and_marker(self):
+        settings = self.window.settings
+        settings.psn_in.multicast, settings.psn_in.port = "236.10.10.40", 56660
+        settings.dmx_in.active = "artnet"
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        settings.fixtures[0].marker_id = 1
+        settings.fixtures[0].output_universe = 0
+        settings.fixtures[0].console_mode_channel = 10
+        settings.fixtures[0].console_marker_channel = 11
+
+        QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
+        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+
+        from fart.plugins._artnet import ARTNET_PORT, build_artnet_dmx
+
+        psn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        psn_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        psn_packet = build_psn_packet(1, 5.0, 0.0, 4.0)
+        psn_packet_marker3 = build_psn_packet(3, -2.0, 1.0, 3.0)
+
+        console_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        console_frame = bytearray(512)
+        console_frame[9] = 255   # mode channel (10): >=128 => auto
+        console_frame[10] = 3    # marker channel (11): select marker 3
+        console_packet = build_artnet_dmx(0, console_frame)
+
+        seen = False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            multicast_sendto(psn_sock, psn_packet, (settings.psn_in.multicast, settings.psn_in.port))
+            multicast_sendto(psn_sock, psn_packet_marker3, (settings.psn_in.multicast, settings.psn_in.port))
+            console_sock.sendto(console_packet, ("127.0.0.1", ARTNET_PORT))
+            self.window._on_ui_tick()
+            table = self.window.operator_tab.overview_table
+            if table.rowCount() > 0:
+                mode_item = table.item(0, 5)
+                marker_item = table.item(0, 6)
+                if mode_item and marker_item and mode_item.text() == "Auto" and marker_item.text() == "3":
+                    seen = True
+                    break
+            time.sleep(0.05)
+        psn_sock.close()
+        console_sock.close()
+
+        self.assertTrue(seen, "overview table never showed the console's live DMX In mode/marker for the relayed fixture")
+
+    def test_fixture_without_console_relay_shows_dashes(self):
+        settings = self.window.settings
+        settings.psn_in.multicast, settings.psn_in.port = "236.10.10.41", 56661
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        settings.fixtures[0].marker_id = 1
+        settings.fixtures[0].output_universe = 0
+        settings.fixtures[0].console_mode_channel = 0
+        settings.fixtures[0].console_marker_channel = 0
+
+        QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
+        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        packet = build_psn_packet(1, 5.0, 0.0, 4.0)
+
+        seen = False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            multicast_sendto(sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
+            self.window._on_ui_tick()
+            table = self.window.operator_tab.overview_table
+            if table.rowCount() > 0:
+                mode_item = table.item(0, 5)
+                marker_item = table.item(0, 6)
+                if mode_item and marker_item and mode_item.text() == "—" and marker_item.text() == "—":
+                    seen = True
+                    break
+            time.sleep(0.05)
+        sock.close()
+
+        self.assertTrue(seen, "overview table should show '—' for DMX In Mode/Marker when no console relay is configured")
 
 
 if __name__ == "__main__":

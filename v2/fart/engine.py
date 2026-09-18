@@ -325,6 +325,15 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         console_stale = console_stale_for_universe.get(universe, False)
         mode = resolve_console_mode(fixture, universe_frame) if console_relay else "auto"
 
+        # For the Operator tab's "DMX In Mode"/"DMX In Marker" columns: None
+        # means "this fixture has no console relay configured" (or no
+        # marker-select channel), distinct from an actual resolved value,
+        # so the UI can show "--" rather than a misleading "Auto"/marker id
+        # for a fixture that never reads DMX-in at all.
+        dmx_mode = mode if console_relay else None
+        dmx_marker = (resolve_live_marker_id(fixture, universe_frame)
+                      if console_relay and int(fixture.console_marker_channel) > 0 else None)
+
         if console_relay and mode == "manual" and not console_stale:
             marker_xyz = trackers.get(int(fixture.marker_id))[:3]
             light_statuses.append({
@@ -333,6 +342,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "marker_xyz": marker_xyz, "fixture_xyz": (fixture.x, fixture.y, fixture.z),
                 "error": "MANUAL (console)", "stale": False, "blackout": False,
                 "pan_limit": False, "tilt_limit": False,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
             })
             state.previous_mode[index] = "manual"
             continue
@@ -388,6 +398,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "bearing": bearing, "elevation": elevation, "distance": distance,
                 "zoom_value": zoom_out, "iris_value": iris_out, "zoom_angle": zoom_angle, "zoom_auto": zoom_auto, "iris_auto": iris_auto,
                 "stale": stale, "blackout": blackout,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
             })
             light_statuses.append(status)
         except ValueError as exc:
@@ -396,6 +407,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "marker_xyz": (sx, sy, sz), "fixture_xyz": (fixture.x, fixture.y, fixture.z),
                 "error": str(exc), "stale": stale, "blackout": True,
                 "pan_limit": False, "tilt_limit": False,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
             })
 
     return frames, light_statuses
