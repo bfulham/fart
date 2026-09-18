@@ -10,7 +10,8 @@ safely.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict
+from dataclasses import replace
+from types import SimpleNamespace
 
 from .config import FixtureConfig
 from .engine import calculate_aim, wrap180
@@ -67,7 +68,7 @@ def _closest_point_to_lines(line_points, line_dirs):
     return _solve_3x3(m, v)
 
 
-def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
+def solve_fixture_calibration(base_fixture: FixtureConfig, pan_min: float, pan_max: float, samples):
     """Estimate fixture position and physical pan/tilt mapping from aimed samples.
 
     Converts each captured pan/tilt value into a 3D ray aimed at a known
@@ -75,6 +76,11 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
     Also tries pan/tilt direction combinations, rejects high-error
     solutions, and returns the direction combination that best matches
     the data. Returns (solved: FixtureConfig, ray_rms: float).
+
+    pan_min/pan_max now live on the fixture's FixtureType (not the instance
+    itself), but calculate_aim needs them to pick the best-fit wrapped pan
+    candidate -- passed in explicitly rather than requiring a full resolved
+    fixture, since nothing else about the type matters for this solve.
     """
     if len(samples) < 4:
         raise ValueError("At least four calibration points are required")
@@ -93,15 +99,16 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
         z_high = max(max_z + 35.0, 30.0)
 
     def make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir):
-        f = FixtureConfig(**asdict(base_fixture))
-        f.x, f.y, f.z = position
-        f.pan_zero_bearing = wrap180(pan_zero)
-        f.tilt_zero_elevation = tilt_zero
-        f.pan_direction = 1 if pan_dir >= 0 else -1
-        f.tilt_direction = 1 if tilt_dir >= 0 else -1
-        f.pan_offset = 0.0
-        f.tilt_offset = 0.0
-        return f
+        # A throwaway object with just what calculate_aim needs (pan_min/
+        # pan_max now live on the fixture's FixtureType, not the instance,
+        # so they're passed in explicitly rather than pulled off base_fixture).
+        x, y, z = position
+        return SimpleNamespace(
+            x=x, y=y, z=z,
+            pan_zero_bearing=wrap180(pan_zero), tilt_zero_elevation=tilt_zero,
+            pan_direction=1 if pan_dir >= 0 else -1, tilt_direction=1 if tilt_dir >= 0 else -1,
+            pan_offset=0.0, tilt_offset=0.0, pan_min=pan_min, pan_max=pan_max,
+        )
 
     def candidate_from_zeros(pan_zero, tilt_zero, pan_dir, tilt_dir):
         dirs = []
@@ -206,12 +213,13 @@ def solve_fixture_calibration(base_fixture: FixtureConfig, samples):
             f"Calibration did not fit well enough to apply safely: fit error {ray_rms:.2f} m. "
             "Recapture wider-spaced points, check the selected fixture, and confirm pan/tilt channels are not swapped."
         )
-    solved = make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir)
-    solved.x = round(solved.x, 4)
-    solved.y = round(solved.y, 4)
-    solved.z = round(solved.z, 4)
-    solved.pan_zero_bearing = round(wrap180(solved.pan_zero_bearing), 4)
-    solved.tilt_zero_elevation = round(solved.tilt_zero_elevation, 4)
-    solved.pan_offset = 0.0
-    solved.tilt_offset = 0.0
+    result = make_fixture(position, pan_zero, tilt_zero, pan_dir, tilt_dir)
+    solved = replace(
+        base_fixture,
+        x=round(result.x, 4), y=round(result.y, 4), z=round(result.z, 4),
+        pan_zero_bearing=round(wrap180(result.pan_zero_bearing), 4),
+        tilt_zero_elevation=round(result.tilt_zero_elevation, 4),
+        pan_direction=result.pan_direction, tilt_direction=result.tilt_direction,
+        pan_offset=0.0, tilt_offset=0.0,
+    )
     return solved, ray_rms

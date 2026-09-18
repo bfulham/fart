@@ -25,14 +25,49 @@ avoided by convention -- it's not a state the system can be in.
 
 - `fart/bus.py` -- the three thread-safe stores (`TrackerBank`, `FaderState`,
   `ExternalInputBus`) that connect input plugins to the engine.
-- `fart/config.py` -- the new nested `Settings` schema (grouped by concern:
-  `psn_in`, `dmx_in`, `dmx_out`, `fader`, per-fixture), plus a `migrate_v1()`
-  that maps an existing v1 `FART.json` onto it.
+- `fart/config.py` -- the nested `Settings` schema (grouped by concern:
+  `psn_in`, `dmx_in`, `dmx_out`, `fader`, `fixture_types`, `fixtures`), plus
+  `migrate_v1()` that maps a pre-v3 config (v1's flat `FART.json`, or v2's
+  earlier flat-fixture `FART2.json`) onto the current shape.
+
+  **Fixtures are split into a `FixtureType` and a `FixtureConfig` instance**,
+  the way a real console patches a fixture, rather than one flat dataclass
+  with ~14 raw absolute channel numbers per fixture:
+  - `FixtureType` -- a reusable personality: channel *offsets* within the
+    fixture's own footprint (not absolute channel numbers), its total
+    footprint size, and physical properties (pan/tilt range, beam model,
+    reverse flags, intensity scale). Define one type, patch as many
+    instances of it as needed -- no more retyping the same ~14 channel
+    numbers for every identical fixture in a rig.
+  - `FixtureConfig` -- an instance: position, calibration, and **three
+    independent DMX patches** (universe + start address each): where FART
+    sends its own computed output, where a live console feed of this
+    fixture's *entire* real channel footprint can optionally be read from
+    (the "shadow patch" -- see below), and where a small mode/marker
+    control block for live relay switching lives. These can all be on
+    completely different universes -- DMX In and DMX Out no longer have to
+    share a universe number, which was a real conflict risk when a
+    console's own DMX output and FART's computed output collided on the
+    same universe.
 - `fart/engine.py` -- all tracking/aiming/safety math, ported from v1 with
   behaviour preserved (`calculate_aim`, `write_fixture_to_frame`,
   console-relay mode/marker resolution), plus `run_cycle()`: an explicit,
   directly-testable replacement for what used to live inline in v1's
-  `App.loop()`.
+  `App.loop()`. `resolve_fixture(fixture, fixture_type)` merges a patched
+  instance with its type into a `ResolvedFixture` (concrete absolute
+  channel numbers) -- the shape `calculate_aim`/`write_fixture_to_frame`
+  actually consume, built fresh each cycle.
+
+  **Console shadow patch**: for a fixture with `shadow_universe` set,
+  `copy_shadow_into_output()` copies that fixture's *entire* footprint
+  (e.g. all 35 channels of a real fixture, not just the handful FART
+  understands) from the console's shadow feed into its slice of the output
+  frame every cycle, before FART overwrites the channels it actually owns
+  (pan/tilt always; dimmer always in auto mode; zoom/iris only when
+  auto-beam-size is on). Everything else -- color, gobo, prism, or zoom/
+  iris/focus when FART isn't actively driving them -- passes through
+  untouched. Manual mode (via the console mode channel) skips FART's
+  writes entirely, so the shadow copy alone *is* the full passthrough.
 - `fart/runner.py` -- headless orchestration: wires whichever plugins
   `Settings` names to the engine and runs the cycle loop. No UI dependency;
   a future Qt UI (or a test, or a script) drives this same class.
@@ -55,7 +90,11 @@ avoided by convention -- it's not a state the system can be in.
   `import_gdtf_channel_mapping` and its helpers, minus the Tk mode-selection
   dialog (`select_gdtf_mode` in v1) -- picking a mode when a GDTF has more
   than one is a UI concern for whatever calls this, not part of the import
-  logic itself.
+  logic itself. Called with `start_address=1` (the default), its output
+  maps directly onto a `FixtureType`'s own offset fields, plus a derived
+  `footprint` (the highest channel offset seen anywhere in the mode, not
+  just the channels FART classifies -- needed so a shadow patch can bring
+  across the whole fixture).
 - `fart/ui/` -- the PySide6 UI, replacing v1's Tkinter front end:
   - `main_window.py` -- `MainWindow`: owns `Settings`, the `Runner`, and a
     100ms timer draining a thread-safe log queue and refreshing live status.
@@ -67,6 +106,12 @@ avoided by convention -- it's not a state the system can be in.
   - `psn_in_tab.py`, `dmx_in_tab.py`, `dmx_out_tab.py`, `fixtures_tab.py`,
     `calibration_tab.py` + `calibration_wizard.py` -- one tab per concern,
     matching the layout described in "Why" below.
+  - `fixtures_tab.py` -- a Fixture Types library (add/duplicate/remove/
+    import-from-GDTF) alongside the fixture instance list; picking a
+    fixture shows its patch (type, position, calibration, the three DMX
+    patches), picking a type shows its channel offsets and physical
+    properties. Removing a type in use reassigns affected fixtures to
+    another type rather than leaving a dangling reference.
   - `binding.py` -- small two-way widget <-> `Settings` field helpers shared
     by every tab.
   - `dmx_in_tab.py` / `dmx_out_tab.py` show only the active protocol's
@@ -130,4 +175,4 @@ pip install -r requirements.txt
 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
 
-52/52 passing as of this writing.
+67/67 passing as of this writing.

@@ -261,9 +261,14 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
     """Best-effort GDTF DMX attribute extraction for one selected mode.
 
     Returns (mapping, mode_names, selected_mode_name). Mapping values are
-    absolute one-based DMX slots, except shutter_open and iris_100_dmx
-    which are DMX values for those attributes. Complex GDTF files may
-    still need manual checking against the fixture manual.
+    channel numbers relative to `start_address` (1-based within the
+    fixture's own footprint), except shutter_open/iris_100_dmx (DMX values,
+    not channel numbers) and footprint (the fixture's total channel count
+    for this mode). Called with the default start_address=1, this maps
+    directly onto a FixtureType's own offset fields -- a type is a
+    reusable template, not tied to where any particular instance is
+    patched. Complex GDTF files may still need manual checking against the
+    fixture manual.
     """
     root = _read_gdtf_description(path)
     modes = [node for node in root.iter() if _strip_ns(node.tag) == "DMXMode"]
@@ -298,12 +303,19 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
 
     found = {}
     kind_channels = {}
+    max_offset = 0
     for dmx_channel in mode.iter():
         if _strip_ns(dmx_channel.tag) != "DMXChannel":
             continue
         offsets = _parse_gdtf_offsets(_xml_attr(dmx_channel, "Offset", ""))
         if not offsets:
             continue
+        # Tracks every DMXChannel's offset, not just the ones FART classifies
+        # below, so `footprint` reflects the fixture's real total channel
+        # count (color, gobo, prism, ...) -- needed so a console shadow
+        # patch can bring across the whole fixture, not just the channels
+        # FART itself drives.
+        max_offset = max(max_offset, *offsets)
         attr_names = [_xml_attr(dmx_channel, "Attribute", "")]
         for child in dmx_channel.iter():
             if child is dmx_channel:
@@ -371,4 +383,6 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
 
     if not found:
         raise ValueError("No usable pan/tilt/dimmer/beam channels were found in that GDTF mode")
+    if max_offset > 0:
+        found["footprint"] = max_offset
     return found, mode_names, selected_mode

@@ -6,8 +6,11 @@ calling run_cycle() directly.
 
 test_runner_integration.py already proves plain tracking (PSN -> DMX out)
 end to end. This file proves the console-relay path: auto-mode passthrough
-of dimmer/beam channels, manual-mode full passthrough, fader sourced from
-DMX in, and the safety fallbacks (tracking loss, console loss, unarmed).
+of dimmer/beam channels via a console shadow patch, manual-mode full
+passthrough, fader sourced from DMX in, and the safety fallbacks (tracking
+loss, console loss, unarmed) -- and that DMX In and DMX Out can live on
+completely independent universes/addresses (the whole point of the
+fixture-type/patch redesign), not just different protocols.
 
 Each test pairs DMX-in and DMX-out on *different* protocols (Art-Net in +
 sACN out, or sACN in + Art-Net out) specifically so this test's own output
@@ -28,8 +31,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fart.config import FixtureConfig, Settings
-from fart.engine import calculate_aim
+from fart.config import FixtureConfig, FixtureType, Settings
+from fart.engine import calculate_aim, resolve_fixture
 from fart.plugins._artnet import ARTNET_PORT, build_artnet_dmx, parse_artnet_dmx
 from fart.plugins._sacn import SACN_PORT, build_sacn_dmx, parse_sacn_dmx, sacn_multicast_group
 from fart.runner import Runner
@@ -180,31 +183,44 @@ def pump_until(senders, sniffer, universe, predicate, timeout=6.0):
     return last
 
 
-def pan_tilt_from_frame(frame, fixture):
-    pan_frac = ((frame[fixture.pan_coarse - 1] << 8) | frame[fixture.pan_fine - 1]) / 65535.0
-    tilt_frac = ((frame[fixture.tilt_coarse - 1] << 8) | frame[fixture.tilt_fine - 1]) / 65535.0
-    pan = fixture.pan_min + pan_frac * (fixture.pan_max - fixture.pan_min)
-    tilt = fixture.tilt_min + tilt_frac * (fixture.tilt_max - fixture.tilt_min)
+def pan_tilt_from_frame(frame, resolved_fixture):
+    pan_frac = ((frame[resolved_fixture.pan_coarse - 1] << 8) | frame[resolved_fixture.pan_fine - 1]) / 65535.0
+    tilt_frac = ((frame[resolved_fixture.tilt_coarse - 1] << 8) | frame[resolved_fixture.tilt_fine - 1]) / 65535.0
+    pan = resolved_fixture.pan_min + pan_frac * (resolved_fixture.pan_max - resolved_fixture.pan_min)
+    tilt = resolved_fixture.tilt_min + tilt_frac * (resolved_fixture.tilt_max - resolved_fixture.tilt_min)
     return pan, tilt
+
+
+def relay_fixture(**overrides):
+    """A fixture with pan/tilt/dimmer/zoom/iris/focus on its type (offsets
+    1-4 pan/tilt as usual, 5=dimmer, 6=zoom, 7=iris, 8=focus), output on
+    universe 1, its console mode/marker control block on universe 10
+    (channels 1/2 -- an arbitrary small block, nowhere near the real
+    fixture's own footprint), and its console shadow feed (a live copy of
+    the real fixture's channels 1-8) on universe 5 -- three genuinely
+    different universes, proving DMX In and DMX Out no longer have to
+    share one."""
+    fixture_type = FixtureType(id="t", zoom=6, iris=7, focus=8)
+    base = dict(
+        marker_id=1, fixture_type_id="t", output_universe=1, output_start_address=1,
+        x=0.0, y=-8.0, z=5.0,
+        console_universe=10, console_mode_channel=1, console_marker_channel=2,
+        shadow_universe=5, shadow_start_address=1,
+    )
+    base.update(overrides)
+    fixture = FixtureConfig(**base)
+    return fixture_type, fixture
 
 
 class ConsoleRelayAutoModeTests(unittest.TestCase):
     """Auto mode: pan/tilt are computed from live tracking as usual, but
-    the console's own dimmer/shutter and beam (zoom/iris/focus) channels
-    are passed straight through untouched -- the whole point of console
-    relay is that the operator's board still controls intensity/beam
-    while FART only ever owns pan/tilt."""
-
-    def _fixture(self):
-        return FixtureConfig(
-            marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0,
-            dimmer=5, zoom=6, iris=7, focus=8,
-            console_mode_channel=10, console_marker_channel=11,
-        )
+    the console's own dimmer and beam (zoom/iris/focus) channels -- read
+    from a *separate* shadow-patch universe, not the mode/marker control
+    universe -- are passed straight through untouched."""
 
     def test_artnet_in_sacn_out(self):
-        fixture = self._fixture()
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = relay_fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.21", 56610
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "artnet"
@@ -215,36 +231,41 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleArtNetSender()
         marker_xyz = (5.0, 0.0, 4.0)
-        console_frame = bytearray(512)
-        console_frame[9] = 200   # mode channel (10): >=128 => auto
-        console_frame[10] = 0    # marker channel (11): 0 => use fixture default (marker 1)
-        console_frame[4] = 180   # dimmer channel (5): console's own live intensity
-        console_frame[5] = 111   # zoom channel (6)
-        console_frame[6] = 222   # iris channel (7)
-        console_frame[7] = 77    # focus channel (8)
+        mode_frame = bytearray(512)
+        mode_frame[0] = 200  # mode channel (1 on console_universe): >=128 => auto
+        mode_frame[1] = 0    # marker channel (2): 0 => use fixture default (marker 1)
+        shadow_frame = bytearray(512)
+        shadow_frame[4] = 180  # dimmer (offset 5): irrelevant -- FART always overwrites this in auto mode
+        shadow_frame[5] = 111  # zoom (offset 6)
+        shadow_frame[6] = 222  # iris (offset 7)
+        shadow_frame[7] = 77   # focus (offset 8)
 
         runner = Runner()
         runner.start(settings)
         runner.armed = True
+        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode, never console-passed-through
         try:
-            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(fixture, *marker_xyz)
+            resolved = resolve_fixture(fixture, fixture_type)
+            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
 
             def converged(frame):
-                pan, tilt = pan_tilt_from_frame(frame, fixture)
-                return abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1
+                pan, tilt = pan_tilt_from_frame(frame, resolved)
+                return abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1 and frame[5] == 111
 
             frame = pump_until(
-                [lambda: psn.send(1, *marker_xyz), lambda: console.send(1, console_frame)],
+                [lambda: psn.send(1, *marker_xyz),
+                 lambda: console.send(10, mode_frame),
+                 lambda: console.send(5, shadow_frame)],
                 sniffer, 1, converged,
             )
             self.assertIsNotNone(frame, "never received a decoded sACN out frame for universe 1")
-            pan, tilt = pan_tilt_from_frame(frame, fixture)
+            pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1)
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
-            self.assertEqual(frame[4], 180, "auto mode should pass the console's live dimmer straight through")
-            self.assertEqual(frame[5], 111, "auto mode should pass the console's live zoom straight through")
-            self.assertEqual(frame[6], 222, "auto mode should pass the console's live iris straight through")
-            self.assertEqual(frame[7], 77, "auto mode should pass the console's live focus straight through")
+            self.assertGreater(frame[4], 0, "dimmer is always FART-computed in auto mode (armed, fader > 0), never console-passed-through")
+            self.assertEqual(frame[5], 111, "auto mode should pass the console's live zoom straight through from the shadow patch")
+            self.assertEqual(frame[6], 222, "auto mode should pass the console's live iris straight through from the shadow patch")
+            self.assertEqual(frame[7], 77, "auto mode should pass the console's live focus straight through from the shadow patch")
         finally:
             runner.stop()
             sniffer.close()
@@ -252,12 +273,11 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
             console.close()
 
     def test_sacn_in_artnet_out(self):
-        fixture = self._fixture()
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = relay_fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.22", 56611
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "sacn"
-        settings.dmx_in.sacn.universe = 1
         settings.dmx_out.active = "artnet"
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
 
@@ -265,30 +285,35 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleSACNSender()
         marker_xyz = (-3.0, 2.0, 1.5)
-        console_frame = bytearray(512)
-        console_frame[9] = 255
-        console_frame[10] = 0
-        console_frame[4] = 90
+        mode_frame = bytearray(512)
+        mode_frame[0] = 255
+        mode_frame[1] = 0
+        shadow_frame = bytearray(512)
+        shadow_frame[4] = 90
 
         runner = Runner()
         runner.start(settings)
         runner.armed = True
+        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode, never console-passed-through
         try:
-            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(fixture, *marker_xyz)
+            resolved = resolve_fixture(fixture, fixture_type)
+            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
 
             def converged(frame):
-                pan, tilt = pan_tilt_from_frame(frame, fixture)
+                pan, tilt = pan_tilt_from_frame(frame, resolved)
                 return abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1
 
             frame = pump_until(
-                [lambda: psn.send(1, *marker_xyz), lambda: console.send(1, console_frame)],
+                [lambda: psn.send(1, *marker_xyz),
+                 lambda: console.send(10, mode_frame),
+                 lambda: console.send(5, shadow_frame)],
                 sniffer, 1, converged,
             )
             self.assertIsNotNone(frame, "never received a decoded Art-Net out frame for universe 1")
-            pan, tilt = pan_tilt_from_frame(frame, fixture)
+            pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1)
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
-            self.assertEqual(frame[4], 90, "auto mode should pass the console's live dimmer straight through")
+            self.assertGreater(frame[4], 0, "dimmer is always FART-computed in auto mode (armed, fader > 0), never console-passed-through")
         finally:
             runner.stop()
             sniffer.close()
@@ -298,19 +323,13 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
 
 class ConsoleRelayManualModeTests(unittest.TestCase):
     """Manual mode: FART must not touch this fixture's channels at all --
-    the console's own raw frame goes out byte-for-byte, including pan/tilt,
+    the shadow patch's raw bytes go out byte-for-byte, including pan/tilt,
     which will *not* match calculate_aim if the console is driving pan/tilt
     itself (proving this isn't accidentally computing and overwriting it)."""
 
-    def _fixture(self):
-        return FixtureConfig(
-            marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0, dimmer=5,
-            console_mode_channel=10, console_marker_channel=11,
-        )
-
     def test_artnet_in_sacn_out_full_passthrough(self):
-        fixture = self._fixture()
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = relay_fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.23", 56612
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "artnet"
@@ -320,24 +339,27 @@ class ConsoleRelayManualModeTests(unittest.TestCase):
         sniffer = SACNOutSniffer(1)
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleArtNetSender()
-        console_frame = bytearray(512)
-        console_frame[9] = 10     # mode channel < 128 => manual
-        console_frame[0] = 111    # pan coarse -- deliberately NOT what calculate_aim would produce
-        console_frame[1] = 222    # pan fine
-        console_frame[4] = 200    # dimmer
+        mode_frame = bytearray(512)
+        mode_frame[0] = 10  # mode channel < 128 => manual
+        shadow_frame = bytearray(512)
+        shadow_frame[0] = 111  # pan coarse -- deliberately NOT what calculate_aim would produce
+        shadow_frame[1] = 222  # pan fine
+        shadow_frame[4] = 200  # dimmer
 
         runner = Runner()
         runner.start(settings)
         runner.armed = True
         try:
             frame = pump_until(
-                [lambda: psn.send(1, 5.0, 0.0, 4.0), lambda: console.send(1, console_frame)],
+                [lambda: psn.send(1, 5.0, 0.0, 4.0),
+                 lambda: console.send(10, mode_frame),
+                 lambda: console.send(5, shadow_frame)],
                 sniffer, 1, lambda f: f[0] == 111 and f[1] == 222,
             )
             self.assertIsNotNone(frame, "never received a decoded sACN out frame for universe 1")
-            self.assertEqual(frame[0], 111, "manual mode must pass the console's raw pan-coarse byte through untouched")
-            self.assertEqual(frame[1], 222, "manual mode must pass the console's raw pan-fine byte through untouched")
-            self.assertEqual(frame[4], 200, "manual mode must pass the console's raw dimmer byte through untouched")
+            self.assertEqual(frame[0], 111, "manual mode must pass the shadow patch's raw pan-coarse byte through untouched")
+            self.assertEqual(frame[1], 222, "manual mode must pass the shadow patch's raw pan-fine byte through untouched")
+            self.assertEqual(frame[4], 200, "manual mode must pass the shadow patch's raw dimmer byte through untouched")
         finally:
             runner.stop()
             sniffer.close()
@@ -352,8 +374,9 @@ class FaderFromDMXInTests(unittest.TestCase):
     fader, separate from per-fixture console relay)."""
 
     def test_artnet_in_channel_drives_output_intensity(self):
-        fixture = FixtureConfig(marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0, dimmer=5)
-        settings = Settings(fixtures=[fixture])
+        fixture_type = FixtureType(id="t")
+        fixture = FixtureConfig(marker_id=1, fixture_type_id="t", output_universe=1, x=0.0, y=-8.0, z=5.0)
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.24", 56613
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "artnet"
@@ -367,7 +390,7 @@ class FaderFromDMXInTests(unittest.TestCase):
         console = ConsoleArtNetSender()
         # fader.channel reads from dmx_in.active's *own configured universe*
         # (settings.dmx_in.artnet.universe) via ExternalInputBus, independent
-        # of any fixture's output_universe.
+        # of any fixture's output_universe or console/shadow patches.
         fader_universe = settings.dmx_in.artnet.universe
         console_frame = bytearray(512)
         console_frame[19] = 128  # channel 20 -> fader ~= 128/255 = 0.502
@@ -381,8 +404,6 @@ class FaderFromDMXInTests(unittest.TestCase):
                 sniffer, 1, lambda f: f[4] not in (0, 255),
             )
             self.assertIsNotNone(frame, "never received a decoded sACN out frame for universe 1")
-            dimmer_16bit = (frame[4] << 8) | 0
-            fraction = dimmer_16bit / 65280.0  # dimmer_fine unset -> compare coarse byte only
             self.assertAlmostEqual(frame[4] / 255.0, 128 / 255.0, delta=0.02,
                                     msg="output dimmer should track the live DMX-in fader channel, not be full or zero")
         finally:
@@ -399,13 +420,14 @@ class SafetyFallbackTests(unittest.TestCase):
     not just the pure function."""
 
     def _fixture(self, **overrides):
-        base = dict(marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0, dimmer=5)
+        fixture_type = FixtureType(id="t")
+        base = dict(marker_id=1, fixture_type_id="t", output_universe=1, x=0.0, y=-8.0, z=5.0)
         base.update(overrides)
-        return FixtureConfig(**base)
+        return fixture_type, FixtureConfig(**base)
 
     def test_tracking_loss_blacks_out_dimmer(self):
-        fixture = self._fixture()
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = self._fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.25", 56614
         settings.psn_in.timeout_s = 0.3
         settings.dmx_out.active = "artnet"
@@ -435,8 +457,8 @@ class SafetyFallbackTests(unittest.TestCase):
             psn.close()
 
     def test_unarmed_blacks_out_dimmer_but_keeps_tracking(self):
-        fixture = self._fixture()
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = self._fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.26", 56615
         settings.psn_in.timeout_s = 1.0
         settings.dmx_out.active = "artnet"
@@ -450,15 +472,16 @@ class SafetyFallbackTests(unittest.TestCase):
         runner.start(settings)
         runner.armed = False  # never armed
         try:
-            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(fixture, *marker_xyz)
+            resolved = resolve_fixture(fixture, fixture_type)
+            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
 
             def converged(frame):
-                pan, tilt = pan_tilt_from_frame(frame, fixture)
+                pan, tilt = pan_tilt_from_frame(frame, resolved)
                 return abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1
 
             frame = pump_until([lambda: psn.send(1, *marker_xyz)], sniffer, 1, converged)
             self.assertIsNotNone(frame)
-            pan, tilt = pan_tilt_from_frame(frame, fixture)
+            pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1,
                                     msg="unarmed must still compute pan/tilt so the light is pre-aimed")
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
@@ -476,8 +499,8 @@ class SafetyFallbackTests(unittest.TestCase):
         computing pan/tilt from live tracking again and forces the dimmer
         off (default on_console_loss = "Blackout"), rather than a silent
         frozen light."""
-        fixture = self._fixture(console_mode_channel=10, console_marker_channel=11)
-        settings = Settings(fixtures=[fixture])
+        fixture_type, fixture = relay_fixture()
+        settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.27", 56616
         settings.psn_in.timeout_s = 0.3
         settings.dmx_in.active = "artnet"
@@ -488,33 +511,37 @@ class SafetyFallbackTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleArtNetSender()
         marker_xyz = (5.0, 0.0, 4.0)
-        manual_frame = bytearray(512)
-        manual_frame[9] = 10     # manual
-        manual_frame[0] = 111
-        manual_frame[1] = 222
-        manual_frame[4] = 200
+        mode_frame = bytearray(512)
+        mode_frame[0] = 10  # manual
+        shadow_frame = bytearray(512)
+        shadow_frame[0] = 111
+        shadow_frame[1] = 222
+        shadow_frame[4] = 200
 
         runner = Runner()
         runner.start(settings)
         runner.armed = True
         try:
             frame = pump_until(
-                [lambda: psn.send(1, *marker_xyz), lambda: console.send(1, manual_frame)],
+                [lambda: psn.send(1, *marker_xyz),
+                 lambda: console.send(10, mode_frame),
+                 lambda: console.send(5, shadow_frame)],
                 sniffer, 1, lambda f: f[0] == 111 and f[1] == 222,
             )
             self.assertIsNotNone(frame, "should have seen manual full passthrough first")
 
             # Now stop the console entirely (keep tracking alive) and wait
-            # past timeout_s for the console frame to go stale.
-            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(fixture, *marker_xyz)
+            # past timeout_s for the mode-channel frame to go stale.
+            resolved = resolve_fixture(fixture, fixture_type)
+            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
 
             def fell_back(frame):
-                pan, tilt = pan_tilt_from_frame(frame, fixture)
+                pan, tilt = pan_tilt_from_frame(frame, resolved)
                 return frame[4] == 0 and abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1
 
             frame = pump_until([lambda: psn.send(1, *marker_xyz)], sniffer, 1, fell_back, timeout=4.0)
             self.assertIsNotNone(frame)
-            pan, tilt = pan_tilt_from_frame(frame, fixture)
+            pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1,
                                     msg="losing the console must fall back to computed tracking, not a frozen frame")
             self.assertEqual(frame[4], 0, "losing the console must force the dimmer off by default")
@@ -537,15 +564,17 @@ class SACNInMultiUniverseTests(unittest.TestCase):
     incoming universe for free, with no per-universe join needed.)"""
 
     def test_fixtures_on_different_sacn_universes_both_get_console_relay(self):
+        type_a = FixtureType(id="ta")
+        type_b = FixtureType(id="tb")
         fixture_a = FixtureConfig(
-            name="A", marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0, dimmer=5,
-            console_mode_channel=10, console_marker_channel=0,
+            name="A", marker_id=1, fixture_type_id="ta", output_universe=1, x=0.0, y=-8.0, z=5.0,
+            console_universe=1, console_mode_channel=10, console_marker_channel=0,
         )
         fixture_b = FixtureConfig(
-            name="B", marker_id=2, output_universe=2, x=0.0, y=-8.0, z=5.0, dimmer=5,
-            console_mode_channel=10, console_marker_channel=0,
+            name="B", marker_id=2, fixture_type_id="tb", output_universe=2, x=0.0, y=-8.0, z=5.0,
+            console_universe=2, console_mode_channel=10, console_marker_channel=0,
         )
-        settings = Settings(fixtures=[fixture_a, fixture_b])
+        settings = Settings(fixture_types=[type_a, type_b], fixtures=[fixture_a, fixture_b])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.28", 56617
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "sacn"
@@ -557,18 +586,18 @@ class SACNInMultiUniverseTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleSACNSender()
         auto_frame = bytearray(512)
-        auto_frame[9] = 200   # auto, non-stale, enables dimmer passthrough once received
-        auto_frame[4] = 200   # console's own live dimmer value, relayed through when received
+        auto_frame[9] = 200  # auto, non-stale -- lets the (forced by armed+fader) dimmer through
 
         runner = Runner()
         runner.start(settings)
         runner.armed = True
+        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode now, never console-passed-through
         try:
             def senders():
                 psn.send(1, 5.0, 0.0, 4.0)
                 psn.send(2, 5.0, 0.0, 4.0)
-                console.send(1, auto_frame)
-                console.send(2, auto_frame)  # a different universe than dmx_in.sacn.universe
+                console.send(1, auto_frame)  # fixture_a's console_universe
+                console.send(2, auto_frame)  # fixture_b's console_universe -- a *different* universe
 
             frame_a = frame_b = None
             deadline = time.monotonic() + 4.0
@@ -588,9 +617,9 @@ class SACNInMultiUniverseTests(unittest.TestCase):
             self.assertIsNotNone(frame_a)
             self.assertIsNotNone(frame_b)
             self.assertGreater(frame_a[4], 0,
-                                "fixture on the fader's configured sACN universe (1) should get its console dimmer relayed")
+                                "fixture A's console relay (universe 1) should not read as console-lost")
             self.assertGreater(frame_b[4], 0,
-                                "fixture on a different sACN universe (2) should also get its console dimmer relayed -- "
+                                "fixture B's console relay (universe 2) should also not read as console-lost -- "
                                 "SACNInPlugin must join a group per universe actually needed, not just dmx_in.sacn.universe")
         finally:
             runner.stop()

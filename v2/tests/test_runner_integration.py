@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fart.config import FixtureConfig, Settings
-from fart.engine import calculate_aim
+from fart.config import FixtureConfig, FixtureType, Settings
+from fart.engine import calculate_aim, resolve_fixture
 from fart.plugins._artnet import parse_artnet_dmx
 from fart.runner import Runner
 
@@ -67,9 +67,11 @@ class RunnerEndToEndTests(unittest.TestCase):
         settings.psn_in.timeout_s = 2.0
         settings.psn_in.smoothing = 0.0
         settings.refresh_hz = 30
-        fixture = FixtureConfig(marker_id=1, output_universe=0, x=0.0, y=-8.0, z=5.0)
+        fixture_type = FixtureType(id="t")
+        fixture = FixtureConfig(marker_id=1, output_universe=0, x=0.0, y=-8.0, z=5.0, fixture_type_id="t")
+        settings.fixture_types = [fixture_type]
         settings.fixtures = [fixture]
-        return settings, fixture
+        return settings, resolve_fixture(fixture, fixture_type)
 
     def test_psn_to_artnet_out_matches_calculate_aim(self):
         settings, fixture = self._base_settings()
@@ -128,7 +130,7 @@ class RunnerEndToEndTests(unittest.TestCase):
         settings, fixture = self._base_settings()
         settings.dmx_out.active = "sacn"
         settings.dmx_out.sacn.universes = [1]
-        fixture.output_universe = 1
+        settings.fixtures[0].output_universe = 1
 
         from fart.plugins._sacn import parse_sacn_dmx, sacn_multicast_group
 

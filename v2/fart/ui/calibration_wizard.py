@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..calibration import solve_fixture_calibration
-from ..engine import blank_frames_for_settings, write_fixture_to_frame
+from ..engine import blank_frames_for_settings, fixture_type_for, resolve_fixture, write_fixture_to_frame
 from ..plugins import OUTPUT_PLUGINS
 
 DEFAULT_TARGETS = [
@@ -27,15 +27,18 @@ DEFAULT_TARGETS = [
 
 
 class _FixtureRow(QWidget):
-    def __init__(self, fixture):
+    def __init__(self, fixture, fixture_type):
         super().__init__()
         self.fixture = fixture
+        self.fixture_type = fixture_type
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel(fixture.name))
 
-        self.pan_slider = self._slider(fixture.pan_min, fixture.pan_max, (fixture.pan_min + fixture.pan_max) / 2)
-        self.tilt_slider = self._slider(fixture.tilt_min, fixture.tilt_max, (fixture.tilt_min + fixture.tilt_max) / 2)
+        pan_min, pan_max = fixture_type.pan_min, fixture_type.pan_max
+        tilt_min, tilt_max = fixture_type.tilt_min, fixture_type.tilt_max
+        self.pan_slider = self._slider(pan_min, pan_max, (pan_min + pan_max) / 2)
+        self.tilt_slider = self._slider(tilt_min, tilt_max, (tilt_min + tilt_max) / 2)
         self.level_slider = self._slider(0, 100, 15)
         self.zoom_slider = self._slider(0, 100, 50)
         self.iris_slider = self._slider(0, 100, 100)
@@ -73,6 +76,7 @@ class CalibrationWizard(QDialog):
         self.main_window = main_window
         self.fixture_indices = list(fixture_indices)
         self.fixtures = {i: main_window.settings.fixtures[i] for i in self.fixture_indices}
+        self.fixture_types = {i: fixture_type_for(main_window.settings, self.fixtures[i]) for i in self.fixture_indices}
         self.samples = {i: [] for i in self.fixture_indices}
         self.targets = list(DEFAULT_TARGETS)
         self.output = None
@@ -102,7 +106,7 @@ class CalibrationWizard(QDialog):
         body.addLayout(right, stretch=1)
         self.rows = {}
         for index in self.fixture_indices:
-            row = _FixtureRow(self.fixtures[index])
+            row = _FixtureRow(self.fixtures[index], self.fixture_types[index])
             self.rows[index] = row
             right.addWidget(row)
 
@@ -161,9 +165,10 @@ class CalibrationWizard(QDialog):
                 frames = blank_frames_for_settings(self.main_window.settings)
                 for index in self.fixture_indices:
                     fixture = self.fixtures[index]
+                    resolved = resolve_fixture(fixture, self.fixture_types[index])
                     row = self.rows[index]
                     frame = frames.setdefault(int(fixture.output_universe), bytearray(512))
-                    write_fixture_to_frame(frame, fixture, row.pan(), row.tilt(), row.level(), False,
+                    write_fixture_to_frame(frame, resolved, row.pan(), row.tilt(), row.level(), False,
                                             row.zoom(), row.iris(), self.main_window.runner.focus_value)
                 self.output.send(frames)
             except Exception as exc:
@@ -190,7 +195,9 @@ class CalibrationWizard(QDialog):
         messages = []
         try:
             for index in self.fixture_indices:
-                solved, rms = solve_fixture_calibration(self.fixtures[index], self.samples[index])
+                fixture_type = self.fixture_types[index]
+                solved, rms = solve_fixture_calibration(
+                    self.fixtures[index], fixture_type.pan_min, fixture_type.pan_max, self.samples[index])
                 self.main_window.settings.fixtures[index] = solved
                 messages.append(
                     f"{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), "
