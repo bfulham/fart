@@ -23,20 +23,25 @@ class SACNInPlugin:
         self._bus = None
         self._thread = None
 
-    def start(self, config, bus):
-        """config: a SACNInConfig (config.universe selects the multicast
-        group to join). bus: a bus.ExternalInputBus."""
+    def start(self, config, bus, universes=None):
+        """config: a SACNInConfig (config.universe is the fallback/fader
+        universe). universes: every universe actually needed (see
+        engine.dmx_in_universes_needed) -- sACN requires joining a
+        multicast group per universe, unlike Art-Net, so without this a
+        fixture whose console relay lives on any universe but config.universe
+        would silently never receive data. bus: a bus.ExternalInputBus."""
         self._bus = bus
-        group = sacn_multicast_group(config.universe)
+        universes = sorted({int(u) for u in universes} if universes else {int(config.universe)})
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("", SACN_PORT))
-        membership = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        for universe in universes:
+            membership = socket.inet_aton(sacn_multicast_group(universe)) + socket.inet_aton("0.0.0.0")
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
         self.sock.settimeout(0.3)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        self.log(f"DMX in (sACN): listening on universe {config.universe} ({group}:{SACN_PORT})")
+        self.log(f"DMX in (sACN): listening on universes {universes} (port {SACN_PORT})")
 
     def _loop(self):
         while not self.stop_evt.is_set():

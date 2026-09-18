@@ -15,8 +15,11 @@ class PositionInputPlugin(Protocol):
 
 class ControlInputPlugin(Protocol):
     """Produces raw DMX frames from an external console (artnet-in, sacn-in).
-    Exactly one of these runs at a time -- see Settings.dmx_in.active."""
-    def start(self, config, bus) -> None: ...
+    Exactly one of these runs at a time -- see Settings.dmx_in.active.
+    `universes` lists every universe actually needed (see
+    engine.dmx_in_universes_needed); Art-Net-in ignores it, sACN-in uses it
+    to know which multicast groups to join."""
+    def start(self, config, bus, universes=None) -> None: ...
     def stop(self) -> None: ...
 
 

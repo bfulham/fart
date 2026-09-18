@@ -24,10 +24,13 @@ class ArtNetInPlugin:
         self._bus = None
         self._thread = None
 
-    def start(self, config, bus):
-        """config: an ArtNetInConfig (currently unused -- Art-Net carries
-        its universe in-band per packet, so nothing to bind per-universe).
-        bus: a bus.ExternalInputBus."""
+    def start(self, config, bus, universes=None):
+        """config: an ArtNetInConfig (only its `universe` field is read,
+        by the master-fader-from-DMX-in lookup; console relay always uses
+        each fixture's own output_universe instead). universes: ignored --
+        Art-Net carries its universe in-band per packet, so every universe
+        is received without needing to join anything. bus: a
+        bus.ExternalInputBus."""
         self._bus = bus
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

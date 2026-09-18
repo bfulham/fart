@@ -74,6 +74,27 @@ def dmx_in_is_needed(settings):
     return any(f.enabled and int(f.console_mode_channel) > 0 for f in settings.fixtures)
 
 
+def dmx_in_universes_needed(settings):
+    """Every universe that actually needs to be readable from the active
+    DMX-in source: each enabled fixture's own output_universe (console
+    relay always reads within a fixture's own universe), plus the DMX-in
+    universe the master fader reads from when fader.source == 'dmx_in'.
+
+    Art-Net-in ignores this (it accepts every incoming universe for free,
+    with no per-universe join needed), but sACN-in needs it to know which
+    multicast groups to join -- otherwise it can only ever receive the one
+    universe named on the DMX In tab, silently losing console relay for
+    any fixture on a different universe even though a real console is
+    genuinely sending it.
+    """
+    universes = {int(f.output_universe) for f in settings.fixtures
+                 if f.enabled and int(f.console_mode_channel) > 0}
+    if settings.fader.source == "dmx_in":
+        active = settings.dmx_in.active
+        universes.add(int(getattr(settings.dmx_in, active).universe))
+    return universes
+
+
 def resolve_console_mode(fixture: FixtureConfig, universe_frame):
     """'auto' or 'manual'. console_mode_channel == 0, or missing/short frame
     data, always falls back to 'auto' -- a stale/absent console signal

@@ -9,7 +9,7 @@ import threading
 import time
 
 from .bus import ExternalInputBus, FaderState, TrackerBank
-from .engine import CycleState, blank_frames_for_settings, dmx_in_is_needed, run_cycle
+from .engine import CycleState, blank_frames_for_settings, dmx_in_is_needed, dmx_in_universes_needed, run_cycle
 from .plugins import CONTROL_INPUT_PLUGINS, OUTPUT_PLUGINS, PSNInPlugin
 
 
@@ -44,7 +44,9 @@ class Runner:
             if dmx_in_is_needed(settings):
                 control_cls = CONTROL_INPUT_PLUGINS[settings.dmx_in.active]
                 self.control_plugin = control_cls(log=self.log)
-                self.control_plugin.start(getattr(settings.dmx_in, settings.dmx_in.active), self.bus)
+                self.control_plugin.start(
+                    getattr(settings.dmx_in, settings.dmx_in.active), self.bus, dmx_in_universes_needed(settings),
+                )
 
             output_cls = OUTPUT_PLUGINS[settings.dmx_out.active]
             self.output_plugin = output_cls()

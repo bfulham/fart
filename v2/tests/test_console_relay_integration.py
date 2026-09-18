@@ -506,19 +506,18 @@ class SafetyFallbackTests(unittest.TestCase):
             console.close()
 
 
-class SACNInSingleUniverseLimitationTests(unittest.TestCase):
-    """Documents real, verified behaviour (not a hypothesis): the sACN
-    DMX-in plugin joins exactly one multicast group -- whichever universe
-    is configured on the DMX In tab (dmx_in.sacn.universe) -- unlike
-    Art-Net-in, which accepts every incoming universe for free because
-    Art-Net carries its universe in-band and needs no per-universe join.
-    A fixture whose console relay lives on a *different* sACN universe
-    than the one configured never receives console data, even though a
-    real console is genuinely sending it on the wire -- and per the
-    default on_console_loss policy, that reads as a permanently lost
-    console and blacks the fixture out forever."""
+class SACNInMultiUniverseTests(unittest.TestCase):
+    """SACNInPlugin must join a multicast group for every universe that
+    actually needs sACN DMX-in data (engine.dmx_in_universes_needed), not
+    just the single universe named on the DMX In tab -- otherwise a
+    fixture whose console relay lives on a different sACN universe would
+    silently and permanently read as console-lost, even though a real
+    console is genuinely sending it on the wire. (This was a real,
+    confirmed bug found while writing this test suite, fixed in
+    sacn_in.py -- Art-Net-in never had this problem since it accepts every
+    incoming universe for free, with no per-universe join needed.)"""
 
-    def test_fixture_on_unconfigured_sacn_universe_never_gets_console_relay(self):
+    def test_fixtures_on_different_sacn_universes_both_get_console_relay(self):
         fixture_a = FixtureConfig(
             name="A", marker_id=1, output_universe=1, x=0.0, y=-8.0, z=5.0, dimmer=5,
             console_mode_channel=10, console_marker_channel=0,
@@ -531,7 +530,7 @@ class SACNInSingleUniverseLimitationTests(unittest.TestCase):
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.28", 56617
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "sacn"
-        settings.dmx_in.sacn.universe = 1  # only universe 1 is ever joined
+        settings.dmx_in.sacn.universe = 1  # only referenced directly for the master fader
         settings.dmx_out.active = "artnet"
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
 
@@ -539,7 +538,7 @@ class SACNInSingleUniverseLimitationTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleSACNSender()
         auto_frame = bytearray(512)
-        auto_frame[9] = 200   # auto, non-stale, would enable dimmer passthrough if received
+        auto_frame[9] = 200   # auto, non-stale, enables dimmer passthrough once received
         auto_frame[4] = 200   # console's own live dimmer value, relayed through when received
 
         runner = Runner()
@@ -549,8 +548,8 @@ class SACNInSingleUniverseLimitationTests(unittest.TestCase):
             def senders():
                 psn.send(1, 5.0, 0.0, 4.0)
                 psn.send(2, 5.0, 0.0, 4.0)
-                console.send(1, auto_frame)  # matches configured universe
-                console.send(2, auto_frame)  # a real console really would send this on universe 2
+                console.send(1, auto_frame)
+                console.send(2, auto_frame)  # a different universe than dmx_in.sacn.universe
 
             frame_a = frame_b = None
             deadline = time.monotonic() + 4.0
@@ -564,16 +563,16 @@ class SACNInSingleUniverseLimitationTests(unittest.TestCase):
                     frame_a = frame
                 elif universe == 2:
                     frame_b = frame
-                if frame_a is not None and frame_b is not None and frame_a[4] > 0:
+                if frame_a is not None and frame_b is not None and frame_a[4] > 0 and frame_b[4] > 0:
                     break
 
             self.assertIsNotNone(frame_a)
             self.assertIsNotNone(frame_b)
             self.assertGreater(frame_a[4], 0,
-                                "fixture on the configured sACN universe (1) should get its console dimmer relayed")
-            self.assertEqual(frame_b[4], 0,
-                              "fixture on a different sACN universe (2) never receives console data even though "
-                              "a real console packet was sent for it -- SACNInPlugin only joins dmx_in.sacn.universe")
+                                "fixture on the fader's configured sACN universe (1) should get its console dimmer relayed")
+            self.assertGreater(frame_b[4], 0,
+                                "fixture on a different sACN universe (2) should also get its console dimmer relayed -- "
+                                "SACNInPlugin must join a group per universe actually needed, not just dmx_in.sacn.universe")
         finally:
             runner.stop()
             sniffer.close()
