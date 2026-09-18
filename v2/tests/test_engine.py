@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -113,7 +114,7 @@ class RunCycleTests(unittest.TestCase):
         trackers.update(1, 5.0, 0.0, 5.0)
         bus = ExternalInputBus()
         state = CycleState()
-        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, False, 100.0, state)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, False, time.monotonic(), state)
         self.assertEqual(frames[0][4], 0, "unarmed must force dimmer to 0")
         self.assertGreater(frames[0][0], 0, "pan should still be computed and written even when unarmed")
 
@@ -123,7 +124,7 @@ class RunCycleTests(unittest.TestCase):
         trackers.xyz[1] = (5.0, 0.0, 5.0, 0.0)  # timestamp 0 => always stale
         bus = ExternalInputBus()
         state = CycleState()
-        _frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, 100.0, state)
+        _frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertTrue(statuses[0]["stale"])
         self.assertTrue(statuses[0]["blackout"])
 
@@ -140,7 +141,7 @@ class RunCycleTests(unittest.TestCase):
         console_frame[9] = 0    # mode channel < 128 => manual
         bus.update(0, console_frame)
         state = CycleState()
-        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, 100.0, state)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertEqual(statuses[0]["error"], "MANUAL (console)")
 
     def test_console_relay_manual_mode_with_shadow_patch_passes_dimmer_through(self):
@@ -159,7 +160,7 @@ class RunCycleTests(unittest.TestCase):
         shadow_frame[4] = 200  # console's own dimmer value on the shadow feed
         bus.update(2, shadow_frame)
         state = CycleState()
-        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, 100.0, state)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertEqual(statuses[0]["error"], "MANUAL (console)")
         self.assertEqual(frames[0][4], 200, "manual mode with a shadow patch must relay the console's dimmer byte")
 
@@ -175,7 +176,7 @@ class RunCycleTests(unittest.TestCase):
         console_frame[9] = 255  # mode channel >= 128 => auto
         bus.update(0, console_frame)
         state = CycleState()
-        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, 100.0, state)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertNotIn("error", statuses[0])
         self.assertGreater(frames[0][0], 0, "pan should be computed by FART in auto mode")
         self.assertGreater(frames[0][4], 0, "dimmer is always computed by FART in auto mode, armed and fader > 0")
@@ -193,7 +194,7 @@ class RunCycleTests(unittest.TestCase):
         shadow_frame[6] = 222  # iris
         bus.update(2, shadow_frame)
         state = CycleState()
-        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, 100.0, state)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertEqual(frames[0][5], 111, "zoom should pass through from the shadow feed with auto-beam-size off")
         self.assertEqual(frames[0][6], 222, "iris should pass through from the shadow feed with auto-beam-size off")
 
