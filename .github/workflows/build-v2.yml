@@ -1,13 +1,11 @@
-name: Build Windows and macOS
+name: Build v2 (Windows and macOS)
 
 on:
   push:
-    branches: [main]
-    # Scoped to v0/v1 tags only -- v2.* tags belong to build-v2.yml, which
-    # builds from the v2/ subdirectory. Both workflows would otherwise
-    # match a bare "v*" glob and race to create/attach to the same release.
-    tags: ["v0.*", "v1.*"]
+    branches: [v2/redesign]
+    tags: ["v2.*"]
   pull_request:
+    paths: ["v2/**"]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +14,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: v2
 
     steps:
       - name: Check out repository
@@ -26,6 +27,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: v2/requirements-dev.txt
 
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
@@ -33,24 +35,27 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Build FART.exe
+      - name: Build FART2.exe
         run: python -m PyInstaller --noconfirm --clean FART.spec
 
       - name: Package executable
         shell: pwsh
-        run: Compress-Archive -Path dist/FART.exe -DestinationPath FART-Windows-x64.zip -Force
+        run: Compress-Archive -Path dist/FART2.exe -DestinationPath FART2-Windows-x64.zip -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FART-Windows-x64
-          path: FART-Windows-x64.zip
+          name: FART2-Windows-x64
+          path: v2/FART2-Windows-x64.zip
           if-no-files-found: error
 
   build-macos:
     # macos-latest is an Apple Silicon (arm64) runner; this build is not
     # tested on Intel Macs and may need Rosetta there.
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: v2
 
     steps:
       - name: Check out repository
@@ -61,29 +66,32 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: v2/requirements-dev.txt
 
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
 
-      - name: Build FART.app
+      - name: Build FART2.app
         run: python -m PyInstaller --noconfirm --clean FART.spec
 
       - name: Package app bundle
-        run: ditto -c -k --keepParent dist/FART.app FART-macOS-arm64.zip
+        run: ditto -c -k --keepParent dist/FART2.app FART2-macOS-arm64.zip
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FART-macOS-arm64
-          path: FART-macOS-arm64.zip
+          name: FART2-macOS-arm64
+          path: v2/FART2-macOS-arm64.zip
           if-no-files-found: error
 
   release:
     needs: [build-windows, build-macos]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v2.')
     runs-on: ubuntu-latest
 
     steps:
@@ -95,14 +103,15 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create or update tagged release
+      - name: Create or update pre-release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            gh release create "${{ github.ref_name }}" --generate-notes --title "FART ${{ github.ref_name }}"
+            gh release create "${{ github.ref_name }}" --prerelease --generate-notes \
+              --title "FART ${{ github.ref_name }} (pre-release)"
           fi
           gh release upload "${{ github.ref_name }}" \
-            artifacts/FART-Windows-x64/FART-Windows-x64.zip \
-            artifacts/FART-macOS-arm64/FART-macOS-arm64.zip \
+            artifacts/FART2-Windows-x64/FART2-Windows-x64.zip \
+            artifacts/FART2-macOS-arm64/FART2-macOS-arm64.zip \
             --clobber
