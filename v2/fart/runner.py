@@ -81,7 +81,8 @@ class Runner:
                     self.armed, cycle_start, state,
                 )
                 self.output_plugin.send(frames)
-                self.live = {"fader": fader_value, "lights": statuses}
+                self.live = {"fader": fader_value, "lights": statuses,
+                             "out_frames": {u: bytes(f) for u, f in frames.items()}}
                 sleep_time = 1.0 / max(1, self.settings.refresh_hz) - (time.monotonic() - cycle_start)
                 time.sleep(max(0.0, sleep_time))
         except Exception as exc:

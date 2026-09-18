@@ -59,7 +59,9 @@ avoided by convention -- it's not a state the system can be in.
 - `fart/ui/` -- the PySide6 UI, replacing v1's Tkinter front end:
   - `main_window.py` -- `MainWindow`: owns `Settings`, the `Runner`, and a
     100ms timer draining a thread-safe log queue and refreshing live status.
-    Locks the setup tabs while running.
+    Setup tabs stay usable while running (no lockout) -- edits apply on the
+    next output cycle, though switching DMX in/out protocol still needs a
+    stop/start to actually reconnect the plugin sockets.
   - `operator_tab.py` -- Start/Stop, arm, manual fader, zoom/iris/focus beam
     sliders, live per-light overview table, log view.
   - `psn_in_tab.py`, `dmx_in_tab.py`, `dmx_out_tab.py`, `fixtures_tab.py`,
@@ -70,7 +72,12 @@ avoided by convention -- it's not a state the system can be in.
   - `dmx_in_tab.py` / `dmx_out_tab.py` show only the active protocol's
     settings (a `QStackedWidget` switched by radio buttons in a
     `QButtonGroup`) while still saving the inactive protocol's settings in
-    the background, so switching back doesn't lose anything.
+    the background, so switching back doesn't lose anything. Both also
+    have a live "Artnetominator-style" 512-channel status grid for a
+    chosen universe -- DMX In reads straight off the shared
+    `ExternalInputBus` (whatever the active control-input plugin actually
+    received), DMX Out reads the literal last frame the Runner sent
+    (`dmx_channel_grid.py` is the shared grid widget).
 - `fart/__main__.py` -- entry point (`python3 -m fart`).
 
 OSC support is dropped entirely (was only ever an intensity-fader input

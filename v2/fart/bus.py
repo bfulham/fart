@@ -92,6 +92,13 @@ class ExternalInputBus:
         with self.lock:
             return self.frames.get(int(universe), (None, 0.0))
 
+    def snapshot(self):
+        """Every universe currently held, for live-monitor UI display (e.g.
+        the DMX In tab's channel grid) -- a plain copy, safe to read
+        without the lock afterwards."""
+        with self.lock:
+            return dict(self.frames)
+
     def get_channel(self, universe, channel):
         """Returns (value 0-255 or None, age_in_seconds or None)."""
         frame, ts = self.get(universe)

@@ -177,7 +177,10 @@ class OperatorTabStartStopTests(WindowTestCase):
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
         self.assertTrue(self.window.runner.running)
-        self.assertFalse(self.window.tabs.isTabEnabled(1), "setup tabs should lock while running")
+        # Setup tabs stay usable while running (no lockout) -- users found
+        # the previous lock annoying, e.g. wanting to check fixture
+        # settings without stopping output first.
+        self.assertTrue(self.window.tabs.isTabEnabled(1))
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
         self.assertFalse(self.window.runner.running)
@@ -222,6 +225,85 @@ class LiveEndToEndUITests(WindowTestCase):
         sock.close()
 
         self.assertTrue(seen_live_row, "overview table never showed a LIVE row for the tracked fixture")
+
+
+class DMXMonitorTests(WindowTestCase):
+    """Real-socket proof for the "like Artnetominator" live channel grids
+    added to the DMX In and DMX Out tabs: they must show actual bytes that
+    were actually received/sent, not just repaint on a timer."""
+
+    def test_dmx_in_tab_channel_grid_shows_real_received_data(self):
+        settings = self.window.settings
+        # Forces the control-input plugin to actually start -- otherwise
+        # nothing is listening and the grid would stay all-zero regardless
+        # of whether the widget itself works.
+        settings.fader.source = "dmx_in"
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+
+        QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
+        self.assertTrue(self.window.runner.running)
+
+        from fart.plugins._artnet import ARTNET_PORT, build_artnet_dmx
+
+        # ArtNetInPlugin binds all interfaces, not just loopback (correct
+        # for real use -- it needs to receive from the LAN). On a network
+        # with real Art-Net gear, universe 0 can carry genuine unrelated
+        # traffic; a distinctive high universe number avoids that, and
+        # matching both bytes exactly (not just "any nonzero") confirms
+        # this is actually our own test packet.
+        monitor_universe = 500
+        self.window.dmx_in_tab.monitor_universe.setValue(monitor_universe)
+        console_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        frame = bytearray(512)
+        frame[0] = 111
+        frame[1] = 222
+        packet = build_artnet_dmx(monitor_universe, frame)
+
+        seen = False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            console_sock.sendto(packet, ("127.0.0.1", ARTNET_PORT))
+            self.window.dmx_in_tab.refresh()
+            values = self.window.dmx_in_tab.channel_grid._last_values
+            if values[0] == 111 and values[1] == 222:
+                seen = True
+                break
+            time.sleep(0.05)
+        console_sock.close()
+
+        self.assertTrue(seen, "DMX In tab's channel grid never showed real received Art-Net data")
+        self.assertEqual(self.window.dmx_in_tab.channel_grid._last_values[1], 222)
+
+    def test_dmx_out_tab_channel_grid_shows_real_sent_data(self):
+        settings = self.window.settings
+        settings.psn_in.multicast, settings.psn_in.port = "236.10.10.30", 56650
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        settings.fixtures[0].marker_id = 1
+        settings.fixtures[0].output_universe = 0
+
+        QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
+        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+
+        psn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        psn_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        packet = build_psn_packet(1, 5.0, 0.0, 4.0)
+
+        seen = False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            multicast_sendto(psn_sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
+            self.window.dmx_out_tab.refresh()
+            # Pan/tilt (channels 1-4) should become nonzero once the runner
+            # actually aims this fixture at the tracked marker.
+            if any(self.window.dmx_out_tab.channel_grid._last_values[:4]):
+                seen = True
+                break
+            time.sleep(0.05)
+        psn_sock.close()
+
+        self.assertTrue(seen, "DMX Out tab's channel grid never showed real sent data")
 
 
 if __name__ == "__main__":

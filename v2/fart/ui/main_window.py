@@ -62,6 +62,8 @@ class MainWindow(QMainWindow):
             self.operator_tab.append_log(message)
             drained = True
         self.operator_tab.refresh_status(self.runner.live)
+        self.dmx_in_tab.refresh()
+        self.dmx_out_tab.refresh()
         if drained and not self.runner.running and self._pending_crash():
             self._on_worker_crashed()
 
@@ -72,13 +74,8 @@ class MainWindow(QMainWindow):
 
     def _on_worker_crashed(self):
         self._was_running = False
-        self.set_setup_tabs_enabled(True)
         self.operator_tab.set_running(False)
         QMessageBox.critical(self, APP_NAME, "The output loop stopped unexpectedly. Check the log.")
-
-    def set_setup_tabs_enabled(self, enabled: bool):
-        for i in range(1, self.tabs.count()):
-            self.tabs.setTabEnabled(i, enabled)
 
     def start(self):
         try:
@@ -87,13 +84,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, str(exc))
             return
         self._was_running = True
-        self.set_setup_tabs_enabled(False)
         self.operator_tab.set_running(True)
 
     def stop(self):
         self._was_running = False
         self.runner.stop()
-        self.set_setup_tabs_enabled(True)
         self.operator_tab.set_running(False)
 
     def do_save_settings(self):

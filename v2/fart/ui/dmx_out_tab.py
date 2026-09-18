@@ -3,11 +3,12 @@ same persist-everything pattern as DMX In."""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QButtonGroup, QFormLayout, QGroupBox, QLineEdit, QRadioButton,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QButtonGroup, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QRadioButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .binding import bind_int, bind_text
+from .dmx_channel_grid import DmxChannelGrid
 
 
 class DMXOutTab(QWidget):
@@ -50,7 +51,22 @@ class DMXOutTab(QWidget):
         open_dmx_form.addRow("Fallback port", bind_text(QLineEdit(), dmx_out.open_dmx, "fallback_port"))
         self.stack.addWidget(open_dmx_panel)
 
-        layout.addStretch(1)
+        status_box = QGroupBox("Live output status")
+        status_layout = QVBoxLayout(status_box)
+        universe_row = QHBoxLayout()
+        universe_row.addWidget(QLabel("Universe to monitor"))
+        self.monitor_universe = QSpinBox()
+        self.monitor_universe.setRange(0, 63999)
+        default_universes = sorted({int(f.output_universe) for f in main_window.settings.fixtures if f.enabled})
+        self.monitor_universe.setValue(default_universes[0] if default_universes else 0)
+        universe_row.addWidget(self.monitor_universe)
+        universe_row.addStretch(1)
+        status_layout.addLayout(universe_row)
+        self.status_label = QLabel("Not running")
+        status_layout.addWidget(self.status_label)
+        self.channel_grid = DmxChannelGrid()
+        status_layout.addWidget(self.channel_grid)
+        layout.addWidget(status_box, 1)
 
         index_for_active = {"artnet": 0, "sacn": 1, "open_dmx": 2}
         index = index_for_active.get(dmx_out.active, 0)
@@ -75,3 +91,21 @@ class DMXOutTab(QWidget):
             universes = self.main_window.settings.dmx_out.sacn.universes
         self.main_window.settings.dmx_out.sacn.universes = universes
         self.sacn_universes_edit.setText(", ".join(str(u) for u in universes))
+
+    def refresh(self):
+        """Called from MainWindow's UI timer: shows the actual last frame
+        the Runner sent for the monitored universe (the "and for out the
+        same sort of thing" ask) -- not a recomputation, the literal bytes
+        that went out the output plugin this cycle."""
+        live = self.main_window.runner.live
+        if not live or not self.main_window.runner.running:
+            self.status_label.setText("Not running")
+            self.channel_grid.set_frame(None)
+            return
+        universe = self.monitor_universe.value()
+        frame = live.get("out_frames", {}).get(universe)
+        if frame is None:
+            self.status_label.setText(f"Universe {universe} is not currently being sent")
+        else:
+            self.status_label.setText(f"Universe {universe}: live")
+        self.channel_grid.set_frame(frame)
