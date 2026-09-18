@@ -4,6 +4,11 @@ A ground-up redesign, developed here alongside the shipped v1 (`fart.py` at
 the repo root, untouched) until it's ready to replace it. Nothing here is
 wired into the v1 app, its tests, or its CI.
 
+The engine, plugins, and PySide6 UI are all in place and runnable
+(`python3 -m fart` from this directory). What's left before this can
+replace v1 is packaging and real-hardware verification -- see "What's *not*
+here yet" below.
+
 ## Why
 
 v1 grew into one 3400-line file mixing UI, protocol I/O, and tracking logic
@@ -51,17 +56,32 @@ avoided by convention -- it's not a state the system can be in.
   dialog (`select_gdtf_mode` in v1) -- picking a mode when a GDTF has more
   than one is a UI concern for whatever calls this, not part of the import
   logic itself.
+- `fart/ui/` -- the PySide6 UI, replacing v1's Tkinter front end:
+  - `main_window.py` -- `MainWindow`: owns `Settings`, the `Runner`, and a
+    100ms timer draining a thread-safe log queue and refreshing live status.
+    Locks the setup tabs while running.
+  - `operator_tab.py` -- Start/Stop, arm, manual fader, zoom/iris/focus beam
+    sliders, live per-light overview table, log view.
+  - `psn_in_tab.py`, `dmx_in_tab.py`, `dmx_out_tab.py`, `fixtures_tab.py`,
+    `calibration_tab.py` + `calibration_wizard.py` -- one tab per concern,
+    matching the layout described in "Why" below.
+  - `binding.py` -- small two-way widget <-> `Settings` field helpers shared
+    by every tab.
+  - `dmx_in_tab.py` / `dmx_out_tab.py` show only the active protocol's
+    settings (a `QStackedWidget` switched by radio buttons in a
+    `QButtonGroup`) while still saving the inactive protocol's settings in
+    the background, so switching back doesn't lose anything.
+- `fart/__main__.py` -- entry point (`python3 -m fart`).
 
 OSC support is dropped entirely (was only ever an intensity-fader input
 option in v1; not needed going forward).
 
 ## What's *not* here yet
 
-- Any UI at all (planned: PySide6, replacing v1's Tkinter). This branch is
-  engine/plugins first, verified working headlessly, before UI is built on
-  top of it.
 - Real hardware testing for `open_dmx_out.py` (no Open DMX USB adapter
   available to test against here).
+- Packaging (PyInstaller spec, CI build workflow) -- v1's exists at the repo
+  root; v2 needs its own once the app is otherwise feature-complete.
 
 ## How this has been verified
 
@@ -85,11 +105,22 @@ directly from v1's test suite (same fixture geometry, same synthetic GDTF
 file), confirming the ported solver and importer still produce the same
 results.
 
+`tests/test_ui.py` drives the real PySide6 widgets with `QTest` (real
+synthesized clicks and key events against a real, shown `MainWindow`, run
+offscreen via `QT_QPA_PLATFORM=offscreen`) -- not just calling handler
+methods directly. It covers adding/editing/removing fixtures, switching the
+DMX In protocol radio buttons and confirming both protocols' settings
+survive the switch, starting/stopping the runner and confirming setup tabs
+lock, and one full live end-to-end pass: real PSN packets sent over
+loopback while the window is running, polling the operator tab's overview
+table until it shows the tracked fixture as "LIVE".
+
 Run the tests:
 
 ```bash
 cd v2
-python3 -m unittest discover -s tests -v
+pip install -r requirements.txt
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
 
-44/44 passing as of this writing.
+52/52 passing as of this writing.
