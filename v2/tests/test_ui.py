@@ -22,7 +22,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from fart.ui.calibration_wizard import CalibrationWizard
+from fart.ui.calibration_wizard import DEFAULT_TARGETS, CalibrationWizard
 from fart.ui.main_window import MainWindow
 
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -443,34 +443,149 @@ class CalibrationTabTests(WindowTestCase):
 
 
 class CalibrationWizardTests(WindowTestCase):
-    def test_add_custom_point_appears_in_target_list_and_is_usable(self):
-        """v1 had an "Add custom point" X/Y/Z entry that got left out of
-        the initial v2 port -- restored here."""
-        wizard = CalibrationWizard(self.window, [0])
-        try:
-            before = wizard.target_list.count()
-            wizard.custom_x_edit.setText("1.5")
-            wizard.custom_y_edit.setText("-2.5")
-            wizard.custom_z_edit.setText("3.0")
-            wizard._on_add_custom_point()
+    """The guided flow: setup (default/custom points) -> step through every
+    (point, fixture) pair, lighting only the current fixture -> done page.
+    Verified with a real Art-Net output socket, not just internal state,
+    since the whole point of the guided flow is that only one fixture is
+    actually lit on the wire at any given moment.
+    """
 
-            self.assertEqual(wizard.target_list.count(), before + 1)
-            self.assertEqual(wizard.targets[-1], ("Custom", 1.5, -2.5, 3.0))
-            self.assertEqual(wizard.target_list.currentRow(), before,
-                              "adding a custom point should select it, ready to capture against")
+    def _two_fixture_settings(self):
+        settings = self.window.settings
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        while len(settings.fixtures) < 2:
+            self.window.fixtures_tab._on_add()
+        settings.fixtures[0].output_universe = 0
+        settings.fixtures[0].output_start_address = 1
+        settings.fixtures[1].output_universe = 0
+        settings.fixtures[1].output_start_address = 11  # no channel overlap with fixture 0
+        return settings
+
+    def test_guided_flow_lights_only_the_current_fixture_and_captures_all_pairs(self):
+        from fart.plugins._artnet import ARTNET_PORT, parse_artnet_dmx
+
+        settings = self._two_fixture_settings()
+        wizard = CalibrationWizard(self.window, [0, 1])
+        sniffer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sniffer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sniffer.bind(("", ARTNET_PORT))
+        sniffer.settimeout(0.1)
+
+        def latest_frame_for_universe(universe, timeout=3.0):
+            # recvfrom() blocks the whole thread, so the wizard's own
+            # output QTimer (which is what actually sends anything) never
+            # gets a chance to fire unless the Qt event loop runs in
+            # between attempts -- qWait() pumps it.
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                QTest.qWait(15)
+                try:
+                    data, _addr = sniffer.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                parsed = parse_artnet_dmx(data)
+                if parsed and parsed[0] == universe:
+                    return parsed[1]
+            return None
+
+        try:
+            self.assertTrue(wizard.default_radio.isChecked())
+            wizard._on_start_guided()
+            self.assertIs(wizard.stack.currentWidget(), wizard.guided_page)
+            self.assertTrue(wizard.output_running)
+            self.assertEqual(wizard.fixture_pos, 0)
+            self.assertEqual(wizard.point_index, 0)
+
+            frame = latest_frame_for_universe(0)
+            self.assertIsNotNone(frame, "never received a decoded Art-Net frame for universe 0")
+            self.assertGreater(frame[4], 0, "fixture 0 (the active one) should be lit")
+            self.assertEqual(frame[14], 0, "fixture 1 (not yet its turn) must stay blacked out")
+
+            wizard._on_guided_next()
+            self.assertEqual(wizard.fixture_pos, 1)
+            self.assertEqual(len(wizard.samples[0]), 1)
+
+            frame = latest_frame_for_universe(0)
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame[4], 0, "fixture 0 must black out once it's no longer the active fixture")
+            self.assertGreater(frame[14], 0, "fixture 1 should now be the lit one")
+
+            # Undo that step and confirm it doesn't leave a duplicate sample.
+            wizard._on_guided_back()
+            self.assertEqual(wizard.fixture_pos, 0)
+            self.assertEqual(len(wizard.samples[0]), 0, "going back must undo the capture for that step")
+
+            # Walk through every remaining (point, fixture) pair.
+            total_steps = len(DEFAULT_TARGETS) * 2
+            for _ in range(total_steps):
+                wizard._on_guided_next()
+
+            self.assertIs(wizard.stack.currentWidget(), wizard.done_page)
+            self.assertFalse(wizard.output_running, "output should stop once every pair is captured")
+            self.assertEqual(len(wizard.samples[0]), len(DEFAULT_TARGETS))
+            self.assertEqual(len(wizard.samples[1]), len(DEFAULT_TARGETS))
+        finally:
+            sniffer.close()
+            wizard._stop_output_internal()
+            wizard.output_timer.stop()
+            wizard.deleteLater()
+            QTest.qWait(20)
+
+    def test_custom_points_are_used_instead_of_defaults(self):
+        wizard = CalibrationWizard(self.window, [0])
+        # Needs real geometry for QTest.mouseClick's hit-testing to land at
+        # all -- without show(), a freshly constructed dialog's widgets can
+        # have degenerate 0x0 rects.
+        wizard.show()
+        QTest.qWait(50)
+        try:
+            # A QRadioButton's real clickable hit-region is only its
+            # natural content size (indicator + label), even when a layout
+            # stretches its allocated rect wider -- clicking the default
+            # centre lands in dead space and silently misses.
+            QTest.mouseClick(wizard.custom_radio, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+            self.assertTrue(wizard.custom_points_box.isEnabled())
+
+            wizard.setup_x_edit.setText("1.5")
+            wizard.setup_y_edit.setText("-2.5")
+            wizard.setup_z_edit.setText("3.0")
+            wizard._on_add_setup_point()
+            self.assertEqual(wizard.custom_point_list.count(), 1)
+            self.assertEqual(wizard._custom_points, [("Point 1", 1.5, -2.5, 3.0)])
 
             # A bad entry must not silently add a broken point. Patched
             # since QMessageBox.critical() is a real modal call that would
             # otherwise block this test forever waiting for a click nothing
             # in a headless test can provide.
             with unittest.mock.patch("fart.ui.calibration_wizard.QMessageBox.critical") as mock_critical:
-                wizard.custom_x_edit.setText("not a number")
-                wizard._on_add_custom_point()
+                wizard.setup_x_edit.setText("not a number")
+                wizard._on_add_setup_point()
             mock_critical.assert_called_once()
-            self.assertEqual(wizard.target_list.count(), before + 1,
-                              "a non-numeric custom point must be rejected, not appended")
+            self.assertEqual(wizard.custom_point_list.count(), 1)
+
+            self.window.settings.dmx_out.active = "artnet"
+            self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+            wizard._on_start_guided()
+            self.assertEqual(wizard.points, [("Point 1", 1.5, -2.5, 3.0)])
         finally:
-            wizard._on_stop_output()
+            wizard._stop_output_internal()
+            wizard.output_timer.stop()
+            wizard.deleteLater()
+            QTest.qWait(20)
+
+    def test_cancel_returns_to_setup_and_stops_output(self):
+        self.window.settings.dmx_out.active = "artnet"
+        self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        wizard = CalibrationWizard(self.window, [0])
+        try:
+            wizard._on_start_guided()
+            self.assertTrue(wizard.output_running)
+            wizard._on_cancel_guided()
+            self.assertIs(wizard.stack.currentWidget(), wizard.setup_page)
+            self.assertFalse(wizard.output_running)
+        finally:
+            wizard._stop_output_internal()
             wizard.output_timer.stop()
             wizard.deleteLater()
             QTest.qWait(20)
