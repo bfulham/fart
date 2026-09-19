@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from ..config import ON_CONSOLE_LOSS_OPTIONS, ON_TRACKING_LOSS_OPTIONS, FixtureConfig, FixtureType
 from ..gdtf import import_gdtf_channel_mapping, list_gdtf_modes
 from .binding import bind_checkbox, bind_combo, bind_float, bind_int, bind_text
+from .gdtf_share_dialog import GDTFShareBrowseDialog
 
 
 class FixturesTab(QWidget):
@@ -299,7 +300,10 @@ class FixturesTab(QWidget):
         form.addRow("Intensity scale", bind_float(QLineEdit(), fixture_type, "intensity_scale", lo=0))
         gdtf_button = QPushButton("Import from GDTF…")
         gdtf_button.clicked.connect(lambda: self._on_import_gdtf(fixture_type))
+        gdtf_share_button = QPushButton("Browse GDTF Share…")
+        gdtf_share_button.clicked.connect(lambda: self._on_browse_gdtf_share(fixture_type))
         form.addRow(gdtf_button)
+        form.addRow(gdtf_share_button)
         self.editor_layout.addWidget(identity)
 
         limits = QGroupBox("Physical angle range")
@@ -369,3 +373,17 @@ class FixturesTab(QWidget):
                                                    f"Check these against the fixture manual.\n\n{found}")
         except Exception as exc:
             QMessageBox.critical(self, "FART", str(exc))
+
+    def _on_browse_gdtf_share(self, fixture_type):
+        dialog = GDTFShareBrowseDialog(self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        for field, value in dialog.result_mapping.items():
+            if hasattr(fixture_type, field):
+                setattr(fixture_type, field, value)
+        self._load_type(self.selected_type_index)
+        found = ", ".join(f"{k}={v}" for k, v in dialog.result_mapping.items())
+        QMessageBox.information(
+            self, "FART",
+            f"Imported {dialog.result_label} from GDTF Share (mode: {dialog.result_mode_name}).\n\n"
+            f"Check these against the fixture manual.\n\n{found}")

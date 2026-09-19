@@ -148,6 +148,37 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(tab.editor_mode, "fixture",
                           "clicking the only (already-current) fixture must still switch the editor back")
 
+    def test_browse_gdtf_share_applies_returned_mapping_to_the_selected_type(self):
+        # The real GDTFShareBrowseDialog talks to the network and the OS
+        # keychain -- stand in for it here so this test (like every other
+        # UI test) never does either.
+        tab = self.window.fixtures_tab
+        tab._on_add_type()
+        fixture_type = self.window.settings.fixture_types[tab.selected_type_index]
+
+        class _Code:
+            Accepted = 1
+
+        class FakeDialog:
+            DialogCode = _Code
+            result_mapping = {"dimmer": 3, "pan_coarse": 1, "footprint": 16}
+            result_mode_name = "Standard 16ch"
+            result_label = "Robe MegaPointe"
+
+            def __init__(self, parent=None):
+                pass
+
+            def exec(self):
+                return 1
+
+        with unittest.mock.patch("fart.ui.fixtures_tab.GDTFShareBrowseDialog", FakeDialog), \
+             unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.information"):
+            tab._on_browse_gdtf_share(fixture_type)
+
+        self.assertEqual(fixture_type.dimmer, 3)
+        self.assertEqual(fixture_type.pan_coarse, 1)
+        self.assertEqual(fixture_type.footprint, 16)
+
 
 class DMXInTabTests(WindowTestCase):
     def test_switching_protocol_preserves_both_universes(self):
