@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -21,6 +22,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from fart.ui.calibration_wizard import CalibrationWizard
 from fart.ui.main_window import MainWindow
 
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -413,6 +415,65 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         sock.close()
 
         self.assertTrue(seen, "overview table should show '—' for DMX In Mode/Marker when no console relay is configured")
+
+
+class CalibrationTabTests(WindowTestCase):
+    def test_refresh_list_preserves_multi_selection(self):
+        """Real user report: selecting multiple fixtures and opening the
+        calibration wizard only showed one. _on_open_wizard() calls
+        _refresh_list() right before reading the selection (to pick up any
+        fixtures added/renamed elsewhere), and _refresh_list() used to
+        unconditionally reset the selection to row 0 -- collapsing any
+        multi-fixture selection every single time the wizard was opened."""
+        tab = self.window.calibration_tab
+        while len(self.window.settings.fixtures) < 3:
+            self.window.fixtures_tab._on_add()
+        tab._refresh_list()
+        self.assertEqual(tab.list_widget.count(), 3)
+
+        tab.list_widget.item(0).setSelected(True)
+        tab.list_widget.item(2).setSelected(True)
+        self.assertEqual({i.row() for i in tab.list_widget.selectedIndexes()}, {0, 2})
+
+        # This is exactly what _on_open_wizard does before reading the
+        # selection.
+        tab._refresh_list()
+        self.assertEqual({i.row() for i in tab.list_widget.selectedIndexes()}, {0, 2},
+                          "refreshing the list must not collapse a multi-fixture selection")
+
+
+class CalibrationWizardTests(WindowTestCase):
+    def test_add_custom_point_appears_in_target_list_and_is_usable(self):
+        """v1 had an "Add custom point" X/Y/Z entry that got left out of
+        the initial v2 port -- restored here."""
+        wizard = CalibrationWizard(self.window, [0])
+        try:
+            before = wizard.target_list.count()
+            wizard.custom_x_edit.setText("1.5")
+            wizard.custom_y_edit.setText("-2.5")
+            wizard.custom_z_edit.setText("3.0")
+            wizard._on_add_custom_point()
+
+            self.assertEqual(wizard.target_list.count(), before + 1)
+            self.assertEqual(wizard.targets[-1], ("Custom", 1.5, -2.5, 3.0))
+            self.assertEqual(wizard.target_list.currentRow(), before,
+                              "adding a custom point should select it, ready to capture against")
+
+            # A bad entry must not silently add a broken point. Patched
+            # since QMessageBox.critical() is a real modal call that would
+            # otherwise block this test forever waiting for a click nothing
+            # in a headless test can provide.
+            with unittest.mock.patch("fart.ui.calibration_wizard.QMessageBox.critical") as mock_critical:
+                wizard.custom_x_edit.setText("not a number")
+                wizard._on_add_custom_point()
+            mock_critical.assert_called_once()
+            self.assertEqual(wizard.target_list.count(), before + 1,
+                              "a non-numeric custom point must be rejected, not appended")
+        finally:
+            wizard._on_stop_output()
+            wizard.output_timer.stop()
+            wizard.deleteLater()
+            QTest.qWait(20)
 
 
 if __name__ == "__main__":

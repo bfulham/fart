@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QMessageBox, QPushButton,
-    QSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMessageBox, QPushButton, QSlider, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..calibration import solve_fixture_calibration
@@ -102,6 +102,19 @@ class CalibrationWizard(QDialog):
         self.target_list.setCurrentRow(0)
         left.addWidget(self.target_list)
 
+        custom_box = QGroupBox("Add custom point")
+        custom_form = QFormLayout(custom_box)
+        self.custom_x_edit = QLineEdit("0")
+        self.custom_y_edit = QLineEdit("0")
+        self.custom_z_edit = QLineEdit("0")
+        custom_form.addRow("X", self.custom_x_edit)
+        custom_form.addRow("Y", self.custom_y_edit)
+        custom_form.addRow("Z", self.custom_z_edit)
+        add_point_button = QPushButton("Add point")
+        add_point_button.clicked.connect(self._on_add_custom_point)
+        custom_form.addRow(add_point_button)
+        left.addWidget(custom_box)
+
         right = QVBoxLayout()
         body.addLayout(right, stretch=1)
         self.rows = {}
@@ -174,6 +187,18 @@ class CalibrationWizard(QDialog):
             except Exception as exc:
                 self.status_label.setText("Output error: " + str(exc))
                 self.output_running = False
+
+    def _on_add_custom_point(self):
+        try:
+            x = float(self.custom_x_edit.text())
+            y = float(self.custom_y_edit.text())
+            z = float(self.custom_z_edit.text())
+        except ValueError as exc:
+            QMessageBox.critical(self, "FART", f"X/Y/Z must be numbers: {exc}")
+            return
+        self.targets.append(("Custom", x, y, z))
+        self.target_list.addItem(f"Custom: X {x:g}, Y {y:g}, Z {z:g}")
+        self.target_list.setCurrentRow(self.target_list.count() - 1)
 
     def _on_capture(self):
         row_idx = self.target_list.currentRow()

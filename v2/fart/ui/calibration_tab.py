@@ -30,10 +30,24 @@ class CalibrationTab(QWidget):
         layout.addStretch(1)
 
     def _refresh_list(self):
+        # Preserve the current multi-selection by name across a refresh --
+        # this is called right before opening the wizard (to pick up any
+        # fixtures added/renamed elsewhere) as well as at startup, and
+        # unconditionally resetting to row 0 here was silently collapsing
+        # a multi-fixture selection down to just one fixture every time the
+        # wizard was opened.
+        previously_selected = {item.text() for item in self.list_widget.selectedItems()}
         self.list_widget.clear()
         for fixture in self.main_window.settings.fixtures:
             self.list_widget.addItem(fixture.name)
-        if self.main_window.settings.fixtures:
+        if not self.main_window.settings.fixtures:
+            return
+        restored = False
+        for row in range(self.list_widget.count()):
+            if self.list_widget.item(row).text() in previously_selected:
+                self.list_widget.item(row).setSelected(True)
+                restored = True
+        if not restored:
             self.list_widget.setCurrentRow(0)
 
     def _on_open_wizard(self):
