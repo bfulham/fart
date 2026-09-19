@@ -591,5 +591,55 @@ class CalibrationWizardTests(WindowTestCase):
             QTest.qWait(20)
 
 
+class PanTiltDialTests(WindowTestCase):
+    """The "Aim (dial)" tab added to each fixture row: drag the needle
+    directly instead of reading a linear slider. The old sliders stay the
+    source of truth pan()/tilt() read from, with the dial just another
+    control kept in sync in both directions."""
+
+    def test_dial_and_slider_stay_in_sync_both_directions(self):
+        wizard = CalibrationWizard(self.window, [0])
+        wizard.show()
+        QTest.qWait(50)
+        try:
+            row = wizard.rows[0]
+            cx, cy, r = row.pan_dial._geometry()
+            # A real press-drag-release from straight up (0) to house
+            # right (90), simulating an actual mouse drag on the needle --
+            # not just calling setValue() directly.
+            QTest.mousePress(row.pan_dial, Qt.MouseButton.LeftButton, pos=QPoint(int(cx), int(cy - r)))
+            QTest.mouseMove(row.pan_dial, pos=QPoint(int(cx + r), int(cy)))
+            QTest.mouseRelease(row.pan_dial, Qt.MouseButton.LeftButton, pos=QPoint(int(cx + r), int(cy)))
+            self.assertAlmostEqual(row.pan_dial.value(), 90.0, delta=1.0)
+            self.assertAlmostEqual(row.pan_slider.value() / 100.0, row.pan_dial.value(), delta=0.1,
+                                    msg="dragging the dial must update the paired slider")
+
+            # And the reverse direction: moving the old slider updates the
+            # dial too, so whichever tab you look at is always current.
+            row.pan_slider.setValue(-9000)
+            self.assertAlmostEqual(row.pan_dial.value(), -90.0, delta=0.1,
+                                    msg="moving the slider must update the dial")
+        finally:
+            wizard._stop_output_internal()
+            wizard.output_timer.stop()
+            wizard.deleteLater()
+            QTest.qWait(20)
+
+    def test_tilt_arc_range_matches_this_fixtures_own_tilt_range(self):
+        fixture_type = self.window.settings.fixture_types[0]
+        fixture_type.tilt_min = -45.0
+        fixture_type.tilt_max = 100.0
+        wizard = CalibrationWizard(self.window, [0])
+        try:
+            row = wizard.rows[0]
+            self.assertEqual((row.tilt_dial.lo, row.tilt_dial.hi), (-45.0, 100.0),
+                              "the tilt dial must reflect this fixture's real tilt range, not a generic default")
+        finally:
+            wizard._stop_output_internal()
+            wizard.output_timer.stop()
+            wizard.deleteLater()
+            QTest.qWait(20)
+
+
 if __name__ == "__main__":
     unittest.main()

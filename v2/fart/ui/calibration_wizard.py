@@ -14,12 +14,13 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QMessageBox, QPushButton, QRadioButton, QSlider,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..calibration import solve_fixture_calibration
 from ..engine import blank_frames_for_settings, fixture_type_for, resolve_fixture, write_fixture_to_frame
 from ..plugins import OUTPUT_PLUGINS
+from .pan_tilt_dial import PanDial, TiltArc
 
 DEFAULT_TARGETS = [
     ("Centre floor", 0.0, 0.0, 0.0),
@@ -36,9 +37,9 @@ class _FixtureRow(QWidget):
         super().__init__()
         self.fixture = fixture
         self.fixture_type = fixture_type
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(fixture.name))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(QLabel(fixture.name))
 
         pan_min, pan_max = fixture_type.pan_min, fixture_type.pan_max
         tilt_min, tilt_max = fixture_type.tilt_min, fixture_type.tilt_max
@@ -47,10 +48,48 @@ class _FixtureRow(QWidget):
         self.level_slider = self._slider(0, 100, 100)
         self.zoom_slider = self._slider(0, 100, 50)
         self.iris_slider = self._slider(0, 100, 100)
+
+        tabs = QTabWidget()
+        outer.addWidget(tabs)
+
+        sliders_page = QWidget()
+        sliders_layout = QHBoxLayout(sliders_page)
         for label, slider in (("Pan", self.pan_slider), ("Tilt", self.tilt_slider),
                                ("Dimmer", self.level_slider), ("Zoom", self.zoom_slider), ("Iris", self.iris_slider)):
-            layout.addWidget(QLabel(label))
-            layout.addWidget(slider)
+            sliders_layout.addWidget(QLabel(label))
+            sliders_layout.addWidget(slider)
+        tabs.addTab(sliders_page, "Sliders")
+
+        dial_page = QWidget()
+        dial_layout = QHBoxLayout(dial_page)
+        pan_col = QVBoxLayout()
+        pan_col.addWidget(QLabel("Top-down (pan)"))
+        self.pan_dial = PanDial(-180.0, 180.0)
+        pan_col.addWidget(self.pan_dial)
+        dial_layout.addLayout(pan_col)
+        tilt_col = QVBoxLayout()
+        tilt_col.addWidget(QLabel("Side view (tilt)"))
+        # The tilt arc's range always matches this specific fixture's own
+        # tilt_min/tilt_max, not a generic -90..90 -- real fixtures vary
+        # widely, and dragging past what the fixture can physically do
+        # would be misleading.
+        self.tilt_dial = TiltArc(tilt_min, tilt_max)
+        tilt_col.addWidget(self.tilt_dial)
+        dial_layout.addLayout(tilt_col)
+        tabs.addTab(dial_page, "Aim (dial)")
+
+        # Sliders stay the source of truth pan()/tilt() read from; the
+        # dials are just another control bound to the same values, kept in
+        # sync in both directions regardless of which tab is showing.
+        # setValue(..., _emit=False) on the receiving end stops these from
+        # ping-ponging back and forth.
+        self.pan_dial.setValue(self.pan_slider.value() / 100.0, _emit=False)
+        self.pan_dial.valueChanged.connect(lambda v: self.pan_slider.setValue(int(round(v * 100))))
+        self.pan_slider.valueChanged.connect(lambda v: self.pan_dial.setValue(v / 100.0, _emit=False))
+
+        self.tilt_dial.setValue(self.tilt_slider.value() / 100.0, _emit=False)
+        self.tilt_dial.valueChanged.connect(lambda v: self.tilt_slider.setValue(int(round(v * 100))))
+        self.tilt_slider.valueChanged.connect(lambda v: self.tilt_dial.setValue(v / 100.0, _emit=False))
 
     def _slider(self, lo, hi, initial):
         slider = QSlider(Qt.Orientation.Horizontal)
