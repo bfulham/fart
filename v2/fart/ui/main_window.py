@@ -17,7 +17,12 @@ from .fixtures_tab import FixturesTab
 from .operator_tab import OperatorTab
 from .psn_in_tab import PSNInTab
 
-DEFAULT_CONFIG_FILE = Path.home() / "FART2.json"
+DEFAULT_CONFIG_FILE = Path.home() / "FART2.fart"
+# Pre-.fart installs have their settings here instead -- loaded once on a
+# fresh DEFAULT_CONFIG_FILE, then always saved back out as the new format
+# (self.config_path is set to DEFAULT_CONFIG_FILE either way, never this
+# path), leaving the old file untouched as a backup of the old format.
+LEGACY_CONFIG_FILE = Path.home() / "FART2.json"
 
 
 class MainWindow(QMainWindow):
@@ -27,7 +32,10 @@ class MainWindow(QMainWindow):
         self.resize(1280, 840)
 
         self.config_path = config_path or DEFAULT_CONFIG_FILE
-        self.settings = load_settings(self.config_path)
+        if config_path is None and not DEFAULT_CONFIG_FILE.exists() and LEGACY_CONFIG_FILE.exists():
+            self.settings = load_settings(LEGACY_CONFIG_FILE)
+        else:
+            self.settings = load_settings(self.config_path)
         self._log_queue: queue.Queue = queue.Queue()
         self.runner = Runner(log=self._log_queue.put)
 

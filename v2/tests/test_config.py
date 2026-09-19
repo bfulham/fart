@@ -2,13 +2,15 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fart.config import (
-    CONFIG_VERSION, FixtureConfig, Settings, load_settings, migrate_v1, save_settings,
+    CONFIG_ENTRY_NAME, CONFIG_VERSION, FixtureConfig, FixtureType, Settings,
+    load_settings, migrate_v1, save_settings,
 )
 
 
@@ -69,9 +71,11 @@ class LoadSaveRoundTripTests(unittest.TestCase):
         settings.dmx_in.artnet.universe = 5
         settings.dmx_in.sacn.universe = 9
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "FART.json"
+            path = Path(tmp) / "FART.fart"
             save_settings(path, settings)
-            data = json.loads(path.read_text())
+            self.assertTrue(zipfile.is_zipfile(path), "a saved settings file is a zip container")
+            with zipfile.ZipFile(path) as zf:
+                data = json.loads(zf.read(CONFIG_ENTRY_NAME))
             self.assertEqual(data["config_version"], CONFIG_VERSION)
             loaded = load_settings(path)
             self.assertEqual(loaded.dmx_in.active, "sacn")
@@ -80,10 +84,12 @@ class LoadSaveRoundTripTests(unittest.TestCase):
             self.assertEqual(loaded.dmx_in.sacn.universe, 9)
 
     def test_load_missing_file_returns_defaults(self):
-        settings = load_settings(Path("/nonexistent/path/FART.json"))
+        settings = load_settings(Path("/nonexistent/path/FART.fart"))
         self.assertEqual(settings.dmx_in.active, "artnet")
 
     def test_load_v1_file_is_migrated(self):
+        # A pre-.fart plain-JSON file -- must still load even though it is
+        # not a zip at all, not just an older JSON schema inside one.
         v1 = {"output": "sACN", "fixtures": [{"name": "X", "output_universe": 4}]}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "FART.json"
@@ -91,6 +97,31 @@ class LoadSaveRoundTripTests(unittest.TestCase):
             settings = load_settings(path)
             self.assertEqual(settings.dmx_out.active, "sacn")
             self.assertEqual(settings.fixtures[0].name, "X")
+
+    def test_gdtf_data_round_trips_through_its_own_zip_entry_not_the_json(self):
+        settings = Settings()
+        settings.fixture_types = [FixtureType(id="t1", name="Robe MegaPointe", gdtf_data=b"PK\x03\x04fake-gdtf-bytes")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "FART.fart"
+            save_settings(path, settings)
+            with zipfile.ZipFile(path) as zf:
+                data = json.loads(zf.read(CONFIG_ENTRY_NAME))
+                self.assertNotIn("gdtf_data", data["fixture_types"][0],
+                                  "binary GDTF data must not be embedded in config.json")
+                self.assertEqual(zf.read("gdtf/t1.gdtf"), b"PK\x03\x04fake-gdtf-bytes")
+            loaded = load_settings(path)
+            self.assertEqual(loaded.fixture_types[0].gdtf_data, b"PK\x03\x04fake-gdtf-bytes")
+
+    def test_custom_type_with_no_gdtf_data_writes_no_zip_entry(self):
+        settings = Settings()
+        settings.fixture_types = [FixtureType(id="t1", name="Custom")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "FART.fart"
+            save_settings(path, settings)
+            with zipfile.ZipFile(path) as zf:
+                self.assertNotIn("gdtf/t1.gdtf", zf.namelist())
+            loaded = load_settings(path)
+            self.assertEqual(loaded.fixture_types[0].gdtf_data, b"")
 
 
 if __name__ == "__main__":

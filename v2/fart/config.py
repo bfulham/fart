@@ -25,16 +25,27 @@ lighting console patches a fixture:
   console relay switching. These can all be on different universes with
   different start addresses -- input and output no longer have to share a
   universe number, which was a real conflict risk when they did.
+
+A settings file (~/FART2.fart by default) is a zip archive, not a plain
+JSON file: config.json inside it is the same JSON shape as before, plus
+one gdtf/<type id>.gdtf entry per GDTF-backed FixtureType. This makes a
+saved file fully self-contained -- there is no separate library folder to
+keep in sync, no shared store two show files could collide over. An older
+plain-JSON FART2.json/FART.json still loads (detected by content, not by
+file extension, via zipfile.is_zipfile) and simply has no GDTF-backed
+types to carry along.
 """
 from __future__ import annotations
 
 import json
 import uuid
+import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 CONFIG_VERSION = 3
 DEFAULT_FIXTURE_TYPE_ID = "default"
+CONFIG_ENTRY_NAME = "config.json"
 
 
 @dataclass
@@ -140,6 +151,23 @@ class FixtureType:
     zoom_angle_at_0: float = 0.0
     zoom_angle_at_100: float = 0.0
 
+    # A GDTF-backed type carries the actual .gdtf file it was imported
+    # from, rather than just the handful of fields extracted above -- so a
+    # future feature needing a channel FART doesn't parse today can just
+    # re-read this file, with no re-download and no data ever discarded on
+    # import. gdtf_data is the whole point: everything else here becomes a
+    # *derived, read-only* view of it (see gdtf.derive_modes_for_type),
+    # recomputed from these bytes at load time rather than persisted by
+    # hand -- non-empty gdtf_data is what marks a type as GDTF-backed
+    # throughout the codebase, there is no separate flag. It is never
+    # embedded in config.json's own text (see save_settings/load_settings)
+    # since that would bloat and un-diff a file users have shared as-is
+    # with testers; it lives instead as its own entry in the .fart zip.
+    gdtf_data: bytes = b""
+    gdtf_origin: str = ""  # "" | "file" | "share"
+    gdtf_share_rid: int = 0
+    gdtf_source_label: str = ""
+
     def effective_footprint(self) -> int:
         if self.footprint > 0:
             return self.footprint
@@ -155,6 +183,12 @@ class FixtureConfig:
     enabled: bool = True
     marker_id: int = 1
     fixture_type_id: str = DEFAULT_FIXTURE_TYPE_ID
+    # Which of the type's DMX modes *this particular patched fixture* runs
+    # -- only meaningful when fixture_type_id points at a GDTF-backed type,
+    # since a custom type has no modes at all. Two fixtures sharing one
+    # GDTF-backed type can run different modes (e.g. one set to a lower
+    # channel count on the console), so this can't live on the type.
+    gdtf_mode: str = ""
 
     x: float = 0.0
     y: float = -8.0
@@ -386,24 +420,46 @@ def _settings_from_v3_dict(data: dict) -> Settings:
     )
 
 
+def _settings_from_dict(data: dict) -> Settings:
+    if data.get("config_version") == CONFIG_VERSION:
+        return _settings_from_v3_dict(data)
+    # Anything without a matching config_version is treated as a pre-v3
+    # file (v1's flat FART.json, or v2's flat-fixture FART2.json) and run
+    # through the same absolute-channels-to-type-and-patch split.
+    return migrate_v1(data)
+
+
 def load_settings(path: Path) -> Settings:
     if not path.exists():
         return Settings()
     try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return Settings()
-
-    try:
-        if data.get("config_version") == CONFIG_VERSION:
-            return _settings_from_v3_dict(data)
-        # Anything without a matching config_version is treated as a
-        # pre-v3 file (v1's flat FART.json, or v2's flat-fixture FART2.json)
-        # and run through the same absolute-channels-to-type-and-patch split.
-        return migrate_v1(data)
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, "r") as zf:
+                settings = _settings_from_dict(json.loads(zf.read(CONFIG_ENTRY_NAME).decode("utf-8")))
+                names = set(zf.namelist())
+                for fixture_type in settings.fixture_types:
+                    entry = f"gdtf/{fixture_type.id}.gdtf"
+                    if entry in names:
+                        fixture_type.gdtf_data = zf.read(entry)
+                return settings
+        # Not a zip: an older plain-JSON FART2.json/FART.json, from before
+        # the .fart container format (or before GDTF-backed types existed
+        # at all) -- it never had any GDTF blobs to carry along.
+        return _settings_from_dict(json.loads(path.read_text()))
     except Exception:
         return Settings()
 
 
 def save_settings(path: Path, settings: Settings) -> None:
-    path.write_text(json.dumps(asdict(settings), indent=2))
+    data = asdict(settings)
+    blobs = {}
+    for type_dict, fixture_type in zip(data["fixture_types"], settings.fixture_types):
+        # bytes never survive json.dumps -- pull it out into its own zip
+        # entry instead of alongside the rest of the (JSON-safe) metadata.
+        blob = type_dict.pop("gdtf_data", b"")
+        if blob:
+            blobs[fixture_type.id] = blob
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(CONFIG_ENTRY_NAME, json.dumps(data, indent=2))
+        for type_id, blob in blobs.items():
+            zf.writestr(f"gdtf/{type_id}.gdtf", blob)

@@ -4,6 +4,7 @@ Tkinter UI, which needed OS-level Accessibility permission to automate and
 so was never actually click-tested this session.
 """
 import errno
+import json
 import os
 import socket
 import struct
@@ -60,7 +61,7 @@ def build_psn_packet(marker_id, x, y, z):
 class WindowTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.config_path = Path(self._tmp.name) / "FART2.json"
+        self.config_path = Path(self._tmp.name) / "FART2.fart"
         self.window = MainWindow(config_path=self.config_path)
         # Real layout/geometry matters for QTest.mouseClick's default
         # widget.rect().center() to actually land on a widget's hit region
@@ -83,6 +84,54 @@ class WindowTestCase(unittest.TestCase):
         self.window.deleteLater()
         QTest.qWait(20)
         self._tmp.cleanup()
+
+
+class MainWindowConfigPathTests(unittest.TestCase):
+    """MainWindow's legacy-file bootstrap never touches the real home
+    directory in these tests -- DEFAULT_CONFIG_FILE/LEGACY_CONFIG_FILE are
+    patched to a temp dir for every case."""
+
+    def _make_window(self, default_path, legacy_path):
+        with unittest.mock.patch("fart.ui.main_window.DEFAULT_CONFIG_FILE", default_path), \
+             unittest.mock.patch("fart.ui.main_window.LEGACY_CONFIG_FILE", legacy_path):
+            window = MainWindow(config_path=None)
+        window.ui_timer.stop()
+        # deleteLater(), not close(): close() runs closeEvent -> a real
+        # save -- pointless here (these tests only cover the bootstrap
+        # load path) and unsafe once the caller's tmp dir is gone.
+        self.addCleanup(window.deleteLater)
+        return window
+
+    def test_fresh_install_uses_the_new_default_path_with_no_legacy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "FART2.fart"
+            legacy_path = Path(tmp) / "FART2.json"
+            window = self._make_window(default_path, legacy_path)
+            self.assertEqual(window.config_path, default_path)
+            self.assertEqual(window.settings.fixtures[0].name, "Light 1")
+
+    def test_legacy_json_is_loaded_but_future_saves_go_to_the_new_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "FART2.fart"
+            legacy_path = Path(tmp) / "FART2.json"
+            legacy_path.write_text(json.dumps({"output": "sACN", "fixtures": [{"name": "Legacy Light"}]}))
+            window = self._make_window(default_path, legacy_path)
+            self.assertEqual(window.config_path, default_path,
+                              "future saves must target the new .fart path, not the legacy one")
+            self.assertEqual(window.settings.fixtures[0].name, "Legacy Light")
+            self.assertFalse(default_path.exists(), "loading must not itself create the new file")
+
+    def test_existing_default_path_takes_priority_over_legacy(self):
+        from fart.config import Settings, save_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "FART2.fart"
+            legacy_path = Path(tmp) / "FART2.json"
+            legacy_path.write_text(json.dumps({"fixtures": [{"name": "Legacy Light"}]}))
+            current = Settings()
+            current.fixtures[0].name = "Current Light"
+            save_settings(default_path, current)
+            window = self._make_window(default_path, legacy_path)
+            self.assertEqual(window.settings.fixtures[0].name, "Current Light")
 
 
 class BasicStructureTests(WindowTestCase):
