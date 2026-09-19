@@ -217,9 +217,11 @@ class GDTFShareBrowseDialog(QDialog):
             haystack = f"{entry['manufacturer']} {entry['fixture']}".lower()
             if query and query not in haystack:
                 continue
+            # "revision" is skipped here: on real GDTF Share data it's
+            # usually an internal build/measurement-date code (e.g.
+            # "20230316NoMeas"), not a meaningful label, so it just added
+            # noise rather than helping tell revisions apart.
             label = f"{entry['manufacturer']} {entry['fixture']}"
-            if entry.get("revision") and entry["revision"] != entry["fixture"]:
-                label += f" ({entry['revision']})"
             if entry.get("verified"):
                 label += " ✓"
             if entry.get("rating"):

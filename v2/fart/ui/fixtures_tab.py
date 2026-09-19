@@ -70,6 +70,15 @@ class FixturesTab(QWidget):
             type_buttons.addWidget(b)
         left.addLayout(type_buttons)
 
+        gdtf_type_buttons = QHBoxLayout()
+        gdtf_button = QPushButton("Import from GDTF…")
+        gdtf_button.clicked.connect(self._on_import_gdtf_clicked)
+        gdtf_share_button = QPushButton("Browse GDTF Share…")
+        gdtf_share_button.clicked.connect(self._on_browse_gdtf_share_clicked)
+        for b in (gdtf_button, gdtf_share_button):
+            gdtf_type_buttons.addWidget(b)
+        left.addLayout(gdtf_type_buttons)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         root.addWidget(scroll, stretch=1)
@@ -298,12 +307,6 @@ class FixturesTab(QWidget):
         form.addRow("Name", name_edit)
         form.addRow("Footprint (0 = auto, from highest channel used)", bind_int(QLineEdit(), fixture_type, "footprint", lo=0, hi=512))
         form.addRow("Intensity scale", bind_float(QLineEdit(), fixture_type, "intensity_scale", lo=0))
-        gdtf_button = QPushButton("Import from GDTF…")
-        gdtf_button.clicked.connect(lambda: self._on_import_gdtf(fixture_type))
-        gdtf_share_button = QPushButton("Browse GDTF Share…")
-        gdtf_share_button.clicked.connect(lambda: self._on_browse_gdtf_share(fixture_type))
-        form.addRow(gdtf_button)
-        form.addRow(gdtf_share_button)
         self.editor_layout.addWidget(identity)
 
         limits = QGroupBox("Physical angle range")
@@ -348,6 +351,23 @@ class FixturesTab(QWidget):
     def _refresh_type_and_fixture_lists(self):
         self._refresh_type_list()
         self._refresh_list()
+
+    def _current_type(self):
+        types = self.main_window.settings.fixture_types
+        if not 0 <= self.selected_type_index < len(types):
+            QMessageBox.warning(self, "FART", "Select a fixture type first.")
+            return None
+        return types[self.selected_type_index]
+
+    def _on_import_gdtf_clicked(self):
+        fixture_type = self._current_type()
+        if fixture_type is not None:
+            self._on_import_gdtf(fixture_type)
+
+    def _on_browse_gdtf_share_clicked(self):
+        fixture_type = self._current_type()
+        if fixture_type is not None:
+            self._on_browse_gdtf_share(fixture_type)
 
     def _on_import_gdtf(self, fixture_type):
         path, _filter = QFileDialog.getOpenFileName(self, "Select GDTF fixture file", "", "GDTF fixture (*.gdtf);;All files (*)")

@@ -179,6 +179,30 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(fixture_type.pan_coarse, 1)
         self.assertEqual(fixture_type.footprint, 16)
 
+    def test_gdtf_buttons_live_under_the_type_list_not_the_type_editor(self):
+        from PySide6.QtWidgets import QPushButton
+        tab = self.window.fixtures_tab
+        tab._load_type(0)
+        editor_buttons = [b.text() for b in tab.editor_container.findChildren(QPushButton)]
+        self.assertNotIn("Import from GDTF…", editor_buttons)
+        self.assertNotIn("Browse GDTF Share…", editor_buttons)
+        top_level_buttons = [b.text() for b in tab.findChildren(QPushButton)
+                              if b not in tab.editor_container.findChildren(QPushButton)]
+        self.assertIn("Import from GDTF…", top_level_buttons)
+        self.assertIn("Browse GDTF Share…", top_level_buttons)
+
+    def test_gdtf_share_button_warns_instead_of_crashing_with_no_type_selected(self):
+        tab = self.window.fixtures_tab
+        # An index past the end of the list is the same "nothing valid
+        # selected" state _current_type() guards against; no real UI path
+        # can empty the type list entirely (at least one must remain).
+        tab.selected_type_index = len(tab.main_window.settings.fixture_types)
+        with unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.warning") as warning, \
+             unittest.mock.patch("fart.ui.fixtures_tab.GDTFShareBrowseDialog") as dialog_cls:
+            tab._on_browse_gdtf_share_clicked()
+        warning.assert_called_once()
+        dialog_cls.assert_not_called()
+
 
 class DMXInTabTests(WindowTestCase):
     def test_switching_protocol_preserves_both_universes(self):
