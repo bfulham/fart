@@ -1,4 +1,4 @@
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 APP_SHORT_NAME = "FART"
 APP_LONG_NAME = "Fixture Aiming and Remote Tracking"
 APP_NAME = f"{APP_SHORT_NAME} {APP_VERSION}"
