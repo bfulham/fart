@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+from dataclasses import asdict
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -148,13 +149,14 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(tab.editor_mode, "fixture",
                           "clicking the only (already-current) fixture must still switch the editor back")
 
-    def test_browse_gdtf_share_applies_returned_mapping_to_the_selected_type(self):
+    def test_browse_gdtf_share_creates_a_new_type_rather_than_editing_the_selected_one(self):
         # The real GDTFShareBrowseDialog talks to the network and the OS
         # keychain -- stand in for it here so this test (like every other
         # UI test) never does either.
         tab = self.window.fixtures_tab
-        tab._on_add_type()
-        fixture_type = self.window.settings.fixture_types[tab.selected_type_index]
+        existing_type = self.window.settings.fixture_types[tab.selected_type_index]
+        existing_snapshot = asdict(existing_type)
+        before_count = len(self.window.settings.fixture_types)
 
         class _Code:
             Accepted = 1
@@ -173,11 +175,17 @@ class FixturesTabTests(WindowTestCase):
 
         with unittest.mock.patch("fart.ui.fixtures_tab.GDTFShareBrowseDialog", FakeDialog), \
              unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.information"):
-            tab._on_browse_gdtf_share(fixture_type)
+            tab._on_browse_gdtf_share_clicked()
 
-        self.assertEqual(fixture_type.dimmer, 3)
-        self.assertEqual(fixture_type.pan_coarse, 1)
-        self.assertEqual(fixture_type.footprint, 16)
+        self.assertEqual(asdict(existing_type), existing_snapshot,
+                          "the previously-selected type must be untouched")
+        self.assertEqual(len(self.window.settings.fixture_types), before_count + 1)
+        new_type = self.window.settings.fixture_types[-1]
+        self.assertEqual(new_type.name, "Robe MegaPointe")
+        self.assertEqual(new_type.dimmer, 3)
+        self.assertEqual(new_type.pan_coarse, 1)
+        self.assertEqual(new_type.footprint, 16)
+        self.assertEqual(tab.selected_type_index, len(self.window.settings.fixture_types) - 1)
 
     def test_gdtf_buttons_live_under_the_type_list_not_the_type_editor(self):
         from PySide6.QtWidgets import QPushButton
@@ -191,17 +199,39 @@ class FixturesTabTests(WindowTestCase):
         self.assertIn("Import from GDTF…", top_level_buttons)
         self.assertIn("Browse GDTF Share…", top_level_buttons)
 
-    def test_gdtf_share_button_warns_instead_of_crashing_with_no_type_selected(self):
+    def test_import_from_gdtf_file_creates_a_new_type_rather_than_editing_the_selected_one(self):
+        import tempfile
+        import zipfile
+
+        gdtf_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
+            '    <DMXMode Name="Basic">\n      <DMXChannels>\n'
+            '        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer">'
+            '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
+            '</LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n'
+            '  </DMXModes>\n</FixtureType>\n'
+        )
+        tmp = tempfile.NamedTemporaryFile(suffix=".gdtf", delete=False)
+        tmp.close()
+        with zipfile.ZipFile(tmp.name, "w") as zf:
+            zf.writestr("description.xml", gdtf_xml)
+
         tab = self.window.fixtures_tab
-        # An index past the end of the list is the same "nothing valid
-        # selected" state _current_type() guards against; no real UI path
-        # can empty the type list entirely (at least one must remain).
-        tab.selected_type_index = len(tab.main_window.settings.fixture_types)
-        with unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.warning") as warning, \
-             unittest.mock.patch("fart.ui.fixtures_tab.GDTFShareBrowseDialog") as dialog_cls:
-            tab._on_browse_gdtf_share_clicked()
-        warning.assert_called_once()
-        dialog_cls.assert_not_called()
+        existing_type = self.window.settings.fixture_types[tab.selected_type_index]
+        existing_snapshot = asdict(existing_type)
+        before_count = len(self.window.settings.fixture_types)
+
+        with unittest.mock.patch("fart.ui.fixtures_tab.QFileDialog.getOpenFileName", return_value=(tmp.name, "")), \
+             unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.information"):
+            tab._on_import_gdtf_clicked()
+
+        self.assertEqual(asdict(existing_type), existing_snapshot,
+                          "the previously-selected type must be untouched")
+        self.assertEqual(len(self.window.settings.fixture_types), before_count + 1)
+        new_type = self.window.settings.fixture_types[-1]
+        self.assertEqual(new_type.name, Path(tmp.name).stem)
+        self.assertEqual(new_type.dimmer, 1)
+        os.unlink(tmp.name)
 
 
 class DMXInTabTests(WindowTestCase):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -352,24 +353,23 @@ class FixturesTab(QWidget):
         self._refresh_type_list()
         self._refresh_list()
 
-    def _current_type(self):
+    def _add_type_from_mapping(self, name, mapping, message):
+        """Both GDTF import paths land here: each always creates a brand
+        new Fixture Type rather than overwriting whatever happened to be
+        selected in the list -- picking an existing type to overwrite by
+        accident is an easy, hard-to-notice mistake; a fresh type is not."""
         types = self.main_window.settings.fixture_types
-        if not 0 <= self.selected_type_index < len(types):
-            QMessageBox.warning(self, "FART", "Select a fixture type first.")
-            return None
-        return types[self.selected_type_index]
+        fixture_type = FixtureType(id=uuid.uuid4().hex, name=name or f"Fixture Type {len(types) + 1}")
+        for field, value in mapping.items():
+            if hasattr(fixture_type, field):
+                setattr(fixture_type, field, value)
+        types.append(fixture_type)
+        self.selected_type_index = len(types) - 1
+        self._refresh_type_list()
+        found = ", ".join(f"{k}={v}" for k, v in mapping.items())
+        QMessageBox.information(self, "FART", f"{message}\n\nCheck these against the fixture manual.\n\n{found}")
 
     def _on_import_gdtf_clicked(self):
-        fixture_type = self._current_type()
-        if fixture_type is not None:
-            self._on_import_gdtf(fixture_type)
-
-    def _on_browse_gdtf_share_clicked(self):
-        fixture_type = self._current_type()
-        if fixture_type is not None:
-            self._on_browse_gdtf_share(fixture_type)
-
-    def _on_import_gdtf(self, fixture_type):
         path, _filter = QFileDialog.getOpenFileName(self, "Select GDTF fixture file", "", "GDTF fixture (*.gdtf);;All files (*)")
         if not path:
             return
@@ -384,26 +384,15 @@ class FixturesTab(QWidget):
             # are offsets within its own footprint, not tied to where any
             # particular instance is patched.
             mapping, _modes, selected_mode = import_gdtf_channel_mapping(path, 1, mode)
-            for field, value in mapping.items():
-                if hasattr(fixture_type, field):
-                    setattr(fixture_type, field, value)
-            self._load_type(self.selected_type_index)
-            found = ", ".join(f"{k}={v}" for k, v in mapping.items())
-            QMessageBox.information(self, "FART", f"Imported GDTF channel mapping (mode: {selected_mode}).\n\n"
-                                                   f"Check these against the fixture manual.\n\n{found}")
         except Exception as exc:
             QMessageBox.critical(self, "FART", str(exc))
+            return
+        self._add_type_from_mapping(Path(path).stem, mapping, f"Imported GDTF channel mapping (mode: {selected_mode}).")
 
-    def _on_browse_gdtf_share(self, fixture_type):
+    def _on_browse_gdtf_share_clicked(self):
         dialog = GDTFShareBrowseDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        for field, value in dialog.result_mapping.items():
-            if hasattr(fixture_type, field):
-                setattr(fixture_type, field, value)
-        self._load_type(self.selected_type_index)
-        found = ", ".join(f"{k}={v}" for k, v in dialog.result_mapping.items())
-        QMessageBox.information(
-            self, "FART",
-            f"Imported {dialog.result_label} from GDTF Share (mode: {dialog.result_mode_name}).\n\n"
-            f"Check these against the fixture manual.\n\n{found}")
+        self._add_type_from_mapping(
+            dialog.result_label, dialog.result_mapping,
+            f"Imported {dialog.result_label} from GDTF Share (mode: {dialog.result_mode_name}).")
