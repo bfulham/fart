@@ -87,9 +87,10 @@ class GDTFShareClient:
     def get_list(self):
         response = self._request("getList.php")
         payload = _read_json_response(response)
-        if isinstance(payload, dict) and payload.get("result") is False:
-            raise GDTFShareError(payload.get("error") or "Could not list GDTF Share fixtures.")
-        return payload
+        if not isinstance(payload, dict) or not payload.get("result"):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            raise GDTFShareError(error or "Could not list GDTF Share fixtures.")
+        return payload.get("list", [])
 
     def download_file(self, rid):
         response = self._request(f"downloadFile.php?rid={rid}")

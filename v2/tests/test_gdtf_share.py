@@ -56,11 +56,20 @@ class GDTFShareClientTests(unittest.TestCase):
         self.assertIn("No valid user", str(ctx.exception))
         self.assertFalse(client.logged_in)
 
-    def test_get_list_returns_parsed_catalog(self):
+    def test_get_list_unwraps_the_result_list_envelope(self):
+        # The real API (verified live) wraps the catalog as
+        # {"result": true, "list": [...]}, not a bare array.
         catalog = [{"rid": 1, "manufacturer": "Robe", "fixture": "MegaPointe", "modes": []}]
-        opener = FakeOpener([FakeResponse(json.dumps(catalog).encode())])
+        opener = FakeOpener([FakeResponse(json.dumps({"result": True, "list": catalog}).encode())])
         client = GDTFShareClient(opener=opener)
         self.assertEqual(client.get_list(), catalog)
+
+    def test_get_list_with_result_false_raises(self):
+        opener = FakeOpener([FakeResponse(json.dumps({"result": False, "error": "Session expired."}).encode())])
+        client = GDTFShareClient(opener=opener)
+        with self.assertRaises(GDTFShareError) as ctx:
+            client.get_list()
+        self.assertIn("Session expired", str(ctx.exception))
 
     def test_get_list_unauthorized_raises(self):
         opener = FakeOpener([http_error(401, {"result": False, "error": "Unauthorized."})])

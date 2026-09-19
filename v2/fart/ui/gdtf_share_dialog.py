@@ -17,7 +17,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QComboBox, QFormLayout, QHBoxLayout, QLabel,
+    QCheckBox, QDialog, QDialogButtonBox, QComboBox, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout,
 )
 
@@ -30,34 +30,29 @@ from ..gdtf_share import (
 CACHE_PATH = Path.home() / "FART2_gdtf_share_cache.json"
 
 
-def _first(raw, *keys, default=None):
-    for key in keys:
-        if key in raw and raw[key] not in (None, ""):
-            return raw[key]
-    return default
-
-
 def _normalize_entry(raw):
-    """Best-effort mapping from a getList.php row to the fields this dialog
-    needs. GDTF Share's exact JSON key names haven't been verified against
-    a real account (the API refuses every call without a login, including
-    listing) -- this tries several plausible spellings per field so a
-    reasonable subset still works, and is the one place to fix if the real
-    field names turn out different.
+    """Map one getList.php row (verified live against a real account) to
+    the fields this dialog needs. Real shape: {"rid": int, "fixture": str,
+    "manufacturer": str, "revision": str, "creator": str, "uploader":
+    "Manuf."|"User", "rating": "N/A" or a numeric string, "modes":
+    [{"name": str, "dmxfootprint": int}], ...}. getList.php itself returns
+    {"result": true, "list": [...]}, already unwrapped by
+    GDTFShareClient.get_list().
     """
-    modes_raw = _first(raw, "modes", default=[]) or []
     modes = []
-    for m in modes_raw:
-        name = _first(m, "name", "mode", "modeName", default="Mode")
-        footprint = _first(m, "footprint", "dmxFootprint", "channels", default=None)
-        modes.append({"name": name, "footprint": footprint})
+    for m in raw.get("modes") or []:
+        modes.append({"name": m.get("name") or "Mode", "footprint": m.get("dmxfootprint")})
+    try:
+        rating = float(raw.get("rating"))
+    except (TypeError, ValueError):
+        rating = 0.0
     return {
-        "rid": _first(raw, "rid", "id"),
-        "manufacturer": _first(raw, "manufacturer", "manufacturerName", default=""),
-        "fixture": _first(raw, "fixture", "fixtureName", "name", default=""),
-        "revision": _first(raw, "revision", "revisionName", default=""),
-        "rating": _first(raw, "rating", default=0) or 0,
-        "uploader": _first(raw, "uploader", "uploaderType", "type", default=""),
+        "rid": raw.get("rid"),
+        "manufacturer": raw.get("manufacturer") or "",
+        "fixture": raw.get("fixture") or "",
+        "revision": raw.get("revision") or "",
+        "rating": rating,
+        "verified": raw.get("uploader") == "Manuf.",
         "modes": modes,
     }
 
@@ -139,6 +134,11 @@ class GDTFShareBrowseDialog(QDialog):
         search_row.addWidget(refresh_button)
         layout.addLayout(search_row)
 
+        self.verified_only_checkbox = QCheckBox("Manufacturer-verified only")
+        self.verified_only_checkbox.setChecked(True)
+        self.verified_only_checkbox.stateChanged.connect(self._apply_filter)
+        layout.addWidget(self.verified_only_checkbox)
+
         self.results_list = QListWidget()
         self.results_list.currentRowChanged.connect(self._on_selection_changed)
         layout.addWidget(self.results_list)
@@ -209,16 +209,21 @@ class GDTFShareBrowseDialog(QDialog):
 
     def _apply_filter(self):
         query = self.filter_edit.text().strip().lower()
+        verified_only = self.verified_only_checkbox.isChecked()
         self.results_list.clear()
         for entry in self.catalog:
+            if verified_only and not entry.get("verified"):
+                continue
             haystack = f"{entry['manufacturer']} {entry['fixture']}".lower()
             if query and query not in haystack:
                 continue
             label = f"{entry['manufacturer']} {entry['fixture']}"
-            if entry.get("revision"):
+            if entry.get("revision") and entry["revision"] != entry["fixture"]:
                 label += f" ({entry['revision']})"
+            if entry.get("verified"):
+                label += " ✓"
             if entry.get("rating"):
-                label += f" ★{entry['rating']}"
+                label += f" ★{entry['rating']:g}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, entry)
             self.results_list.addItem(item)

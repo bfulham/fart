@@ -39,12 +39,22 @@ def make_gdtf_bytes():
     return data
 
 
-CATALOG = [
-    {"rid": 1, "manufacturer": "Robe", "fixture": "MegaPointe", "revision": "1.2", "rating": 5,
-     "modes": [{"name": "Standard 16ch", "footprint": 16}]},
-    {"rid": 2, "manufacturer": "Martin", "fixture": "MAC Aura XB", "revision": "1.0", "rating": 4,
-     "modes": [{"name": "Mode 1", "footprint": 20}]},
+# Shaped exactly like a real getList.php row (verified live against a real
+# GDTF Share account): "dmxfootprint" (lowercase), "rating" as a numeric
+# string or "N/A", "uploader" of "Manuf." or "User". This is what
+# GDTFShareClient.get_list() returns (already unwrapped from the
+# {"result": true, "list": [...]} envelope) -- the dialog normalizes it
+# from there via _normalize_entry.
+RAW_CATALOG = [
+    {"rid": 1, "manufacturer": "Robe", "fixture": "MegaPointe", "revision": "1.2",
+     "uploader": "Manuf.", "rating": "5.0", "modes": [{"name": "Standard 16ch", "dmxfootprint": 16}]},
+    {"rid": 2, "manufacturer": "Martin", "fixture": "MAC Aura XB", "revision": "1.0",
+     "uploader": "Manuf.", "rating": "4.0", "modes": [{"name": "Mode 1", "dmxfootprint": 20}]},
 ]
+
+# What ends up in the on-disk cache and in dialog.catalog once _normalize_entry
+# has run -- derived from RAW_CATALOG so the two can't drift apart.
+NORMALIZED_CATALOG = [gdtf_share_dialog._normalize_entry(raw) for raw in RAW_CATALOG]
 
 
 class FakeClient:
@@ -54,7 +64,7 @@ class FakeClient:
         self.login_calls = []
         self.list_calls = 0
         self.download_calls = []
-        self._list_result = list_result if list_result is not None else CATALOG
+        self._list_result = list_result if list_result is not None else RAW_CATALOG
         self._login_should_fail = login_should_fail
         self._download_bytes = download_bytes if download_bytes is not None else make_gdtf_bytes()
 
@@ -98,7 +108,41 @@ class RejectingFakeLoginDialog(FakeLoginDialog):
         return QDialog.DialogCode.Rejected
 
 
+class NormalizeEntryTests(unittest.TestCase):
+    def test_real_field_names_are_mapped_correctly(self):
+        raw = {"rid": 2294, "manufacturer": "ACME", "fixture": "ACME XP-260 BEAM", "revision": "rev1",
+               "uploader": "Manuf.", "rating": "2.6",
+               "modes": [{"name": "Mode 1 16 DMX", "dmxfootprint": 16}]}
+        entry = gdtf_share_dialog._normalize_entry(raw)
+        self.assertEqual(entry["rid"], 2294)
+        self.assertEqual(entry["manufacturer"], "ACME")
+        self.assertEqual(entry["fixture"], "ACME XP-260 BEAM")
+        self.assertTrue(entry["verified"])
+        self.assertEqual(entry["rating"], 2.6)
+        self.assertEqual(entry["modes"], [{"name": "Mode 1 16 DMX", "footprint": 16}])
+
+    def test_unrated_entry_and_user_upload_do_not_crash(self):
+        raw = {"rid": 1, "manufacturer": "aa", "fixture": "1111111112", "revision": "x",
+               "uploader": "User", "rating": "N/A", "modes": [{"name": "Standard mode", "dmxfootprint": 0}]}
+        entry = gdtf_share_dialog._normalize_entry(raw)
+        self.assertEqual(entry["rating"], 0.0)
+        self.assertFalse(entry["verified"])
+
+
 class GDTFShareBrowseDialogTests(unittest.TestCase):
+    def test_verified_only_filter_hides_user_uploads_by_default(self):
+        mixed = NORMALIZED_CATALOG + [gdtf_share_dialog._normalize_entry(
+            {"rid": 9, "manufacturer": "Randomuser", "fixture": "Junk Fixture", "revision": "",
+             "uploader": "User", "rating": "N/A", "modes": [{"name": "Mode", "dmxfootprint": 4}]})]
+        with _isolated_paths():
+            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(mixed))
+            dialog = GDTFShareBrowseDialog(client=FakeClient())
+            self.assertTrue(dialog.verified_only_checkbox.isChecked())
+            self.assertEqual(dialog.results_list.count(), 2)
+            dialog.verified_only_checkbox.setChecked(False)
+            self.assertEqual(dialog.results_list.count(), 3)
+
+
     def test_no_cache_triggers_login_and_list_fetch(self):
         with _isolated_paths(), \
              patch("fart.ui.gdtf_share_dialog.get_remembered_username", return_value=None), \
@@ -115,7 +159,7 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
 
     def test_cached_catalog_shown_with_no_login_or_list_call(self):
         with _isolated_paths():
-            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(CATALOG))
+            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             client = FakeClient()
             dialog = GDTFShareBrowseDialog(client=client)
             self.assertFalse(client.logged_in)
@@ -124,7 +168,7 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
 
     def test_filter_narrows_results_by_manufacturer_or_fixture(self):
         with _isolated_paths():
-            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(CATALOG))
+            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             dialog = GDTFShareBrowseDialog(client=FakeClient())
             dialog.filter_edit.setText("martin")
             self.assertEqual(dialog.results_list.count(), 1)
@@ -132,7 +176,7 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
 
     def test_selecting_a_result_populates_its_modes(self):
         with _isolated_paths():
-            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(CATALOG))
+            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             dialog = GDTFShareBrowseDialog(client=FakeClient())
             dialog.results_list.setCurrentRow(0)
             self.assertEqual(dialog.mode_combo.count(), 1)
@@ -140,7 +184,7 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
 
     def test_import_downloads_and_applies_channel_mapping_then_accepts(self):
         with _isolated_paths():
-            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(CATALOG))
+            gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             client = FakeClient()
             client.logged_in = True
             dialog = GDTFShareBrowseDialog(client=client)
