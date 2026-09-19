@@ -9,6 +9,7 @@ and values against the fixture's manual before moving a real fixture.
 """
 from __future__ import annotations
 
+import io
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -40,8 +41,16 @@ def _parse_gdtf_offsets(value):
     return out
 
 
-def _read_gdtf_description(path):
-    with zipfile.ZipFile(path, "r") as zf:
+def _read_gdtf_description(source):
+    """`source` is a path (str/Path) to a .gdtf file on disk, or the raw
+    bytes of one already in memory (e.g. downloaded from GDTF Share, or a
+    FixtureType's own stored gdtf_data) -- zipfile accepts a file-like
+    object just as happily as a path, so bytes never need to touch disk as
+    a temp file just to be parsed.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+    with zipfile.ZipFile(source, "r") as zf:
         names = zf.namelist()
         desc_name = next((n for n in names if n.lower().endswith("description.xml")), None)
         if not desc_name:
@@ -49,8 +58,8 @@ def _read_gdtf_description(path):
         return ET.fromstring(zf.read(desc_name))
 
 
-def list_gdtf_modes(path):
-    root = _read_gdtf_description(path)
+def list_gdtf_modes(source):
+    root = _read_gdtf_description(source)
     modes = [node for node in root.iter() if _strip_ns(node.tag) == "DMXMode"]
     names = [_xml_attr(m, "Name", f"Mode {i + 1}") for i, m in enumerate(modes)]
     if not names:
@@ -257,8 +266,10 @@ def _derive_iris_physical_values(dmx_channel):
     return p0, p100
 
 
-def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
+def import_gdtf_channel_mapping(source, start_address=1, preferred_mode=None):
     """Best-effort GDTF DMX attribute extraction for one selected mode.
+
+    `source` is a path or raw .gdtf bytes -- see _read_gdtf_description.
 
     Returns (mapping, mode_names, selected_mode_name). Mapping values are
     channel numbers relative to `start_address` (1-based within the
@@ -270,7 +281,7 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
     patched. Complex GDTF files may still need manual checking against the
     fixture manual.
     """
-    root = _read_gdtf_description(path)
+    root = _read_gdtf_description(source)
     modes = [node for node in root.iter() if _strip_ns(node.tag) == "DMXMode"]
     mode_names = [_xml_attr(m, "Name", f"Mode {i + 1}") for i, m in enumerate(modes)]
     if not modes:
@@ -386,3 +397,29 @@ def import_gdtf_channel_mapping(path, start_address=1, preferred_mode=None):
     if max_offset > 0:
         found["footprint"] = max_offset
     return found, mode_names, selected_mode
+
+
+def derive_all_modes(source, start_address=1):
+    """Every DMX mode a GDTF file declares, mapped to its own channel data
+    -- what a GDTF-backed FixtureType uses in place of hand-entered
+    fields, since which mode is active is a per-patched-instance choice
+    (FixtureConfig.gdtf_mode), not something the type itself can pin down
+    to a single set of channel numbers.
+
+    A mode with no pan/tilt/dimmer/beam channels FART recognises (a
+    macro-only or purely static mode, say) maps to {} rather than being
+    dropped -- it still needs to appear as a selectable mode, it just
+    resolves to a fixture with every channel disabled (the same safe
+    no-op a FixtureType's own field defaults already represent) rather
+    than one whole mode silently vanishing from the picker. One bad mode
+    in an otherwise-fine file (not uncommon in messy community uploads)
+    likewise doesn't take down every other mode with it.
+    """
+    modes = {}
+    for mode_name in list_gdtf_modes(source):
+        try:
+            mapping, _modes, _selected = import_gdtf_channel_mapping(source, start_address, mode_name)
+        except Exception:
+            mapping = {}
+        modes[mode_name] = mapping
+    return modes

@@ -1,7 +1,10 @@
 import math
 import sys
+import tempfile
 import time
 import unittest
+import unittest.mock
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -9,9 +12,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fart.bus import ExternalInputBus, TrackerBank
 from fart.config import FixtureConfig, FixtureType, Settings
 from fart.engine import (
-    CycleState, calculate_aim, dmx_in_is_needed, resolve_console_mode, resolve_fixture,
-    resolve_live_marker_id, run_cycle, write_fixture_to_frame,
+    CycleState, calculate_aim, dmx_in_is_needed, effective_fixture_type, resolve_console_mode,
+    resolve_fixture, resolve_live_marker_id, run_cycle, write_fixture_to_frame,
 )
+
+# Two modes with genuinely different channel layouts, so switching modes
+# is observably different: "DimmerOnly" is a 1-channel footprint with just
+# a dimmer; "PanTiltDimmer" adds pan/tilt ahead of a dimmer at offset 5.
+TWO_MODE_GDTF_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
+    '    <DMXMode Name="DimmerOnly"><DMXChannels>\n'
+    '        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer">'
+    '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
+    '</LogicalChannel></DMXChannel>\n    </DMXChannels></DMXMode>\n'
+    '    <DMXMode Name="PanTiltDimmer"><DMXChannels>\n'
+    '        <DMXChannel Offset="1 2"><LogicalChannel Attribute="Pan">'
+    '<ChannelFunction Name="Pan" Attribute="Pan" DMXFrom="0/2" DMXTo="65535/2"/>'
+    '</LogicalChannel></DMXChannel>\n'
+    '        <DMXChannel Offset="3 4"><LogicalChannel Attribute="Tilt">'
+    '<ChannelFunction Name="Tilt" Attribute="Tilt" DMXFrom="0/2" DMXTo="65535/2"/>'
+    '</LogicalChannel></DMXChannel>\n'
+    '        <DMXChannel Offset="5"><LogicalChannel Attribute="Dimmer">'
+    '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
+    '</LogicalChannel></DMXChannel>\n    </DMXChannels></DMXMode>\n'
+    '  </DMXModes>\n</FixtureType>\n'
+)
+
+
+def make_two_mode_gdtf_bytes():
+    tmp = tempfile.NamedTemporaryFile(suffix=".gdtf", delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w") as zf:
+        zf.writestr("description.xml", TWO_MODE_GDTF_XML)
+    data = Path(tmp.name).read_bytes()
+    Path(tmp.name).unlink()
+    return data
 
 
 def resolved(instance_overrides=None, type_overrides=None):
@@ -197,6 +232,87 @@ class RunCycleTests(unittest.TestCase):
         frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
         self.assertEqual(frames[0][5], 111, "zoom should pass through from the shadow feed with auto-beam-size off")
         self.assertEqual(frames[0][6], 222, "iris should pass through from the shadow feed with auto-beam-size off")
+
+    def test_shadow_patch_copy_uses_the_selected_modes_footprint(self):
+        # DimmerOnly's real footprint is 1 channel. Using the type's own
+        # (meaningless, for a GDTF-backed type) stored field defaults
+        # instead of the resolved mode's footprint would compute 5 here by
+        # coincidence (FixtureType()'s own pan/tilt/dimmer field defaults
+        # happen to span channels 1-5) and wrongly copy a byte one past
+        # what this mode actually has.
+        settings = self._settings(
+            type_overrides={"gdtf_data": make_two_mode_gdtf_bytes()},
+            gdtf_mode="DimmerOnly", shadow_universe=2, shadow_start_address=1,
+        )
+        trackers = TrackerBank()
+        trackers.update(1, 5.0, 0.0, 5.0)
+        bus = ExternalInputBus()
+        shadow_frame = bytearray(512)
+        shadow_frame[1] = 250  # channel 2 -- beyond DimmerOnly's 1-channel footprint
+        bus.update(2, shadow_frame)
+        state = CycleState()
+        frames, _statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, True, time.monotonic(), state)
+        self.assertEqual(frames[0][1], 0, "a byte beyond this mode's real footprint must not be copied")
+
+
+class GDTFBackedResolutionTests(unittest.TestCase):
+    def test_custom_type_is_returned_unchanged(self):
+        fixture_type = FixtureType(dimmer=7)
+        fixture = FixtureConfig(gdtf_mode="whatever")
+        self.assertIs(effective_fixture_type(fixture, fixture_type), fixture_type)
+
+    def test_selected_mode_drives_the_resolved_channels_not_the_types_own_fields(self):
+        # The type's own stored fields (dimmer=99 here) must be completely
+        # ignored for a GDTF-backed type -- only the instance's selected
+        # mode matters.
+        fixture_type = FixtureType(id="t", gdtf_data=make_two_mode_gdtf_bytes(), dimmer=99)
+        fixture = FixtureConfig(fixture_type_id="t", gdtf_mode="DimmerOnly", output_start_address=100)
+        resolved = resolve_fixture(fixture, fixture_type)
+        self.assertEqual(resolved.dimmer, 100)
+        self.assertEqual(resolved.pan_coarse, 0, "DimmerOnly has no pan channel")
+        self.assertEqual(resolved.footprint, 1)
+
+    def test_two_fixtures_sharing_one_type_can_run_different_modes(self):
+        fixture_type = FixtureType(id="t", gdtf_data=make_two_mode_gdtf_bytes())
+        dimmer_only = FixtureConfig(fixture_type_id="t", gdtf_mode="DimmerOnly", output_start_address=1)
+        pan_tilt = FixtureConfig(fixture_type_id="t", gdtf_mode="PanTiltDimmer", output_start_address=1)
+
+        a = resolve_fixture(dimmer_only, fixture_type)
+        b = resolve_fixture(pan_tilt, fixture_type)
+        self.assertEqual(a.footprint, 1)
+        self.assertEqual(a.pan_coarse, 0)
+        self.assertEqual(b.footprint, 5)
+        self.assertEqual(b.pan_coarse, 1)
+        self.assertEqual(b.dimmer, 5)
+
+    def test_unset_or_unknown_mode_resolves_to_an_all_disabled_baseline_not_a_crash(self):
+        fixture_type = FixtureType(id="t", gdtf_data=make_two_mode_gdtf_bytes())
+        fixture = FixtureConfig(fixture_type_id="t", gdtf_mode="")
+        resolved = resolve_fixture(fixture, fixture_type)
+        self.assertEqual(resolved.footprint, 0)
+        self.assertEqual(resolved.dimmer, 0)
+        self.assertEqual(resolved.pan_coarse, 0)
+
+        fixture.gdtf_mode = "NoSuchMode"
+        resolved = resolve_fixture(fixture, fixture_type)
+        self.assertEqual(resolved.dimmer, 0)
+
+    def test_gdtf_parsing_is_cached_on_the_type_not_redone_every_resolve(self):
+        fixture_type = FixtureType(id="t", gdtf_data=make_two_mode_gdtf_bytes())
+        fixture = FixtureConfig(fixture_type_id="t", gdtf_mode="DimmerOnly")
+        resolve_fixture(fixture, fixture_type)
+        with unittest.mock.patch("fart.gdtf.derive_all_modes") as derive:
+            resolve_fixture(fixture, fixture_type)
+            resolve_fixture(fixture, fixture_type)
+        derive.assert_not_called()
+
+    def test_replacing_gdtf_data_invalidates_the_cache(self):
+        fixture_type = FixtureType(id="t", gdtf_data=make_two_mode_gdtf_bytes())
+        fixture = FixtureConfig(fixture_type_id="t", gdtf_mode="DimmerOnly")
+        resolve_fixture(fixture, fixture_type)
+        fixture_type.gdtf_data = make_two_mode_gdtf_bytes()  # a new bytes object, same content
+        resolved = resolve_fixture(fixture, fixture_type)
+        self.assertEqual(resolved.dimmer, 1, "must still resolve correctly against the replaced file")
 
 
 class DMXInNeededTests(unittest.TestCase):

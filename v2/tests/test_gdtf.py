@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fart.gdtf import import_gdtf_channel_mapping, list_gdtf_modes
+from fart.gdtf import derive_all_modes, import_gdtf_channel_mapping, list_gdtf_modes
 
 GDTF_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
@@ -87,6 +87,56 @@ class GDTFImportTests(unittest.TestCase):
             self.assertEqual(mapping["dimmer"], 1)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_list_modes_and_import_mapping_accept_raw_bytes_not_just_a_path(self):
+        path = make_gdtf()
+        try:
+            data = path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(list_gdtf_modes(data), ["Basic", "Extended"])
+        mapping, _modes, selected = import_gdtf_channel_mapping(data, start_address=1, preferred_mode="Extended")
+        self.assertEqual(selected, "Extended")
+        self.assertEqual(mapping["dimmer"], 2)
+
+
+MIXED_MODES_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
+    '    <DMXMode Name="Standard"><DMXChannels>\n'
+    '        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer">'
+    '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
+    '</LogicalChannel></DMXChannel>\n    </DMXChannels></DMXMode>\n'
+    '    <DMXMode Name="ColorOnly"><DMXChannels>\n'
+    '        <DMXChannel Offset="1"><LogicalChannel Attribute="ColorMacro">'
+    '<ChannelFunction Name="Red" Attribute="ColorMacro" DMXFrom="0/1" DMXTo="255/1" />'
+    '</LogicalChannel></DMXChannel>\n    </DMXChannels></DMXMode>\n'
+    '  </DMXModes>\n</FixtureType>\n'
+)
+
+
+def make_mixed_modes_gdtf_bytes():
+    tmp = tempfile.NamedTemporaryFile(suffix=".gdtf", delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w") as zf:
+        zf.writestr("description.xml", MIXED_MODES_XML)
+    data = Path(tmp.name).read_bytes()
+    Path(tmp.name).unlink()
+    return data
+
+
+class DeriveAllModesTests(unittest.TestCase):
+    def test_every_declared_mode_gets_an_entry_even_one_with_no_usable_channels(self):
+        data = make_mixed_modes_gdtf_bytes()
+        modes = derive_all_modes(data)
+        self.assertEqual(set(modes.keys()), {"Standard", "ColorOnly"})
+        self.assertEqual(modes["Standard"]["dimmer"], 1)
+        self.assertEqual(modes["ColorOnly"], {},
+                          "a mode with no pan/tilt/dimmer/beam channel must still appear, just with no mapping")
+
+    def test_start_address_offsets_every_mode(self):
+        data = make_mixed_modes_gdtf_bytes()
+        modes = derive_all_modes(data, start_address=50)
+        self.assertEqual(modes["Standard"]["dimmer"], 50)
 
 
 if __name__ == "__main__":

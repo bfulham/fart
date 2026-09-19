@@ -17,7 +17,7 @@ from before the type/instance split.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import FixtureConfig, FixtureType
 
@@ -66,6 +66,53 @@ class ResolvedFixture:
     blackout_on_limit: bool
     limit_blackout_zoom_100: bool
     limit_blackout_iris_100: bool
+    footprint: int
+
+
+# The baseline a GDTF-backed type's selected mode is overlaid onto --
+# every channel disabled (0) and the physical ranges set to a generic
+# fallback, never the type's own stored field values (meaningless for a
+# GDTF-backed type -- see effective_fixture_type) and never FixtureType's
+# own field defaults (pan_coarse=1 etc., a convenience for a brand-new
+# *custom* type someone is about to hand-edit, not a safe "nothing here"
+# baseline). A channel this mode's derived mapping doesn't mention must
+# read as disabled, not as some stale/coincidental leftover value.
+_GDTF_MODE_BLANK_FIELDS = dict(
+    footprint=0,
+    pan_min=-270.0, pan_max=270.0, tilt_min=-135.0, tilt_max=135.0,
+    pan_coarse=0, pan_fine=0, tilt_coarse=0, tilt_fine=0,
+    dimmer=0, dimmer_fine=0, shutter=0, shutter_open=255,
+    zoom=0, zoom_fine=0, iris=0, iris_100_dmx=255,
+    iris_physical_at_0=0.0, iris_physical_at_100=0.0,
+    focus=0, focus_fine=0,
+    zoom_angle_at_0=0.0, zoom_angle_at_100=0.0,
+)
+
+
+def effective_fixture_type(fixture: FixtureConfig, fixture_type: FixtureType) -> FixtureType:
+    """A GDTF-backed type's own channel fields aren't meaningful by
+    themselves: which mode is active is a per-instance choice
+    (fixture.gdtf_mode), so the same type resolves differently for two
+    fixtures running different modes. This overlays that mode's derived
+    channel data (see gdtf.derive_all_modes) onto _GDTF_MODE_BLANK_FIELDS.
+    Custom types (no gdtf_data) are returned completely unchanged.
+
+    Parsing the GDTF file is cached on the type object itself (invalidated
+    by gdtf_data no longer being the same bytes object, e.g. after a
+    "replace file" action) -- resolve_fixture calls this every cycle for
+    every fixture, and re-parsing XML out of a zip at 30+ Hz per fixture
+    would be wasteful; the cache is a plain attribute, not a dataclass
+    field, so it never leaks into asdict()/config.json.
+    """
+    if not fixture_type.gdtf_data:
+        return fixture_type
+    cache = getattr(fixture_type, "_derived_modes_cache", None)
+    if cache is None or cache[0] is not fixture_type.gdtf_data:
+        from .gdtf import derive_all_modes  # local: gdtf.py imports clamp from this module
+        cache = (fixture_type.gdtf_data, derive_all_modes(fixture_type.gdtf_data))
+        fixture_type._derived_modes_cache = cache
+    mapping = cache[1].get(fixture.gdtf_mode) or {}
+    return replace(fixture_type, **{**_GDTF_MODE_BLANK_FIELDS, **mapping})
 
 
 def resolve_fixture(fixture: FixtureConfig, fixture_type: FixtureType) -> ResolvedFixture:
@@ -74,6 +121,8 @@ def resolve_fixture(fixture: FixtureConfig, fixture_type: FixtureType) -> Resolv
     own footprint, 0 = not present) into concrete absolute channel
     numbers: absolute = output_start_address + offset - 1.
     """
+    fixture_type = effective_fixture_type(fixture, fixture_type)
+
     def addr(offset: int) -> int:
         return fixture.output_start_address + offset - 1 if offset > 0 else 0
 
@@ -100,6 +149,7 @@ def resolve_fixture(fixture: FixtureConfig, fixture_type: FixtureType) -> Resolv
         blackout_on_limit=fixture.blackout_on_limit,
         limit_blackout_zoom_100=fixture.limit_blackout_zoom_100,
         limit_blackout_iris_100=fixture.limit_blackout_iris_100,
+        footprint=fixture_type.effective_footprint(),
     )
 
 
@@ -430,7 +480,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         dmx_marker = (resolve_live_marker_id(fixture, console_frame)
                       if console_relay and int(fixture.console_marker_channel) > 0 else None)
 
-        footprint = fixture_type.effective_footprint()
+        footprint = resolved.footprint
         if fixture.shadow_universe:
             shadow_frame, _ts = bus.get(fixture.shadow_universe)
             copy_shadow_into_output(frame, shadow_frame, footprint,
