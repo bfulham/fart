@@ -207,16 +207,21 @@ class TiltArc(QWidget):
 
         painter.setPen(text_color)
 
-        def label_at(display_angle, text, above):
+        def label_at(display_angle, text):
+            # Anchored a fixed distance out along the same radial direction
+            # as the arc endpoint, then centered on that anchor with real
+            # font metrics -- so it lines up with the endpoint regardless of
+            # which quadrant it falls in or how many digits the text has.
             rad = math.radians(display_angle)
-            lx = cx + (r + 12) * math.cos(rad) - 4 * len(text)
-            ly = cy + (r + 12) * math.sin(rad) + (-4 if above else 12)
-            painter.drawText(QPointF(lx, ly), text)
+            anchor = QPointF(cx + (r + 16) * math.cos(rad), cy + (r + 16) * math.sin(rad))
+            rect = painter.fontMetrics().boundingRect(text)
+            rect.moveCenter(anchor.toPoint())
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
-        label_at(start, f"{self.hi:g}", self.hi > 0)
-        label_at(end, f"{self.lo:g}", self.lo > 0)
-        if min(self.lo, self.hi) <= 0 <= max(self.lo, self.hi):
-            painter.drawText(QPointF(cx - 4, cy + r + 16), "0")
+        label_at(start, f"{self.hi:g}")
+        label_at(end, f"{self.lo:g}")
+        if min(self.lo, self.hi) < 0 < max(self.lo, self.hi):
+            label_at(self._display_angle(0.0), "0")
 
         rad = math.radians(self._display_angle(self._value))
         nx, ny = cx + r * 0.88 * math.cos(rad), cy + r * 0.88 * math.sin(rad)
