@@ -46,14 +46,24 @@ class PanDialTests(unittest.TestCase):
 
 
 class TiltArcTests(unittest.TestCase):
-    def test_midpoint_of_range_points_straight_down(self):
-        arc = TiltArc(-45.0, 135.0)
-        self.assertAlmostEqual(arc._display_angle(45.0), 90.0, places=3)
+    def test_tilt_zero_always_points_straight_down_regardless_of_range(self):
+        for lo, hi in [(-45.0, 135.0), (-135.0, 135.0), (0.0, 270.0)]:
+            arc = TiltArc(lo, hi)
+            self.assertAlmostEqual(arc._display_angle(0.0), 90.0, places=3)
 
-    def test_lo_is_left_hi_is_right(self):
+    def test_display_angle_is_a_direct_one_to_one_mapping(self):
         arc = TiltArc(-45.0, 135.0)
-        self.assertAlmostEqual(arc._display_angle(-45.0), 180.0, places=3)
-        self.assertAlmostEqual(arc._display_angle(135.0), 0.0, places=3)
+        self.assertAlmostEqual(arc._display_angle(-45.0), 135.0, places=3)
+        self.assertAlmostEqual(arc._display_angle(135.0), -45.0, places=3)
+
+    def test_arc_display_range_width_matches_true_tilt_range_width(self):
+        arc = TiltArc(-135.0, 135.0)
+        start, end = arc._arc_display_range()
+        self.assertAlmostEqual(end - start, 270.0, places=3)
+
+        arc = TiltArc(-45.0, 135.0)
+        start, end = arc._arc_display_range()
+        self.assertAlmostEqual(end - start, 180.0, places=3)
 
     def test_value_and_display_angle_round_trip_for_an_asymmetric_range(self):
         arc = TiltArc(-135.0, 135.0)
