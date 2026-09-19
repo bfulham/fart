@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import ON_CONSOLE_LOSS_OPTIONS, ON_TRACKING_LOSS_OPTIONS, FixtureConfig, FixtureType
+from ..engine import fixture_type_for
 from ..gdtf import import_gdtf_channel_mapping, list_gdtf_modes
 from .binding import bind_checkbox, bind_combo, bind_float, bind_int, bind_text
 from .gdtf_share_dialog import GDTFShareBrowseDialog
@@ -228,6 +229,13 @@ class FixturesTab(QWidget):
         form.addRow("Optical centre Z", bind_float(QLineEdit(), fixture, "z"))
         self.editor_layout.addWidget(identity)
 
+        fixture_type = fixture_type_for(self.main_window.settings, fixture)
+        if fixture_type.gdtf_data:
+            mode_box = QGroupBox("GDTF DMX mode")
+            form = QFormLayout(mode_box)
+            form.addRow("Mode", self._gdtf_mode_combo(fixture, fixture_type))
+            self.editor_layout.addWidget(mode_box)
+
         mapping = QGroupBox("Physical angle mapping (calibration)")
         form = QFormLayout(mapping)
         form.addRow("Pan-zero bearing", bind_float(QLineEdit(), fixture, "pan_zero_bearing"))
@@ -281,8 +289,32 @@ class FixturesTab(QWidget):
 
         def on_change(idx):
             fixture.fixture_type_id = combo.itemData(idx)
+            # The new type may be GDTF-backed (or no longer be) -- reload
+            # so the DMX mode row appears/disappears/repopulates to match.
+            self._load_fixture(self.selected_index)
 
         combo.currentIndexChanged.connect(on_change)
+        return combo
+
+    def _gdtf_mode_combo(self, fixture, fixture_type):
+        combo = QComboBox()
+        try:
+            modes = list_gdtf_modes(fixture_type.gdtf_data)
+        except Exception:
+            modes = []
+        combo.addItems(modes)
+        if fixture.gdtf_mode in modes:
+            combo.setCurrentText(fixture.gdtf_mode)
+        elif modes:
+            # Nothing chosen yet (or a stale mode from a replaced file) --
+            # default to the first mode rather than silently resolving to
+            # the all-disabled baseline while the combo shows something else.
+            fixture.gdtf_mode = modes[0]
+
+        def on_change(text):
+            fixture.gdtf_mode = text
+
+        combo.currentTextChanged.connect(on_change)
         return combo
 
     def _direction_combo(self, fixture, attr):
@@ -300,22 +332,59 @@ class FixturesTab(QWidget):
         self.selected_type_index = index
         fixture_type = types[index]
         self._clear_editor()
+        is_gdtf = bool(fixture_type.gdtf_data)
+
+        def add(form, widget, label=None):
+            # Channel/physical fields on a GDTF-backed type aren't
+            # meaningful to hand-edit -- the real values come from
+            # whichever mode a given patched fixture selects (see
+            # engine.effective_fixture_type) -- so they're shown, not hidden
+            # (still useful context), but disabled.
+            if label is not None:
+                form.addRow(label, widget)
+            else:
+                form.addRow(widget)
+            if is_gdtf:
+                widget.setEnabled(False)
+            return widget
 
         identity = QGroupBox("Identity")
         form = QFormLayout(identity)
         name_edit = bind_text(QLineEdit(), fixture_type, "name")
         name_edit.editingFinished.connect(self._refresh_type_and_fixture_lists)
-        form.addRow("Name", name_edit)
-        form.addRow("Footprint (0 = auto, from highest channel used)", bind_int(QLineEdit(), fixture_type, "footprint", lo=0, hi=512))
-        form.addRow("Intensity scale", bind_float(QLineEdit(), fixture_type, "intensity_scale", lo=0))
+        form.addRow("Name", name_edit)  # always editable, even for a GDTF-backed type
+        add(form, bind_int(QLineEdit(), fixture_type, "footprint", lo=0, hi=512), "Footprint (0 = auto, from highest channel used)")
+        add(form, bind_float(QLineEdit(), fixture_type, "intensity_scale", lo=0), "Intensity scale")
         self.editor_layout.addWidget(identity)
+
+        if is_gdtf:
+            source = QGroupBox("GDTF source")
+            form = QFormLayout(source)
+            origin_text = {"file": "Imported from a local GDTF file",
+                           "share": "Imported from GDTF Share"}.get(fixture_type.gdtf_origin, "GDTF-backed")
+            form.addRow(QLabel(origin_text))
+            try:
+                modes = list_gdtf_modes(fixture_type.gdtf_data)
+            except Exception:
+                modes = []
+            modes_label = QLabel(", ".join(modes) if modes else "(file could not be read)")
+            modes_label.setWordWrap(True)
+            form.addRow("Available modes", modes_label)
+            convert_button = QPushButton("Convert to custom copy…")
+            convert_button.clicked.connect(lambda: self._on_convert_to_custom(fixture_type))
+            form.addRow(convert_button)
+            self.editor_layout.addWidget(source)
+            note = QLabel("The fields below are read-only for a GDTF-backed type. Pick which mode a "
+                          "fixture using this type runs on that fixture's own editor.")
+            note.setWordWrap(True)
+            self.editor_layout.addWidget(note)
 
         limits = QGroupBox("Physical angle range")
         form = QFormLayout(limits)
-        form.addRow("Pan minimum", bind_float(QLineEdit(), fixture_type, "pan_min"))
-        form.addRow("Pan maximum", bind_float(QLineEdit(), fixture_type, "pan_max"))
-        form.addRow("Tilt minimum", bind_float(QLineEdit(), fixture_type, "tilt_min"))
-        form.addRow("Tilt maximum", bind_float(QLineEdit(), fixture_type, "tilt_max"))
+        add(form, bind_float(QLineEdit(), fixture_type, "pan_min"), "Pan minimum")
+        add(form, bind_float(QLineEdit(), fixture_type, "pan_max"), "Pan maximum")
+        add(form, bind_float(QLineEdit(), fixture_type, "tilt_min"), "Tilt minimum")
+        add(form, bind_float(QLineEdit(), fixture_type, "tilt_max"), "Tilt maximum")
         self.editor_layout.addWidget(limits)
 
         channels = QGroupBox("Channel offsets within this fixture's own footprint (1-based; 0 disables)")
@@ -329,70 +398,100 @@ class FixturesTab(QWidget):
             ("Iris", "iris"), ("Iris 100% DMX", "iris_100_dmx"),
             ("Focus coarse", "focus"), ("Focus fine", "focus_fine"),
         ):
-            form.addRow(label, bind_int(QLineEdit(), fixture_type, attr, lo=0, hi=512))
+            add(form, bind_int(QLineEdit(), fixture_type, attr, lo=0, hi=512), label)
         self.editor_layout.addWidget(channels)
 
         direction_box = QGroupBox("Beam control direction")
         form = QFormLayout(direction_box)
-        form.addRow(bind_checkbox(QCheckBox("Reverse zoom"), fixture_type, "zoom_reverse"))
-        form.addRow(bind_checkbox(QCheckBox("Reverse iris"), fixture_type, "iris_reverse"))
-        form.addRow(bind_checkbox(QCheckBox("Reverse focus"), fixture_type, "focus_reverse"))
+        add(form, bind_checkbox(QCheckBox("Reverse zoom"), fixture_type, "zoom_reverse"))
+        add(form, bind_checkbox(QCheckBox("Reverse iris"), fixture_type, "iris_reverse"))
+        add(form, bind_checkbox(QCheckBox("Reverse focus"), fixture_type, "focus_reverse"))
         self.editor_layout.addWidget(direction_box)
 
         beam_model = QGroupBox("Auto zoom beam model")
         form = QFormLayout(beam_model)
-        form.addRow("Beam angle at zoom 0%", bind_float(QLineEdit(), fixture_type, "zoom_angle_at_0", lo=0))
-        form.addRow("Beam angle at zoom 100%", bind_float(QLineEdit(), fixture_type, "zoom_angle_at_100", lo=0))
-        form.addRow("Iris physical at 0%", bind_float(QLineEdit(), fixture_type, "iris_physical_at_0", lo=0, hi=1))
-        form.addRow("Iris physical at 100%", bind_float(QLineEdit(), fixture_type, "iris_physical_at_100", lo=0, hi=1))
+        add(form, bind_float(QLineEdit(), fixture_type, "zoom_angle_at_0", lo=0), "Beam angle at zoom 0%")
+        add(form, bind_float(QLineEdit(), fixture_type, "zoom_angle_at_100", lo=0), "Beam angle at zoom 100%")
+        add(form, bind_float(QLineEdit(), fixture_type, "iris_physical_at_0", lo=0, hi=1), "Iris physical at 0%")
+        add(form, bind_float(QLineEdit(), fixture_type, "iris_physical_at_100", lo=0, hi=1), "Iris physical at 100%")
         self.editor_layout.addWidget(beam_model)
 
         self.editor_layout.addStretch(1)
+
+    def _on_convert_to_custom(self, fixture_type):
+        try:
+            modes = list_gdtf_modes(fixture_type.gdtf_data)
+        except Exception as exc:
+            QMessageBox.critical(self, "FART", str(exc))
+            return
+        mode = modes[0]
+        if len(modes) > 1:
+            mode, ok = QInputDialog.getItem(self, "FART", "Bake in values from which DMX mode?", modes, 0, False)
+            if not ok:
+                return
+        try:
+            mapping, _modes, selected_mode = import_gdtf_channel_mapping(fixture_type.gdtf_data, 1, mode)
+        except Exception as exc:
+            QMessageBox.critical(self, "FART", str(exc))
+            return
+        types = self.main_window.settings.fixture_types
+        copy = FixtureType(id=uuid.uuid4().hex, name=f"{fixture_type.name} (custom copy)")
+        for field, value in mapping.items():
+            if hasattr(copy, field):
+                setattr(copy, field, value)
+        types.append(copy)
+        self.selected_type_index = len(types) - 1
+        self._refresh_type_list()
+        QMessageBox.information(
+            self, "FART",
+            f"Created an editable copy of '{fixture_type.name}' using mode '{selected_mode}'. "
+            "The original GDTF-backed type is unchanged.")
 
     def _refresh_type_and_fixture_lists(self):
         self._refresh_type_list()
         self._refresh_list()
 
-    def _add_type_from_mapping(self, name, mapping, message):
+    def _add_gdtf_type(self, name, gdtf_data, origin, share_rid=0):
         """Both GDTF import paths land here: each always creates a brand
         new Fixture Type rather than overwriting whatever happened to be
         selected in the list -- picking an existing type to overwrite by
-        accident is an easy, hard-to-notice mistake; a fresh type is not."""
+        accident is an easy, hard-to-notice mistake; a fresh type is not.
+
+        No mode is picked and no channels are extracted here -- the whole
+        file is stored as-is (gdtf_data) and every mode it declares is
+        derived on demand (see engine.effective_fixture_type), so nothing
+        about the fixture is ever lost to a mode choice made at import
+        time. Which mode a given patched fixture actually runs is chosen
+        later, on that fixture's own instance editor.
+        """
         types = self.main_window.settings.fixture_types
-        fixture_type = FixtureType(id=uuid.uuid4().hex, name=name or f"Fixture Type {len(types) + 1}")
-        for field, value in mapping.items():
-            if hasattr(fixture_type, field):
-                setattr(fixture_type, field, value)
+        modes = list_gdtf_modes(gdtf_data)
+        fixture_type = FixtureType(
+            id=uuid.uuid4().hex, name=name or f"Fixture Type {len(types) + 1}",
+            gdtf_data=gdtf_data, gdtf_origin=origin, gdtf_share_rid=share_rid, gdtf_source_label=name,
+        )
         types.append(fixture_type)
         self.selected_type_index = len(types) - 1
         self._refresh_type_list()
-        found = ", ".join(f"{k}={v}" for k, v in mapping.items())
-        QMessageBox.information(self, "FART", f"{message}\n\nCheck these against the fixture manual.\n\n{found}")
+        QMessageBox.information(
+            self, "FART",
+            f"Added '{fixture_type.name}' with {len(modes)} DMX mode(s): {', '.join(modes)}.\n\n"
+            "Pick which mode each patched fixture using this type should run on that fixture's own editor.")
 
     def _on_import_gdtf_clicked(self):
         path, _filter = QFileDialog.getOpenFileName(self, "Select GDTF fixture file", "", "GDTF fixture (*.gdtf);;All files (*)")
         if not path:
             return
         try:
-            modes = list_gdtf_modes(path)
-            mode = modes[0]
-            if len(modes) > 1:
-                mode, ok = QInputDialog.getItem(self, "FART", "Select the GDTF DMX mode to import:", modes, 0, False)
-                if not ok:
-                    return
-            # start_address is always 1 here: a FixtureType's channel fields
-            # are offsets within its own footprint, not tied to where any
-            # particular instance is patched.
-            mapping, _modes, selected_mode = import_gdtf_channel_mapping(path, 1, mode)
+            data = Path(path).read_bytes()
+            list_gdtf_modes(data)  # fail fast on a corrupt/unreadable file
         except Exception as exc:
             QMessageBox.critical(self, "FART", str(exc))
             return
-        self._add_type_from_mapping(Path(path).stem, mapping, f"Imported GDTF channel mapping (mode: {selected_mode}).")
+        self._add_gdtf_type(Path(path).stem, data, origin="file")
 
     def _on_browse_gdtf_share_clicked(self):
         dialog = GDTFShareBrowseDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        self._add_type_from_mapping(
-            dialog.result_label, dialog.result_mapping,
-            f"Imported {dialog.result_label} from GDTF Share (mode: {dialog.result_mode_name}).")
+        self._add_gdtf_type(dialog.result_label, dialog.result_data, origin="share", share_rid=dialog.result_share_rid)

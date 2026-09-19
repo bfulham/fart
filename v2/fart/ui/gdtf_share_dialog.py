@@ -11,17 +11,15 @@ session has expired.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QComboBox, QFormLayout, QHBoxLayout, QLabel,
+    QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout,
 )
 
-from ..gdtf import import_gdtf_channel_mapping
+from ..gdtf import list_gdtf_modes
 from ..gdtf_share import (
     GDTFShareClient, GDTFShareError, get_remembered_username, keychain_available,
     load_stored_password, remember_username, store_password,
@@ -112,15 +110,22 @@ class GDTFShareLoginDialog(QDialog):
 
 
 class GDTFShareBrowseDialog(QDialog):
+    """Picks a fixture and downloads it, in full -- no mode is chosen here.
+    A GDTF-backed FixtureType stores every mode the file declares; which
+    one a given patched fixture actually runs is chosen later, on that
+    fixture's own instance editor (FixtureConfig.gdtf_mode), since two
+    fixtures sharing one type can run different modes.
+    """
+
     def __init__(self, parent=None, client=None):
         super().__init__(parent)
         self.setWindowTitle("Browse GDTF Share")
         self.resize(520, 480)
         self.client = client or GDTFShareClient()
         self.catalog = []
-        self.result_mapping = None
-        self.result_mode_name = None
+        self.result_data = None
         self.result_label = None
+        self.result_share_rid = None
 
         layout = QVBoxLayout(self)
 
@@ -143,11 +148,9 @@ class GDTFShareBrowseDialog(QDialog):
         self.results_list.currentRowChanged.connect(self._on_selection_changed)
         layout.addWidget(self.results_list)
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("DMX mode"))
-        self.mode_combo = QComboBox()
-        mode_row.addWidget(self.mode_combo, 1)
-        layout.addLayout(mode_row)
+        self.modes_label = QLabel("")
+        self.modes_label.setWordWrap(True)
+        layout.addWidget(self.modes_label)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -231,23 +234,22 @@ class GDTFShareBrowseDialog(QDialog):
             self.results_list.addItem(item)
 
     def _on_selection_changed(self, row):
-        self.mode_combo.clear()
-        self.import_button.setEnabled(False)
+        self.import_button.setEnabled(0 <= row < self.results_list.count())
         if not 0 <= row < self.results_list.count():
+            self.modes_label.setText("")
             return
         entry = self.results_list.item(row).data(Qt.ItemDataRole.UserRole)
+        names = []
         for mode in entry.get("modes") or []:
             footprint = mode.get("footprint")
-            text = mode["name"] if footprint is None else f"{mode['name']} ({footprint}ch)"
-            self.mode_combo.addItem(text, mode["name"])
-        self.import_button.setEnabled(self.mode_combo.count() > 0)
+            names.append(mode["name"] if footprint is None else f"{mode['name']} ({footprint}ch)")
+        self.modes_label.setText("Modes: " + ", ".join(names) if names else "")
 
     def _on_import(self):
         row = self.results_list.currentRow()
         if not 0 <= row < self.results_list.count():
             return
         entry = self.results_list.item(row).data(Qt.ItemDataRole.UserRole)
-        mode_name = self.mode_combo.currentData()
         if not self._ensure_login():
             return
         self.status_label.setText("Downloading...")
@@ -257,23 +259,19 @@ class GDTFShareBrowseDialog(QDialog):
             self.status_label.setText("")
             QMessageBox.critical(self, "FART", str(exc))
             return
-        fd, temp_path = tempfile.mkstemp(suffix=".gdtf")
-        os.close(fd)
         try:
-            with open(temp_path, "wb") as f:
-                f.write(data)
-            mapping, _modes, selected_mode = import_gdtf_channel_mapping(temp_path, 1, mode_name)
+            # Fail fast on a corrupt/unreadable file rather than silently
+            # storing bytes nothing can ever parse -- the file itself is
+            # kept whole either way (see gdtf_share_dialog module docstring
+            # and fixtures_tab._add_gdtf_type: no per-mode extraction
+            # happens at import time, only this validation pass).
+            list_gdtf_modes(data)
         except Exception as exc:
             self.status_label.setText("")
             QMessageBox.critical(self, "FART", f"Could not import that fixture: {exc}")
             return
-        finally:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-        self.result_mapping = mapping
-        self.result_mode_name = selected_mode
+        self.result_data = data
         self.result_label = f"{entry['manufacturer']} {entry['fixture']}"
+        self.result_share_rid = entry["rid"]
         self.accept()
 

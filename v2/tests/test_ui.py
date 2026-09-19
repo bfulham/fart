@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -24,10 +25,32 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from fart.config import FixtureType
 from fart.ui.calibration_wizard import DEFAULT_TARGETS, CalibrationWizard
 from fart.ui.main_window import MainWindow
 
 _app = QApplication.instance() or QApplication(sys.argv)
+
+
+def make_test_gdtf_bytes(mode_name="Standard 16ch"):
+    """A minimal but real, parseable .gdtf file's bytes -- one dimmer-only
+    mode -- for tests exercising the GDTF import paths without a real
+    fixture file or network access."""
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
+        f'    <DMXMode Name="{mode_name}"><DMXChannels>\n'
+        '        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer">'
+        '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
+        '</LogicalChannel></DMXChannel>\n    </DMXChannels></DMXMode>\n'
+        '  </DMXModes>\n</FixtureType>\n'
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".gdtf", delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w") as zf:
+        zf.writestr("description.xml", xml)
+    data = Path(tmp.name).read_bytes()
+    os.unlink(tmp.name)
+    return data
 
 
 def multicast_sendto(sock, data, addr):
@@ -206,15 +229,16 @@ class FixturesTabTests(WindowTestCase):
         existing_type = self.window.settings.fixture_types[tab.selected_type_index]
         existing_snapshot = asdict(existing_type)
         before_count = len(self.window.settings.fixture_types)
+        gdtf_bytes = make_test_gdtf_bytes()
 
         class _Code:
             Accepted = 1
 
         class FakeDialog:
             DialogCode = _Code
-            result_mapping = {"dimmer": 3, "pan_coarse": 1, "footprint": 16}
-            result_mode_name = "Standard 16ch"
+            result_data = gdtf_bytes
             result_label = "Robe MegaPointe"
+            result_share_rid = 2294
 
             def __init__(self, parent=None):
                 pass
@@ -231,9 +255,9 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(len(self.window.settings.fixture_types), before_count + 1)
         new_type = self.window.settings.fixture_types[-1]
         self.assertEqual(new_type.name, "Robe MegaPointe")
-        self.assertEqual(new_type.dimmer, 3)
-        self.assertEqual(new_type.pan_coarse, 1)
-        self.assertEqual(new_type.footprint, 16)
+        self.assertEqual(new_type.gdtf_data, gdtf_bytes, "the whole file must be stored, not an extracted mapping")
+        self.assertEqual(new_type.gdtf_origin, "share")
+        self.assertEqual(new_type.gdtf_share_rid, 2294)
         self.assertEqual(tab.selected_type_index, len(self.window.settings.fixture_types) - 1)
 
     def test_gdtf_buttons_live_under_the_type_list_not_the_type_editor(self):
@@ -249,21 +273,10 @@ class FixturesTabTests(WindowTestCase):
         self.assertIn("Browse GDTF Share…", top_level_buttons)
 
     def test_import_from_gdtf_file_creates_a_new_type_rather_than_editing_the_selected_one(self):
-        import tempfile
-        import zipfile
-
-        gdtf_xml = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n<FixtureType>\n  <DMXModes>\n'
-            '    <DMXMode Name="Basic">\n      <DMXChannels>\n'
-            '        <DMXChannel Offset="1"><LogicalChannel Attribute="Dimmer">'
-            '<ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1" DMXTo="255/1" />'
-            '</LogicalChannel></DMXChannel>\n      </DMXChannels>\n    </DMXMode>\n'
-            '  </DMXModes>\n</FixtureType>\n'
-        )
+        gdtf_bytes = make_test_gdtf_bytes()
         tmp = tempfile.NamedTemporaryFile(suffix=".gdtf", delete=False)
+        tmp.write(gdtf_bytes)
         tmp.close()
-        with zipfile.ZipFile(tmp.name, "w") as zf:
-            zf.writestr("description.xml", gdtf_xml)
 
         tab = self.window.fixtures_tab
         existing_type = self.window.settings.fixture_types[tab.selected_type_index]
@@ -279,8 +292,73 @@ class FixturesTabTests(WindowTestCase):
         self.assertEqual(len(self.window.settings.fixture_types), before_count + 1)
         new_type = self.window.settings.fixture_types[-1]
         self.assertEqual(new_type.name, Path(tmp.name).stem)
-        self.assertEqual(new_type.dimmer, 1)
+        self.assertEqual(new_type.gdtf_data, gdtf_bytes, "the whole file must be stored, not an extracted mapping")
+        self.assertEqual(new_type.gdtf_origin, "file")
         os.unlink(tmp.name)
+
+    def test_gdtf_backed_type_editor_is_read_only_except_the_name(self):
+        from PySide6.QtWidgets import QLineEdit
+        tab = self.window.fixtures_tab
+        types = self.window.settings.fixture_types
+        types.append(FixtureType(id="g", name="GDTF Type", gdtf_data=make_test_gdtf_bytes(), dimmer=5))
+        tab._load_type(len(types) - 1)
+
+        line_edits = tab.editor_container.findChildren(QLineEdit)
+        name_edit = next(e for e in line_edits if e.text() == "GDTF Type")
+        self.assertTrue(name_edit.isEnabled(), "the display name must stay editable")
+        other_edits = [e for e in line_edits if e is not name_edit]
+        self.assertTrue(other_edits, "there should be other fields present (shown, just disabled)")
+        self.assertTrue(all(not e.isEnabled() for e in other_edits),
+                         "every non-name field must be disabled for a GDTF-backed type")
+
+    def test_convert_to_custom_copy_bakes_in_values_and_leaves_the_original_untouched(self):
+        tab = self.window.fixtures_tab
+        types = self.window.settings.fixture_types
+        gdtf_type = FixtureType(id="g", name="GDTF Type", gdtf_data=make_test_gdtf_bytes())
+        types.append(gdtf_type)
+        before_count = len(types)
+
+        with unittest.mock.patch("fart.ui.fixtures_tab.QMessageBox.information"):
+            tab._on_convert_to_custom(gdtf_type)
+
+        self.assertEqual(gdtf_type.gdtf_data, make_test_gdtf_bytes(), "the original GDTF-backed type is unchanged")
+        self.assertEqual(len(types), before_count + 1)
+        copy = types[-1]
+        self.assertEqual(copy.gdtf_data, b"", "the copy is a plain custom type, not GDTF-backed")
+        self.assertEqual(copy.dimmer, 1, "values from the mode must be baked in")
+        self.assertIn("custom copy", copy.name)
+
+    def test_fixture_editor_shows_mode_dropdown_only_for_a_gdtf_backed_type(self):
+        from PySide6.QtWidgets import QComboBox, QGroupBox
+        tab = self.window.fixtures_tab
+        types = self.window.settings.fixture_types
+        custom_type = types[0]
+        gdtf_type = FixtureType(id="g", name="GDTF Type", gdtf_data=make_test_gdtf_bytes("Mode X"))
+        types.append(gdtf_type)
+        fixture = self.window.settings.fixtures[0]
+        fixture.fixture_type_id = custom_type.id
+        tab._load_fixture(0)
+        self.assertNotIn("GDTF DMX mode", [g.title() for g in tab.editor_container.findChildren(QGroupBox)])
+
+        fixture.fixture_type_id = gdtf_type.id
+        tab._load_fixture(0)
+        group_titles = [g.title() for g in tab.editor_container.findChildren(QGroupBox)]
+        self.assertIn("GDTF DMX mode", group_titles)
+        combo = next(c for c in tab.editor_container.findChildren(QComboBox) if c.itemText(0) == "Mode X")
+        self.assertEqual(combo.currentText(), "Mode X")
+        self.assertEqual(fixture.gdtf_mode, "Mode X", "an unset mode must default to the first available one")
+
+    def test_changing_fixture_type_via_combo_reloads_the_mode_dropdown(self):
+        from PySide6.QtWidgets import QComboBox, QGroupBox
+        tab = self.window.fixtures_tab
+        types = self.window.settings.fixture_types
+        gdtf_type = FixtureType(id="g", name="GDTF Type", gdtf_data=make_test_gdtf_bytes())
+        types.append(gdtf_type)
+        tab._load_fixture(0)
+        type_combo = tab.editor_container.findChildren(QComboBox)[0]
+        type_combo.setCurrentIndex(type_combo.findData("g"))
+        self.assertEqual(self.window.settings.fixtures[0].fixture_type_id, "g")
+        self.assertIn("GDTF DMX mode", [g.title() for g in tab.editor_container.findChildren(QGroupBox)])
 
 
 class DMXInTabTests(WindowTestCase):

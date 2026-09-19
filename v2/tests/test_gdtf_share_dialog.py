@@ -174,15 +174,15 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
             self.assertEqual(dialog.results_list.count(), 1)
             self.assertIn("Martin", dialog.results_list.item(0).text())
 
-    def test_selecting_a_result_populates_its_modes(self):
+    def test_selecting_a_result_shows_its_modes_and_enables_import(self):
         with _isolated_paths():
             gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             dialog = GDTFShareBrowseDialog(client=FakeClient())
             dialog.results_list.setCurrentRow(0)
-            self.assertEqual(dialog.mode_combo.count(), 1)
+            self.assertIn("Standard 16ch", dialog.modes_label.text())
             self.assertTrue(dialog.import_button.isEnabled())
 
-    def test_import_downloads_and_applies_channel_mapping_then_accepts(self):
+    def test_import_downloads_the_whole_file_with_no_mode_chosen_and_accepts(self):
         with _isolated_paths():
             gdtf_share_dialog.CACHE_PATH.write_text(json.dumps(NORMALIZED_CATALOG))
             client = FakeClient()
@@ -193,9 +193,10 @@ class GDTFShareBrowseDialogTests(unittest.TestCase):
                 dialog._on_import()
             accept.assert_called_once()
             self.assertEqual(client.download_calls, [1])
-            self.assertIn("dimmer", dialog.result_mapping)
-            self.assertEqual(dialog.result_mode_name, "Standard 16ch")
+            self.assertEqual(dialog.result_data, client._download_bytes,
+                              "the whole file must be kept, not a mapping extracted from one mode")
             self.assertEqual(dialog.result_label, "Robe MegaPointe")
+            self.assertEqual(dialog.result_share_rid, 1)
 
     def test_cancelling_login_leaves_list_empty_and_does_not_raise(self):
         with _isolated_paths(), \
