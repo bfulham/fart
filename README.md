@@ -5,6 +5,7 @@
 [![Build Windows and macOS](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5F8279CAL)
 
 FART is a GUI application (Windows and macOS) that receives live marker positions from OpenFollow over PosiStageNet (PSN), calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX to aim them. It's meant to sit in the signal path for a lighting console that doesn't do 3D position tracking natively — the console still owns the show; FART owns the aiming math for whichever fixtures are following a tracked performer. FART is developed primarily on Windows; the macOS build is newer and less battle-tested.
 
@@ -263,6 +264,8 @@ The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/w
 ## Contributing and support
 
 Contributions are welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)** for development setup and pull request expectations. Bugs and feature requests go through [GitHub Issues](https://github.com/bfulham/fart/issues); if you believe you've found a safety-relevant issue (unexpected movement or intensity), see **[SECURITY.md](SECURITY.md)** first.
+
+If FART's been useful to you, you can support development here: [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5F8279CAL)
 
 ## Licence
 
