@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, APP_NAME, "The output loop stopped unexpectedly. Check the log.")
 
     def start(self):
+        self.operator_tab.reset_dimmer_fader()
         try:
             self.runner.start(self.settings)
         except Exception as exc:

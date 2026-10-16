@@ -7,8 +7,8 @@ calling run_cycle() directly.
 test_runner_integration.py already proves plain tracking (PSN -> DMX out)
 end to end. This file proves the console-relay path: auto-mode passthrough
 of dimmer/beam channels via a console shadow patch, manual-mode full
-passthrough, fader sourced from DMX in, and the safety fallbacks (tracking
-loss, console loss, unarmed) -- and that DMX In and DMX Out can live on
+passthrough, the Dimmer/Beam DMX-in modes and the Use DMX in switch, and the
+safety fallbacks (tracking loss, console loss, dark fader) -- and that DMX In and DMX Out can live on
 completely independent universes/addresses (the whole point of the
 fixture-type/patch redesign), not just different protocols.
 
@@ -235,15 +235,16 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
         mode_frame[0] = 200  # mode channel (1 on console_universe): >=128 => auto
         mode_frame[1] = 0    # marker channel (2): 0 => use fixture default (marker 1)
         shadow_frame = bytearray(512)
-        shadow_frame[4] = 180  # dimmer (offset 5): irrelevant -- FART always overwrites this in auto mode
+        shadow_frame[4] = 180  # dimmer (offset 5): passed through in DMX dimmer mode
         shadow_frame[5] = 111  # zoom (offset 6)
         shadow_frame[6] = 222  # iris (offset 7)
         shadow_frame[7] = 77   # focus (offset 8)
 
+        settings.dimmer_mode = "dmx_in"
+        settings.beam_mode = "dmx"
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
-        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode, never console-passed-through
+        # Fader stays at 0: in DMX dimmer mode it must have no say.
         try:
             resolved = resolve_fixture(fixture, fixture_type)
             _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
@@ -262,7 +263,7 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
             pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1)
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
-            self.assertGreater(frame[4], 0, "dimmer is always FART-computed in auto mode (armed, fader > 0), never console-passed-through")
+            self.assertEqual(frame[4], 180, "DMX dimmer mode passes the console's dimmer through in auto mode, whatever the fader says")
             self.assertEqual(frame[5], 111, "auto mode should pass the console's live zoom straight through from the shadow patch")
             self.assertEqual(frame[6], 222, "auto mode should pass the console's live iris straight through from the shadow patch")
             self.assertEqual(frame[7], 77, "auto mode should pass the console's live focus straight through from the shadow patch")
@@ -293,8 +294,7 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
-        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode, never console-passed-through
+        runner.fader.update(1.0)  # default Manual dimmer mode: the fader drives the dimmer
         try:
             resolved = resolve_fixture(fixture, fixture_type)
             _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
@@ -313,7 +313,7 @@ class ConsoleRelayAutoModeTests(unittest.TestCase):
             pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1)
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
-            self.assertGreater(frame[4], 0, "dimmer is always FART-computed in auto mode (armed, fader > 0), never console-passed-through")
+            self.assertEqual(frame[4], 255, "Manual dimmer mode: the fader at 100% drives the dimmer, not the console's 90")
         finally:
             runner.stop()
             sniffer.close()
@@ -348,7 +348,6 @@ class ConsoleRelayManualModeTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
         try:
             frame = pump_until(
                 [lambda: psn.send(1, 5.0, 0.0, 4.0),
@@ -367,45 +366,58 @@ class ConsoleRelayManualModeTests(unittest.TestCase):
             console.close()
 
 
-class FaderFromDMXInTests(unittest.TestCase):
-    """fader.source == "dmx_in": the operator's manual fader is replaced by
-    a live channel value read off the active DMX-in bus (no console-relay
-    fixtures involved at all -- this is the whole-rig master intensity
-    fader, separate from per-fixture console relay)."""
+class UseDMXInSwitchTests(unittest.TestCase):
+    """Use DMX in off must behave exactly as if the fixture's DMX-in
+    addresses were 0 -- even with the console sending full-passthrough
+    mode, a shadow feed, and DMX dimmer/beam modes selected."""
 
-    def test_artnet_in_channel_drives_output_intensity(self):
-        fixture_type = FixtureType(id="t")
-        fixture = FixtureConfig(marker_id=1, fixture_type_id="t", output_universe=1, x=0.0, y=-8.0, z=5.0)
+    def test_unticked_is_fart_only_control(self):
+        fixture_type, fixture = relay_fixture()
         settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.24", 56613
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "artnet"
-        settings.fader.source = "dmx_in"
-        settings.fader.channel = 20
         settings.dmx_out.active = "sacn"
         settings.dmx_out.sacn.universes = [1]
+        settings.use_dmx_in = False
+        settings.dimmer_mode = "dmx_in"
+        settings.beam_mode = "dmx"
 
         sniffer = SACNOutSniffer(1)
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleArtNetSender()
-        # fader.channel reads from dmx_in.active's *own configured universe*
-        # (settings.dmx_in.artnet.universe) via ExternalInputBus, independent
-        # of any fixture's output_universe or console/shadow patches.
-        fader_universe = settings.dmx_in.artnet.universe
-        console_frame = bytearray(512)
-        console_frame[19] = 128  # channel 20 -> fader ~= 128/255 = 0.502
+        marker_xyz = (5.0, 0.0, 4.0)
+        mode_frame = bytearray(512)
+        mode_frame[0] = 10  # manual (full passthrough) -- must be ignored
+        shadow_frame = bytearray(512)
+        shadow_frame[0] = 111
+        shadow_frame[1] = 222
+        shadow_frame[4] = 200
+        shadow_frame[5] = 33
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
+        runner.fader.update(0.5)
         try:
+            resolved = resolve_fixture(fixture, fixture_type)
+            _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
+
+            def converged(frame):
+                pan, tilt = pan_tilt_from_frame(frame, resolved)
+                return abs(pan - expected_pan) <= 0.1 and abs(tilt - expected_tilt) <= 0.1 and frame[4] > 0
+
             frame = pump_until(
-                [lambda: psn.send(1, 5.0, 0.0, 4.0), lambda: console.send(fader_universe, console_frame)],
-                sniffer, 1, lambda f: f[4] not in (0, 255),
+                [lambda: psn.send(1, *marker_xyz),
+                 lambda: console.send(10, mode_frame),
+                 lambda: console.send(5, shadow_frame)],
+                sniffer, 1, converged,
             )
             self.assertIsNotNone(frame, "never received a decoded sACN out frame for universe 1")
-            self.assertAlmostEqual(frame[4] / 255.0, 128 / 255.0, delta=0.02,
-                                    msg="output dimmer should track the live DMX-in fader channel, not be full or zero")
+            pan, tilt = pan_tilt_from_frame(frame, resolved)
+            self.assertAlmostEqual(pan, expected_pan, delta=0.1, msg="tracking must drive pan, not the console")
+            self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
+            self.assertAlmostEqual(frame[4] / 255.0, 0.5, delta=0.02, msg="dimmer comes from the fader, not the console's 200")
+            self.assertNotEqual(frame[5], 33, "zoom comes from the slider, not the shadow feed")
         finally:
             runner.stop()
             sniffer.close()
@@ -438,12 +450,11 @@ class SafetyFallbackTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
-        runner.fader.update(1.0)  # manual fader source: FaderState defaults to 0.0 (dark)
+        runner.fader.update(1.0)  # Start always resets the fader to 0 (dark)
         try:
             frame = pump_until([lambda: psn.send(1, 5.0, 0.0, 4.0)], sniffer, 1, lambda f: f[4] > 0)
             self.assertIsNotNone(frame)
-            self.assertGreater(frame[4], 0, "dimmer should be lit while tracking is live and armed")
+            self.assertGreater(frame[4], 0, "dimmer should be lit while tracking is live and the fader is up")
 
             # Stop sending PSN entirely and wait past timeout_s: tracking
             # goes stale, and the default on_tracking_loss ("Blackout")
@@ -456,7 +467,7 @@ class SafetyFallbackTests(unittest.TestCase):
             sniffer.close()
             psn.close()
 
-    def test_unarmed_blacks_out_dimmer_but_keeps_tracking(self):
+    def test_dark_fader_keeps_dimmer_at_zero_but_keeps_tracking(self):
         fixture_type, fixture = self._fixture()
         settings = Settings(fixture_types=[fixture_type], fixtures=[fixture])
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.26", 56615
@@ -469,8 +480,7 @@ class SafetyFallbackTests(unittest.TestCase):
         marker_xyz = (5.0, 0.0, 4.0)
 
         runner = Runner()
-        runner.start(settings)
-        runner.armed = False  # never armed
+        runner.start(settings)  # fader starts at 0 and is never raised
         try:
             resolved = resolve_fixture(fixture, fixture_type)
             _b, _e, expected_pan, expected_tilt, _d = calculate_aim(resolved, *marker_xyz)
@@ -483,9 +493,9 @@ class SafetyFallbackTests(unittest.TestCase):
             self.assertIsNotNone(frame)
             pan, tilt = pan_tilt_from_frame(frame, resolved)
             self.assertAlmostEqual(pan, expected_pan, delta=0.1,
-                                    msg="unarmed must still compute pan/tilt so the light is pre-aimed")
+                                    msg="a dark fader must still compute pan/tilt so the light is pre-aimed")
             self.assertAlmostEqual(tilt, expected_tilt, delta=0.1)
-            self.assertEqual(frame[4], 0, "unarmed must force the dimmer to 0 regardless of tracking")
+            self.assertEqual(frame[4], 0, "a fader at 0 means dimmer 0 regardless of tracking")
         finally:
             runner.stop()
             sniffer.close()
@@ -520,7 +530,6 @@ class SafetyFallbackTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
         try:
             frame = pump_until(
                 [lambda: psn.send(1, *marker_xyz),
@@ -578,7 +587,7 @@ class SACNInMultiUniverseTests(unittest.TestCase):
         settings.psn_in.multicast, settings.psn_in.port = "236.10.10.28", 56617
         settings.psn_in.timeout_s = 1.0
         settings.dmx_in.active = "sacn"
-        settings.dmx_in.sacn.universe = 1  # only referenced directly for the master fader
+        settings.dmx_in.sacn.universe = 1
         settings.dmx_out.active = "artnet"
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
 
@@ -586,12 +595,11 @@ class SACNInMultiUniverseTests(unittest.TestCase):
         psn = PSNSender(settings.psn_in.multicast, settings.psn_in.port)
         console = ConsoleSACNSender()
         auto_frame = bytearray(512)
-        auto_frame[9] = 200  # auto, non-stale -- lets the (forced by armed+fader) dimmer through
+        auto_frame[9] = 200  # auto, non-stale -- lets the fader-driven dimmer through
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
-        runner.fader.update(1.0)  # dimmer is always FART-computed in auto mode now, never console-passed-through
+        runner.fader.update(1.0)
         try:
             def senders():
                 psn.send(1, 5.0, 0.0, 4.0)

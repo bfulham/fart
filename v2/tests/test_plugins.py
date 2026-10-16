@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fart.bus import ExternalInputBus, TrackerBank
 from fart.config import ArtNetInConfig, ArtNetOutConfig, PSNInConfig, SACNInConfig, SACNOutConfig
 from fart.plugins._artnet import build_artnet_dmx, parse_artnet_dmx
-from fart.plugins._sacn import build_sacn_dmx, parse_sacn_dmx, sacn_multicast_group
+from fart.plugins._sacn import SourceSelector, build_sacn_dmx, parse_sacn_dmx, parse_sacn_packet, sacn_multicast_group
 from fart.plugins.artnet_in import ArtNetInPlugin
 from fart.plugins.artnet_out import ArtNetOutPlugin
 from fart.plugins.psn_in import PSNInPlugin, _chunks
@@ -88,6 +88,74 @@ class SACNWireTests(unittest.TestCase):
     def test_rejects_non_data_packets(self):
         junk = bytes(700)
         self.assertIsNone(parse_sacn_dmx(junk))
+
+
+class SACNPacketParsingTests(unittest.TestCase):
+    def test_parse_packet_exposes_source_priority_and_sequence(self):
+        cid = bytes(range(16))
+        packet = parse_sacn_packet(build_sacn_dmx(cid, "src", 77, 5, bytes([9] * 512), priority=150))
+        self.assertEqual(packet["cid"], cid)
+        self.assertEqual(packet["priority"], 150)
+        self.assertEqual(packet["sequence"], 77)
+        self.assertEqual(packet["universe"], 5)
+        self.assertFalse(packet["terminated"])
+
+    def test_non_zero_start_code_is_not_dmx_levels(self):
+        raw = bytearray(build_sacn_dmx(bytes(16), "src", 0, 1, bytes(512)))
+        raw[125] = 0xDD  # per-address-priority packet
+        self.assertIsNone(parse_sacn_packet(bytes(raw)))
+        self.assertIsNone(parse_sacn_dmx(bytes(raw)))
+
+    def test_terminated_option_is_reported(self):
+        raw = bytearray(build_sacn_dmx(bytes(16), "src", 0, 1, bytes(512)))
+        raw[112] = 0x40
+        self.assertTrue(parse_sacn_packet(bytes(raw))["terminated"])
+
+
+class SACNSourceSelectorTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100.0
+        self.sel = SourceSelector(clock=lambda: self.now)
+
+    def test_single_source_is_accepted(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertTrue(self.sel.accept(1, b"A", 100, 2))
+
+    def test_two_equal_priority_sources_do_not_alternate(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertFalse(self.sel.accept(1, b"B", 100, 1), "second source must not steal the universe")
+        self.assertTrue(self.sel.accept(1, b"A", 100, 2))
+        self.assertFalse(self.sel.accept(1, b"B", 100, 2))
+
+    def test_higher_priority_source_takes_over(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertTrue(self.sel.accept(1, b"B", 150, 1))
+        self.assertFalse(self.sel.accept(1, b"A", 100, 2))
+
+    def test_failover_after_the_locked_source_goes_silent(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertFalse(self.sel.accept(1, b"B", 100, 1))
+        self.now += 3.0  # past the 2.5 s network-data-loss timeout
+        self.assertTrue(self.sel.accept(1, b"B", 100, 2))
+
+    def test_stream_terminated_releases_the_universe_immediately(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertFalse(self.sel.accept(1, b"A", 100, 2, terminated=True))
+        self.assertTrue(self.sel.accept(1, b"B", 100, 1))
+
+    def test_duplicate_and_late_packets_are_dropped_but_wraparound_is_fine(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 10))
+        self.assertFalse(self.sel.accept(1, b"A", 100, 10), "duplicate")
+        self.assertFalse(self.sel.accept(1, b"A", 100, 5), "late (5 behind)")
+        self.assertTrue(self.sel.accept(1, b"A", 100, 11))
+        self.assertTrue(self.sel.accept(1, b"A", 100, 200))
+        self.assertTrue(self.sel.accept(1, b"A", 100, 255))
+        self.assertTrue(self.sel.accept(1, b"A", 100, 0), "sequence wraps 255 -> 0")
+        self.assertFalse(self.sel.accept(1, b"A", 100, 250), "17 behind after the wrap is still late")
+
+    def test_universes_are_independent(self):
+        self.assertTrue(self.sel.accept(1, b"A", 100, 1))
+        self.assertTrue(self.sel.accept(2, b"B", 100, 1))
 
 
 class PSNPluginLoopbackTests(unittest.TestCase):

@@ -187,13 +187,13 @@ def blank_frames_for_settings(settings):
 
 
 def dmx_in_is_needed(settings):
-    """Whether anything actually consumes DMX-in data this run. The control-
-    input plugin binds a port (6454 for Art-Net, a multicast group for
-    sACN), so it should only run when something needs it -- not
-    unconditionally just because a protocol is configured as 'active'.
+    """Whether any enabled fixture has a DMX-in patch (console mode/marker
+    channels or a shadow feed) to read. The control-input plugin binds a
+    port (6454 for Art-Net, a multicast group for sACN), so it only runs
+    when something could consume it. Deliberately independent of
+    settings.use_dmx_in: that tickbox is a live toggle, so the plugin keeps
+    running while it is unticked and data is simply ignored.
     """
-    if settings.fader.source == "dmx_in":
-        return True
     return any(f.enabled and (int(f.console_mode_channel) > 0 or int(f.shadow_universe) > 0)
                for f in settings.fixtures)
 
@@ -201,17 +201,12 @@ def dmx_in_is_needed(settings):
 def dmx_in_universes_needed(settings):
     """Every universe that actually needs to be readable from the active
     DMX-in source: each enabled fixture's console-relay universe (mode/
-    marker control) and shadow universe (full-footprint passthrough feed),
-    plus the DMX-in universe the master fader reads from when
-    fader.source == 'dmx_in'. These are independent per fixture and no
-    longer tied to output_universe at all.
+    marker control) and shadow universe (full-footprint passthrough feed).
+    These are independent per fixture and no longer tied to output_universe.
 
     Art-Net-in ignores this (it accepts every incoming universe for free,
     with no per-universe join needed), but sACN-in needs it to know which
-    multicast groups to join -- otherwise it can only ever receive the one
-    universe named on the DMX In tab, silently losing console relay for
-    any fixture on a different universe even though a real console is
-    genuinely sending it.
+    multicast groups to join.
     """
     universes = set()
     for f in settings.fixtures:
@@ -221,9 +216,6 @@ def dmx_in_universes_needed(settings):
             universes.add(int(f.console_universe))
         if int(f.shadow_universe) > 0:
             universes.add(int(f.shadow_universe))
-    if settings.fader.source == "dmx_in":
-        active = settings.dmx_in.active
-        universes.add(int(getattr(settings.dmx_in, active).universe))
     return universes
 
 
@@ -346,18 +338,22 @@ def copy_shadow_into_output(frame, shadow_frame, footprint, shadow_start_address
 
 
 def write_fixture_to_frame(frame, fixture: ResolvedFixture, pan, tilt, fader, blackout,
-                            zoom=0.5, iris=1.0, focus=0.5, beam_passthrough=False):
-    """Write one fixture's channels into a 512-byte DMX frame. Pan/tilt/
-    dimmer are always written here (FART always owns them once a fixture
-    reaches this function at all -- full passthrough, where FART writes
-    nothing, is handled one level up in run_cycle by skipping this call
-    entirely and relying on the shadow copy alone).
+                            zoom=0.5, iris=1.0, focus=0.5, beam_passthrough=False,
+                            dimmer_passthrough=False):
+    """Write one fixture's channels into a 512-byte DMX frame. Pan and tilt
+    are always written here (FART always owns them once a fixture reaches
+    this function at all -- full passthrough, where FART writes nothing, is
+    handled one level up in run_cycle by skipping this call entirely and
+    relying on the shadow copy alone).
 
-    beam_passthrough is for a fixture with a shadow feed and no active
-    auto-beam-size: zoom/iris/focus are left exactly as the shadow copy
-    already wrote them into `frame`, instead of being overwritten here,
-    *except* when a limit-blackout zoom/iris-to-100% safety override needs
-    that specific channel regardless.
+    dimmer_passthrough/beam_passthrough are for a fixture with a shadow
+    feed: dimmer/shutter (dimmer_passthrough) or zoom/iris/focus
+    (beam_passthrough) are left exactly as the shadow copy already wrote
+    them into `frame`, instead of being overwritten here, *except* when a
+    safety condition needs that specific channel regardless -- blackout (a
+    lost tracker/console, a marker change) or a limit blackout forces the
+    dimmer to 0, and the limit-blackout zoom/iris-to-100% overrides force
+    those channels.
     """
     plim = clamp(pan, fixture.pan_min, fixture.pan_max)
     tlim = clamp(tilt, fixture.tilt_min, fixture.tilt_max)
@@ -375,19 +371,20 @@ def write_fixture_to_frame(frame, fixture: ResolvedFixture, pan, tilt, fader, bl
     pc, pf = dmx16(pan_fraction)
     tc, tf = dmx16(tilt_fraction)
 
-    intensity = 0.0 if (blackout or limit_blackout) else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
-    dc, df = dmx16(intensity)
     values = [
         (fixture.pan_coarse, pc),
         (fixture.pan_fine, pf),
         (fixture.tilt_coarse, tc),
         (fixture.tilt_fine, tf),
-        (fixture.dimmer, dc),
     ]
-    if fixture.dimmer_fine:
-        values.append((fixture.dimmer_fine, df))
-    if fixture.shutter:
-        values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
+    if not (dimmer_passthrough and not blackout and not limit_blackout):
+        intensity = 0.0 if (blackout or limit_blackout) else clamp(fader * fixture.intensity_scale, 0.0, 1.0)
+        dc, df = dmx16(intensity)
+        values.append((fixture.dimmer, dc))
+        if fixture.dimmer_fine:
+            values.append((fixture.dimmer_fine, df))
+        if fixture.shutter:
+            values.append((fixture.shutter, 0 if blackout else fixture.shutter_open))
 
     def add_parameter(coarse_channel, fine_channel, value, reverse=False):
         if not coarse_channel:
@@ -442,18 +439,47 @@ class CycleState:
         self.marker_change_until = {}
 
 
-def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_value, armed, cycle_start, state: CycleState):
+def fixture_has_shadow(fixture: FixtureConfig) -> bool:
+    return int(fixture.shadow_universe) > 0
+
+
+def _source_label(wants_dmx: bool, has_feed: bool, use_dmx_in: bool) -> str:
+    """'dmx' | 'manual' | 'manual (no DMX feed)' | 'manual (DMX in off)' --
+    for the Operator tab's per-fixture source columns, so a fixture that
+    silently fell back to the faders (because it has nothing to pass
+    through) is visibly different from one that is genuinely on them."""
+    if not wants_dmx:
+        return "manual"
+    if not use_dmx_in:
+        return "manual (DMX in off)"
+    return "dmx" if has_feed else "manual (no DMX feed)"
+
+
+def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_value, cycle_start, state: CycleState):
     """One tracking/output cycle. Returns (frames: dict[int, bytearray], light_statuses: list[dict]).
 
     This is the direct, explicitly-parameterised replacement for the body of
     App.loop() in fart.py v1 -- same behaviour, but with every input passed
     in instead of read off `self`, so it can be called from a plain test
     with synthetic trackers/bus and no engine, sockets, or GUI involved.
+
+    Control model (see Settings): per fixture, the console's mode channel
+    picks full passthrough (FART writes nothing; the whole footprint comes
+    from the shadow feed) or auto (FART drives pan/tilt). In auto, dimmer
+    follows settings.dimmer_mode (the manual fader, or the shadow feed's own
+    dimmer) and beam follows settings.beam_mode (manual faders, auto beam
+    size, or the shadow feed's zoom/iris/focus). settings.use_dmx_in off
+    behaves as if every fixture's DMX-in addresses were 0.
     """
     smoothing = clamp(settings.psn_in.smoothing, 0.0, 0.95)
     alpha = 1.0 - smoothing
     timeout_s = settings.psn_in.timeout_s
+    dmx_timeout_s = settings.dmx_in.timeout_s
     lead_lag_s = settings.psn_in.lead_lag_ms / 1000.0
+    use_dmx_in = bool(settings.use_dmx_in)
+    dimmer_wants_dmx = settings.dimmer_mode == "dmx_in"
+    beam_wants_dmx = settings.beam_mode == "dmx"
+    beam_auto = settings.beam_mode == "auto_size"
 
     frames = blank_frames_for_settings(settings)
     light_statuses = []
@@ -466,9 +492,10 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         universe = int(fixture.output_universe)
         frame = frames.setdefault(universe, bytearray(512))
 
-        console_relay = int(fixture.console_mode_channel) > 0
+        console_relay = use_dmx_in and int(fixture.console_mode_channel) > 0
+        has_shadow = use_dmx_in and fixture_has_shadow(fixture)
         console_frame, console_ts = bus.get(fixture.console_universe) if console_relay else (None, 0.0)
-        console_stale = console_frame is None or (cycle_start - console_ts) > timeout_s
+        console_stale = console_frame is None or (cycle_start - console_ts) > dmx_timeout_s
         mode = resolve_console_mode(fixture, console_frame) if console_relay else "auto"
 
         # For the Operator tab's "DMX In Mode"/"DMX In Marker" columns: None
@@ -480,11 +507,21 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         dmx_marker = (resolve_live_marker_id(fixture, console_frame)
                       if console_relay and int(fixture.console_marker_channel) > 0 else None)
 
-        footprint = resolved.footprint
-        if fixture.shadow_universe:
-            shadow_frame, _ts = bus.get(fixture.shadow_universe)
-            copy_shadow_into_output(frame, shadow_frame, footprint,
+        shadow_stale = False
+        if has_shadow:
+            shadow_frame, shadow_ts = bus.get(fixture.shadow_universe)
+            shadow_stale = shadow_frame is None or (cycle_start - shadow_ts) > dmx_timeout_s
+            copy_shadow_into_output(frame, shadow_frame, resolved.footprint,
                                      fixture.shadow_start_address, fixture.output_start_address)
+
+        dimmer_dmx = dimmer_wants_dmx and has_shadow
+        beam_dmx = beam_wants_dmx and has_shadow
+        # DMX in counts as lost for this fixture if its mode channel went
+        # quiet, or if its dimmer is being passed through from a shadow
+        # feed that went quiet (a frozen console dimmer must not stay lit).
+        dmx_lost = (console_relay and console_stale) or (dimmer_dmx and shadow_stale)
+        dimmer_source = _source_label(dimmer_wants_dmx, has_shadow, use_dmx_in)
+        beam_source = "auto" if beam_auto else _source_label(beam_wants_dmx, has_shadow, use_dmx_in)
 
         if console_relay and mode == "manual" and not console_stale:
             # The shadow copy (if any) above already *is* the full manual
@@ -496,7 +533,8 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "marker_xyz": marker_xyz, "fixture_xyz": (fixture.x, fixture.y, fixture.z),
                 "error": "MANUAL (console)", "stale": False, "blackout": False,
                 "pan_limit": False, "tilt_limit": False,
-                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker, "dmx_lost": False,
+                "dimmer_source": "passthrough", "beam_source": "passthrough",
             })
             state.previous_mode[index] = "manual"
             continue
@@ -525,15 +563,9 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         state.smoothed[effective_marker_id] = (sx, sy, sz)
 
         tracking_lost_blackout = stale and fixture.on_tracking_loss != "Keep current intensity"
-        console_lost_blackout = console_relay and console_stale and fixture.on_console_loss != "Keep tracking, hold last dimmer"
+        console_lost_blackout = dmx_lost and fixture.on_console_loss != "Keep tracking, hold last dimmer"
         in_marker_change_window = cycle_start < state.marker_change_until.get(index, 0.0)
-        blackout = tracking_lost_blackout or console_lost_blackout or in_marker_change_window or not armed
-        # Beam (zoom/iris/focus) only passes through from the shadow copy
-        # when there's a shadow feed to pass through *from* -- a fixture
-        # with no shadow_universe always uses FART's own manual/master
-        # sliders, same as before shadow patches existed.
-        beam_passthrough = bool(fixture.shadow_universe) and not (
-            settings.zoom_mode == "Auto beam size" and fixture_has_zoom_model(resolved))
+        blackout = tracking_lost_blackout or console_lost_blackout or in_marker_change_window
 
         try:
             bearing, elevation, pan, tilt, distance = calculate_aim(resolved, sx, sy, sz, state.previous_pan.get(index))
@@ -541,13 +573,13 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
             zoom_out, iris_out = zoom_value, iris_value
             zoom_angle = None
             zoom_auto = iris_auto = False
-            if settings.zoom_mode == "Auto beam size":
+            if beam_auto:
                 zoom_out, iris_out, zoom_angle, zoom_auto, iris_auto = auto_beam_for_distance(
                     resolved, distance, settings.auto_beam_diameter_m, zoom_value, iris_value
                 )
             status = write_fixture_to_frame(
                 frame, resolved, pan, tilt, fader, blackout, zoom_out, iris_out, focus_value,
-                beam_passthrough=beam_passthrough,
+                beam_passthrough=beam_dmx, dimmer_passthrough=dimmer_dmx,
             )
             status.update({
                 "index": index, "name": fixture.name, "marker_id": effective_marker_id, "output_universe": fixture.output_universe,
@@ -555,7 +587,8 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "bearing": bearing, "elevation": elevation, "distance": distance,
                 "zoom_value": zoom_out, "iris_value": iris_out, "zoom_angle": zoom_angle, "zoom_auto": zoom_auto, "iris_auto": iris_auto,
                 "stale": stale, "blackout": blackout,
-                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker, "dmx_lost": dmx_lost,
+                "dimmer_source": dimmer_source, "beam_source": beam_source,
             })
             light_statuses.append(status)
         except ValueError as exc:
@@ -564,7 +597,8 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "marker_xyz": (sx, sy, sz), "fixture_xyz": (fixture.x, fixture.y, fixture.z),
                 "error": str(exc), "stale": stale, "blackout": True,
                 "pan_limit": False, "tilt_limit": False,
-                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker,
+                "dmx_mode": dmx_mode, "dmx_marker": dmx_marker, "dmx_lost": dmx_lost,
+                "dimmer_source": dimmer_source, "beam_source": beam_source,
             })
 
     return frames, light_statuses

@@ -63,3 +63,25 @@ class ExternalInputBusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExternalInputBusRateTests(unittest.TestCase):
+    def test_rate_and_age_for_a_slow_feed(self):
+        bus = ExternalInputBus()
+        now = __import__("time").monotonic()
+        bus.arrivals[3] = __import__("collections").deque([now - 6.0, now - 4.0, now - 2.0])
+        bus.frames[3] = (bytes(512), now - 2.0)
+        rate, age = bus.rates()[3]
+        self.assertAlmostEqual(rate, 0.5, delta=0.01)  # one packet every 2 s
+        self.assertAlmostEqual(age, 2.0, delta=0.1)
+
+    def test_single_packet_has_zero_rate(self):
+        bus = ExternalInputBus()
+        bus.update(1, bytes(512))
+        rate, age = bus.rates()[1]
+        self.assertEqual(rate, 0.0)
+        self.assertLess(age, 1.0)
+
+    def test_unseen_universe_is_absent(self):
+        self.assertNotIn(7, ExternalInputBus().rates())
+

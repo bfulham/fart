@@ -72,6 +72,10 @@ class SACNInConfig:
 @dataclass
 class DMXInConfig:
     active: str = "artnet"  # "artnet" | "sacn"
+    # How long a universe can go without a packet before the console feed
+    # counts as lost. Separate from PSN's tracking timeout: a console may
+    # legitimately send far slower (even under 1 fps) than a tracker does.
+    timeout_s: float = 3.0
     artnet: ArtNetInConfig = field(default_factory=ArtNetInConfig)
     sacn: SACNInConfig = field(default_factory=SACNInConfig)
 
@@ -98,12 +102,6 @@ class DMXOutConfig:
     artnet: ArtNetOutConfig = field(default_factory=ArtNetOutConfig)
     sacn: SACNOutConfig = field(default_factory=SACNOutConfig)
     open_dmx: OpenDMXOutConfig = field(default_factory=OpenDMXOutConfig)
-
-
-@dataclass
-class FaderConfig:
-    source: str = "manual"  # "manual" | "dmx_in"
-    channel: int = 1  # channel on whichever protocol dmx_in.active names
 
 
 @dataclass
@@ -232,17 +230,22 @@ class Settings:
     psn_in: PSNInConfig = field(default_factory=PSNInConfig)
     dmx_in: DMXInConfig = field(default_factory=DMXInConfig)
     dmx_out: DMXOutConfig = field(default_factory=DMXOutConfig)
-    fader: FaderConfig = field(default_factory=FaderConfig)
     refresh_hz: int = 30
     zoom_master: float = 0.5
     iris_master: float = 1.0
     focus_master: float = 0.5
-    zoom_mode: str = "Manual"  # "Manual" | "Auto beam size"
+    # Global control model (Operator tab). use_dmx_in off behaves exactly as
+    # if every fixture's DMX-in addresses were 0: FART-only control.
+    use_dmx_in: bool = True
+    dimmer_mode: str = "manual"  # "manual" (the fader) | "dmx_in" (pass through each fixture's own dimmer)
+    beam_mode: str = "manual"    # "manual" (faders) | "auto_size" | "dmx" (pass zoom/iris/focus through)
     auto_beam_diameter_m: float = 1.0
     fixture_types: list = field(default_factory=lambda: [FixtureType(id=DEFAULT_FIXTURE_TYPE_ID, name="Default Type")])
     fixtures: list = field(default_factory=lambda: [FixtureConfig()])
 
 
+DIMMER_MODES = ["manual", "dmx_in"]
+BEAM_MODES = ["manual", "auto_size", "dmx"]
 ON_TRACKING_LOSS_OPTIONS = ["Blackout", "Keep current intensity"]
 ON_CONSOLE_LOSS_OPTIONS = ["Blackout", "Keep tracking, force dimmer off", "Keep tracking, hold last dimmer"]
 
@@ -329,6 +332,10 @@ def _split_legacy_fixtures(fixtures_data) -> tuple[list, list]:
     return fixture_types, fixtures
 
 
+def _beam_mode_from_legacy(zoom_mode) -> str:
+    return "auto_size" if zoom_mode == "Auto beam size" else "manual"
+
+
 def migrate_v1(data: dict) -> Settings:
     """Map a v1 (flat) FART.json, or a pre-v3 v2 FART2.json (both used
     absolute per-fixture channel numbers with no fixture-type concept),
@@ -349,15 +356,8 @@ def migrate_v1(data: dict) -> Settings:
     settings.psn_in.lead_lag_ms = float(data.get("lead_lag_ms", settings.psn_in.lead_lag_ms))
 
     settings.dmx_in.artnet.universe = int(data.get("artnet_input_universe", 0))
-    fader_mode = data.get("fader_mode", "Manual")
-    if fader_mode == "Art-Net Input":
-        settings.fader.source = "dmx_in"
-        settings.fader.channel = int(data.get("artnet_input_channel", 1))
-        settings.dmx_in.active = "artnet"
-    else:
-        settings.fader.source = "manual"
-        settings.fader.channel = int(data.get("artnet_input_channel", 1))
-    settings.fader.channel = max(1, settings.fader.channel)
+    # v1's "Art-Net Input" master fader has no equivalent any more (dimmer
+    # is now Manual or per-fixture DMX in), so it falls back to Manual.
 
     output = data.get("output", "Open DMX")
     settings.dmx_out.artnet.target_ip = data.get("artnet_ip", settings.dmx_out.artnet.target_ip)
@@ -378,7 +378,7 @@ def migrate_v1(data: dict) -> Settings:
     settings.zoom_master = float(data.get("zoom_master", settings.zoom_master))
     settings.iris_master = float(data.get("iris_master", settings.iris_master))
     settings.focus_master = float(data.get("focus_master", settings.focus_master))
-    settings.zoom_mode = data.get("zoom_mode", settings.zoom_mode)
+    settings.beam_mode = _beam_mode_from_legacy(data.get("zoom_mode"))
     settings.auto_beam_diameter_m = float(data.get("auto_beam_diameter_m", settings.auto_beam_diameter_m))
 
     fixtures_data = data.get("fixtures")
@@ -399,6 +399,7 @@ def _settings_from_v3_dict(data: dict) -> Settings:
         psn_in=PSNInConfig(**{k: v for k, v in data.get("psn_in", {}).items() if k in PSNInConfig.__dataclass_fields__}),
         dmx_in=DMXInConfig(
             active=data.get("dmx_in", {}).get("active", "artnet"),
+            timeout_s=float(data.get("dmx_in", {}).get("timeout_s", 3.0)),
             artnet=ArtNetInConfig(**{k: v for k, v in data.get("dmx_in", {}).get("artnet", {}).items() if k in ArtNetInConfig.__dataclass_fields__}),
             sacn=SACNInConfig(**{k: v for k, v in data.get("dmx_in", {}).get("sacn", {}).items() if k in SACNInConfig.__dataclass_fields__}),
         ),
@@ -408,12 +409,14 @@ def _settings_from_v3_dict(data: dict) -> Settings:
             sacn=SACNOutConfig(**{k: v for k, v in data.get("dmx_out", {}).get("sacn", {}).items() if k in SACNOutConfig.__dataclass_fields__}),
             open_dmx=OpenDMXOutConfig(**{k: v for k, v in data.get("dmx_out", {}).get("open_dmx", {}).items() if k in OpenDMXOutConfig.__dataclass_fields__}),
         ),
-        fader=FaderConfig(**{k: v for k, v in data.get("fader", {}).items() if k in FaderConfig.__dataclass_fields__}),
         refresh_hz=int(data.get("refresh_hz", 30)),
         zoom_master=float(data.get("zoom_master", 0.5)),
         iris_master=float(data.get("iris_master", 1.0)),
         focus_master=float(data.get("focus_master", 0.5)),
-        zoom_mode=data.get("zoom_mode", "Manual"),
+        use_dmx_in=bool(data.get("use_dmx_in", True)),
+        dimmer_mode=data.get("dimmer_mode") if data.get("dimmer_mode") in DIMMER_MODES else "manual",
+        beam_mode=(data["beam_mode"] if data.get("beam_mode") in BEAM_MODES
+                   else _beam_mode_from_legacy(data.get("zoom_mode"))),
         auto_beam_diameter_m=float(data.get("auto_beam_diameter_m", 1.0)),
         fixture_types=fixture_types,
         fixtures=fixtures,

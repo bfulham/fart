@@ -85,7 +85,6 @@ class RunnerEndToEndTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
         try:
             marker_pos = (5.0, 0.0, 4.0)
             psn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -143,7 +142,6 @@ class RunnerEndToEndTests(unittest.TestCase):
 
         runner = Runner()
         runner.start(settings)
-        runner.armed = True
         try:
             psn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             psn_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)

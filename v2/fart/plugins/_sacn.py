@@ -27,6 +27,7 @@ Total minimum packet size: 638 bytes.
 from __future__ import annotations
 
 import struct
+import time
 
 SACN_PORT = 5568
 VECTOR_ROOT_E131_DATA = 0x00000004
@@ -94,9 +95,15 @@ def build_sacn_dmx(cid, source_name, sequence, universe, dmx_bytes, priority=100
     return packet
 
 
-def parse_sacn_dmx(data):
-    """Parse an E1.31 sACN DATA packet. Returns (universe, dmx_bytes) or
-    None if this is not a well-formed, full-size sACN DMX data packet."""
+SOURCE_TIMEOUT_S = 2.5  # E1.31 "network data loss" timeout
+OPTION_STREAM_TERMINATED = 0x40
+
+
+def parse_sacn_packet(data):
+    """Parse an E1.31 sACN DATA packet into a dict with universe, dmx, cid,
+    priority, sequence and terminated, or None if this is not a well-formed,
+    full-size, start-code-0 DMX data packet (per-address-priority packets
+    use start code 0xDD and must not be mistaken for DMX levels)."""
     if len(data) < MIN_PACKET_LENGTH:
         return None
     root_vector = struct.unpack_from(">I", data, 18)[0]
@@ -107,6 +114,63 @@ def parse_sacn_dmx(data):
         return None
     if data[117] != VECTOR_DMP_SET_PROPERTY:
         return None
-    universe = struct.unpack_from(">H", data, 113)[0]
-    dmx = bytes(data[126:638])
-    return universe, dmx
+    if data[125] != 0:
+        return None
+    return {
+        "universe": struct.unpack_from(">H", data, 113)[0],
+        "dmx": bytes(data[126:638]),
+        "cid": bytes(data[22:38]),
+        "priority": data[108],
+        "sequence": data[111],
+        "terminated": bool(data[112] & OPTION_STREAM_TERMINATED),
+    }
+
+
+def parse_sacn_dmx(data):
+    """Parse an E1.31 sACN DATA packet. Returns (universe, dmx_bytes) or
+    None if this is not a well-formed, full-size sACN DMX data packet."""
+    packet = parse_sacn_packet(data)
+    return None if packet is None else (packet["universe"], packet["dmx"])
+
+
+class SourceSelector:
+    """Per-universe sACN source lock. Two sources sending to one universe
+    (a console plus a merge node echoing it, say) would otherwise alternate
+    their frames into the same store and make every channel flicker between
+    the two. Following E1.31's rule instead: only the highest-priority
+    source is accepted; among equals, the first one seen stays locked until
+    it goes silent (SOURCE_TIMEOUT_S) or sends a stream-terminated packet.
+    Out-of-order (duplicate or late) packets from a source are dropped.
+    """
+
+    def __init__(self, clock=time.monotonic, timeout_s=SOURCE_TIMEOUT_S):
+        self.clock = clock
+        self.timeout_s = timeout_s
+        self.sources = {}  # universe -> {cid: [priority, last_seen, last_sequence, first_seen]}
+        self.locked = {}   # universe -> cid
+
+    def accept(self, universe, cid, priority, sequence, terminated=False):
+        """True if this packet's frame should be used."""
+        now = self.clock()
+        sources = self.sources.setdefault(universe, {})
+        for other in [c for c, v in sources.items() if now - v[1] > self.timeout_s]:
+            del sources[other]
+        if terminated:
+            sources.pop(cid, None)
+            return False
+        entry = sources.get(cid)
+        if entry is not None:
+            delta = (sequence - entry[2]) & 0xFF
+            if delta == 0 or delta >= 237:  # duplicate, or 1-19 packets behind
+                return False
+            entry[0], entry[1], entry[2] = priority, now, sequence
+        else:
+            sources[cid] = [priority, now, sequence, now]
+        top = max(v[0] for v in sources.values())
+        locked = self.locked.get(universe)
+        if locked in sources and sources[locked][0] == top:
+            winner = locked
+        else:
+            winner = min((c for c, v in sources.items() if v[0] == top), key=lambda c: sources[c][3])
+            self.locked[universe] = winner
+        return cid == winner

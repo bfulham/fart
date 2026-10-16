@@ -420,10 +420,95 @@ class OperatorTabStartStopTests(WindowTestCase):
         self.assertFalse(self.window.runner.running)
         self.assertTrue(self.window.tabs.isTabEnabled(1))
 
-    def test_arm_checkbox_updates_runner(self):
-        self.assertFalse(self.window.runner.armed)
-        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
-        self.assertTrue(self.window.runner.armed)
+    def test_there_is_no_arm_control_and_start_is_the_only_gate(self):
+        tab = self.window.operator_tab
+        self.assertFalse(hasattr(tab, "arm_checkbox"))
+        self.assertFalse(hasattr(self.window.runner, "armed"))
+        self.assertEqual(tab.start_button.text(), "START")
+        self.window.settings.dmx_out.active = "artnet"
+        self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        QTest.mouseClick(tab.start_button, Qt.MouseButton.LeftButton)
+        self.assertEqual(tab.start_button.text(), "RUNNING — click to stop")
+
+    def test_start_always_resets_the_dimmer_fader_to_zero(self):
+        tab = self.window.operator_tab
+        self.window.settings.dmx_out.active = "artnet"
+        self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        tab.fader_slider.setValue(800)
+        self.assertAlmostEqual(self.window.runner.fader.get()[0], 0.8, places=3)
+        QTest.mouseClick(tab.start_button, Qt.MouseButton.LeftButton)
+        self.assertEqual(tab.fader_slider.value(), 0)
+        self.assertEqual(self.window.runner.fader.get()[0], 0.0)
+
+
+class OperatorControlModelTests(WindowTestCase):
+    """Use DMX in / Dimmer mode / Beam mode, and the rule that any fader
+    with no effect is greyed out."""
+
+    def _give_every_light_a_shadow_feed(self):
+        for fixture in self.window.settings.fixtures:
+            fixture.shadow_universe = 2
+        self.window.operator_tab._update_enabled_states()
+
+    def _select(self, combo, value):
+        combo.setCurrentIndex(combo.findData(value))
+
+    def test_widgets_reflect_loaded_settings_and_write_back(self):
+        tab = self.window.operator_tab
+        settings = self.window.settings
+        self.assertTrue(tab.use_dmx_in_checkbox.isChecked())
+        self.assertEqual(tab.dimmer_mode_combo.currentData(), "manual")
+        self.assertEqual(tab.beam_mode_combo.currentData(), "manual")
+        tab.use_dmx_in_checkbox.setChecked(False)
+        self.assertFalse(settings.use_dmx_in)
+        self._select(tab.dimmer_mode_combo, "dmx_in")
+        self._select(tab.beam_mode_combo, "auto_size")
+        self.assertEqual(settings.dimmer_mode, "dmx_in")
+        self.assertEqual(settings.beam_mode, "auto_size")
+
+    def test_everything_is_live_in_the_default_manual_modes(self):
+        tab = self.window.operator_tab
+        for widget in (tab.fader_slider, tab.zoom_slider, tab.iris_slider, tab.focus_slider):
+            self.assertTrue(widget.isEnabled())
+        self.assertFalse(tab.spot_diameter_edit.isEnabled(), "spot diameter only matters in Auto size")
+
+    def test_dimmer_fader_is_greyed_only_when_dmx_in_really_drives_every_light(self):
+        tab = self.window.operator_tab
+        self._select(tab.dimmer_mode_combo, "dmx_in")
+        self.assertTrue(tab.fader_slider.isEnabled(), "light 1 has no shadow feed, so it still uses the fader")
+        self._give_every_light_a_shadow_feed()
+        self.assertFalse(tab.fader_slider.isEnabled())
+        tab.use_dmx_in_checkbox.setChecked(False)
+        self.assertTrue(tab.fader_slider.isEnabled(), "with Use DMX in off the fader is back in control")
+        tab.use_dmx_in_checkbox.setChecked(True)
+        self._select(tab.dimmer_mode_combo, "manual")
+        self.assertTrue(tab.fader_slider.isEnabled())
+
+    def test_beam_faders_follow_the_beam_mode(self):
+        tab = self.window.operator_tab
+        self._give_every_light_a_shadow_feed()
+        self._select(tab.beam_mode_combo, "auto_size")
+        self.assertFalse(tab.zoom_slider.isEnabled())
+        self.assertFalse(tab.iris_slider.isEnabled())
+        self.assertTrue(tab.focus_slider.isEnabled(), "auto size does not drive focus")
+        self.assertTrue(tab.spot_diameter_edit.isEnabled())
+        self._select(tab.beam_mode_combo, "dmx")
+        for widget in (tab.zoom_slider, tab.iris_slider, tab.focus_slider):
+            self.assertFalse(widget.isEnabled())
+        self.assertFalse(tab.spot_diameter_edit.isEnabled())
+        self._select(tab.beam_mode_combo, "manual")
+        for widget in (tab.zoom_slider, tab.iris_slider, tab.focus_slider):
+            self.assertTrue(widget.isEnabled())
+
+    def test_dmx_options_are_greyed_out_when_use_dmx_in_is_off(self):
+        tab = self.window.operator_tab
+        dimmer_item = tab.dimmer_mode_combo.model().item(tab.dimmer_mode_combo.findData("dmx_in"))
+        beam_item = tab.beam_mode_combo.model().item(tab.beam_mode_combo.findData("dmx"))
+        self.assertTrue(dimmer_item.isEnabled())
+        self.assertTrue(beam_item.isEnabled())
+        tab.use_dmx_in_checkbox.setChecked(False)
+        self.assertFalse(dimmer_item.isEnabled())
+        self.assertFalse(beam_item.isEnabled())
 
 
 class LiveEndToEndUITests(WindowTestCase):
@@ -438,7 +523,6 @@ class LiveEndToEndUITests(WindowTestCase):
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
         self.assertTrue(self.window.runner.running)
-        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
@@ -451,7 +535,7 @@ class LiveEndToEndUITests(WindowTestCase):
             self.window._on_ui_tick()
             table = self.window.operator_tab.overview_table
             if table.rowCount() > 0:
-                state_item = table.item(0, 7)  # column order: Light, Marker, Marker XYZ, Pan/Tilt, Distance, DMX In Mode, DMX In Marker, State
+                state_item = table.item(0, 9)  # column order: Light, Marker, Marker XYZ, Pan/Tilt, Distance, DMX In Mode, DMX In Marker, Dimmer, Beam, State
                 if state_item and state_item.text() == "LIVE":
                     seen_live_row = True
                     break
@@ -468,10 +552,10 @@ class DMXMonitorTests(WindowTestCase):
 
     def test_dmx_in_tab_channel_grid_shows_real_received_data(self):
         settings = self.window.settings
-        # Forces the control-input plugin to actually start -- otherwise
+        # A console-relay fixture forces the control-input plugin to start -- otherwise
         # nothing is listening and the grid would stay all-zero regardless
         # of whether the widget itself works.
-        settings.fader.source = "dmx_in"
+        settings.fixtures[0].console_mode_channel = 10
         settings.dmx_out.active = "artnet"
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
 
@@ -518,7 +602,6 @@ class DMXMonitorTests(WindowTestCase):
         settings.fixtures[0].output_universe = 0
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
-        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
 
         psn_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         psn_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
@@ -559,7 +642,6 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         settings.fixtures[0].console_marker_channel = 11
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
-        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
 
         from fart.plugins._artnet import ARTNET_PORT, build_artnet_dmx
 
@@ -605,7 +687,6 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         settings.fixtures[0].console_marker_channel = 0
 
         QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
-        QTest.mouseClick(self.window.operator_tab.arm_checkbox, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)

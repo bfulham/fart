@@ -26,20 +26,20 @@ class MigrateV1Tests(unittest.TestCase):
         settings = migrate_v1(v1)
         self.assertEqual(settings.psn_in.default_marker_id, 2)
         self.assertEqual(settings.psn_in.timeout_s, 0.7)
-        self.assertEqual(settings.fader.source, "manual")
+        self.assertEqual(settings.dimmer_mode, "manual")
+        self.assertEqual(settings.beam_mode, "manual")
         self.assertEqual(settings.dmx_out.active, "open_dmx")
         self.assertEqual(settings.dmx_out.open_dmx.adapters, "COM5=0")
         self.assertEqual(settings.fixtures[0].name, "A")
 
-    def test_artnet_input_fader_becomes_dmx_in(self):
+    def test_artnet_input_master_fader_has_no_equivalent_and_falls_back_to_manual_dimmer(self):
         v1 = {
             "fader_mode": "Art-Net Input", "artnet_input_universe": 3, "artnet_input_channel": 7,
             "output": "Art-Net", "artnet_ip": "10.0.0.5",
             "fixtures": [{"name": "A"}],
         }
         settings = migrate_v1(v1)
-        self.assertEqual(settings.fader.source, "dmx_in")
-        self.assertEqual(settings.fader.channel, 7)
+        self.assertEqual(settings.dimmer_mode, "manual")
         self.assertEqual(settings.dmx_in.active, "artnet")
         self.assertEqual(settings.dmx_in.artnet.universe, 3)
         self.assertEqual(settings.dmx_out.active, "artnet")
@@ -58,10 +58,55 @@ class MigrateV1Tests(unittest.TestCase):
         self.assertEqual(settings.dmx_out.active, "sacn")
         self.assertEqual(settings.dmx_out.sacn.universes, [1, 2])
 
+    def test_legacy_auto_beam_size_zoom_mode_becomes_auto_size_beam_mode(self):
+        self.assertEqual(migrate_v1({"zoom_mode": "Auto beam size"}).beam_mode, "auto_size")
+        self.assertEqual(migrate_v1({"zoom_mode": "Manual"}).beam_mode, "manual")
+
     def test_missing_fixtures_gets_one_default(self):
         settings = migrate_v1({})
         self.assertEqual(len(settings.fixtures), 1)
         self.assertIsInstance(settings.fixtures[0], FixtureConfig)
+
+
+class ControlModelSettingsTests(unittest.TestCase):
+    def test_defaults(self):
+        settings = Settings()
+        self.assertTrue(settings.use_dmx_in)
+        self.assertEqual(settings.dimmer_mode, "manual")
+        self.assertEqual(settings.beam_mode, "manual")
+        self.assertEqual(settings.dmx_in.timeout_s, 3.0)
+
+    def test_round_trip_preserves_the_new_settings(self):
+        settings = Settings()
+        settings.use_dmx_in = False
+        settings.dimmer_mode = "dmx_in"
+        settings.beam_mode = "dmx"
+        settings.dmx_in.timeout_s = 7.5
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "FART.fart"
+            save_settings(path, settings)
+            loaded = load_settings(path)
+        self.assertFalse(loaded.use_dmx_in)
+        self.assertEqual(loaded.dimmer_mode, "dmx_in")
+        self.assertEqual(loaded.beam_mode, "dmx")
+        self.assertEqual(loaded.dmx_in.timeout_s, 7.5)
+
+    def test_an_existing_v3_file_from_before_this_change_still_loads(self):
+        old = asdict(Settings())
+        for key in ("use_dmx_in", "dimmer_mode", "beam_mode"):
+            old.pop(key)
+        old["dmx_in"].pop("timeout_s")
+        old["zoom_mode"] = "Auto beam size"
+        old["fader"] = {"source": "dmx_in", "channel": 7}
+        old["fixture_types"] = [{k: v for k, v in t.items() if k != "gdtf_data"} for t in old["fixture_types"]]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            path.write_text(json.dumps(old))
+            loaded = load_settings(path)
+        self.assertTrue(loaded.use_dmx_in)
+        self.assertEqual(loaded.dimmer_mode, "manual", "the removed DMX master fader must not become a dimmer mode")
+        self.assertEqual(loaded.beam_mode, "auto_size", "the old zoom mode is migrated, not dropped")
+        self.assertEqual(loaded.dmx_in.timeout_s, 3.0)
 
 
 class LoadSaveRoundTripTests(unittest.TestCase):

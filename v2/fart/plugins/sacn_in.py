@@ -12,7 +12,7 @@ from __future__ import annotations
 import socket
 import threading
 
-from ._sacn import SACN_PORT, parse_sacn_dmx, sacn_multicast_group
+from ._sacn import SACN_PORT, SourceSelector, parse_sacn_packet, sacn_multicast_group
 
 
 class SACNInPlugin:
@@ -22,6 +22,7 @@ class SACNInPlugin:
         self.stop_evt = threading.Event()
         self._bus = None
         self._thread = None
+        self.selector = SourceSelector()
 
     def start(self, config, bus, universes=None):
         """config: a SACNInConfig (config.universe is the fallback/fader
@@ -51,10 +52,11 @@ class SACNInPlugin:
                 continue
             except OSError:
                 break
-            parsed = parse_sacn_dmx(data)
-            if parsed:
-                universe, dmx = parsed
-                self._bus.update(universe, dmx)
+            packet = parse_sacn_packet(data)
+            if packet and self.selector.accept(
+                packet["universe"], packet["cid"], packet["priority"], packet["sequence"], packet["terminated"],
+            ):
+                self._bus.update(packet["universe"], packet["dmx"])
 
     def stop(self):
         self.stop_evt.set()

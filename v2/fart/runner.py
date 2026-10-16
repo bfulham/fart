@@ -22,7 +22,6 @@ class Runner:
         self.zoom_value = 0.5
         self.iris_value = 1.0
         self.focus_value = 0.5
-        self.armed = False
         self.settings = None
         self.running = False
         self.live = None
@@ -37,6 +36,9 @@ class Runner:
         if self.running:
             return
         self.settings = settings
+        # The manual dimmer fader always starts dark: with no separate arm
+        # step, Start must never light fixtures from a stale fader position.
+        self.fader.update(0.0)
         try:
             self.position_plugin = PSNInPlugin(log=self.log)
             self.position_plugin.start(settings.psn_in, self.trackers)
@@ -61,24 +63,16 @@ class Runner:
         self._thread.start()
         self.log(f"Started: PSN in, DMX in ({settings.dmx_in.active}), DMX out ({settings.dmx_out.active})")
 
-    def _resolve_fader(self):
-        if self.settings.fader.source == "dmx_in":
-            active = self.settings.dmx_in.active
-            universe = getattr(self.settings.dmx_in, active).universe
-            value, _age = self.bus.get_channel(universe, self.settings.fader.channel)
-            return 0.0 if value is None else value / 255.0
-        return self.fader.get()[0]
-
     def _loop(self):
         state = CycleState()
         try:
             while not self._stop_evt.is_set():
                 cycle_start = time.monotonic()
-                fader_value = self._resolve_fader()
+                fader_value = self.fader.get()[0]
                 frames, statuses = run_cycle(
                     self.settings, self.trackers, self.bus, fader_value,
                     self.zoom_value, self.iris_value, self.focus_value,
-                    self.armed, cycle_start, state,
+                    cycle_start, state,
                 )
                 self.output_plugin.send(frames)
                 self.live = {"fader": fader_value, "lights": statuses,
@@ -104,7 +98,6 @@ class Runner:
         self.position_plugin = self.control_plugin = self.output_plugin = None
 
     def stop(self):
-        self.armed = False
         self._stop_evt.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=1)

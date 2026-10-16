@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 
 class TrackerBank:
@@ -70,22 +71,45 @@ class ExternalInputBus:
     whichever ControlInputPlugin (Art-Net-in or sACN-in) is currently
     active. Exactly one such plugin ever runs at a time (dmx_in.active),
     so there is never contention over which plugin owns the listening
-    socket — but there are still multiple *readers*: the fader (if
-    fader.source == "dmx_in") and every fixture's console-relay mode/
-    marker-select channels all read the same stored frame independently.
+    socket — but there are still multiple *readers*: every fixture's
+    console-relay mode/marker-select channels and shadow feed all read the
+    same stored frames independently.
     """
+
+    RATE_WINDOW_S = 10.0
 
     def __init__(self):
         self.lock = threading.Lock()
         self.frames = {}
+        self.arrivals = {}  # universe -> deque of recent packet times, for rate()
 
     def update(self, universe, dmx_bytes):
         universe = int(universe)
         frame = bytearray(512)
         n = min(512, len(dmx_bytes))
         frame[:n] = dmx_bytes[:n]
+        now = time.monotonic()
         with self.lock:
-            self.frames[universe] = (bytes(frame), time.monotonic())
+            self.frames[universe] = (bytes(frame), now)
+            self.arrivals.setdefault(universe, deque(maxlen=64)).append(now)
+
+    def rates(self):
+        """{universe: (packets_per_second, age_seconds)} for every universe
+        seen. Rate is measured over the packets that arrived within the last
+        RATE_WINDOW_S, so a feed running well under 1 fps still reads
+        sensibly instead of rounding to zero; 0.0 once fewer than two
+        packets fall in the window."""
+        now = time.monotonic()
+        result = {}
+        with self.lock:
+            for universe, times in self.arrivals.items():
+                recent = [t for t in times if now - t <= self.RATE_WINDOW_S]
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    rate = (len(recent) - 1) / (recent[-1] - recent[0])
+                else:
+                    rate = 0.0
+                result[universe] = (rate, max(0.0, now - times[-1]))
+        return result
 
     def get(self, universe):
         """Returns (frame_bytes_or_None, last_update_monotonic_or_0.0)."""
