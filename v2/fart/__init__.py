@@ -1,0 +1,3 @@
+from ._version import APP_LONG_NAME, APP_NAME, APP_SHORT_NAME, APP_VERSION
+
+__all__ = ["APP_VERSION", "APP_SHORT_NAME", "APP_LONG_NAME", "APP_NAME"]

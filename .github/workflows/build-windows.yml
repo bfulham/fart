@@ -3,7 +3,10 @@ name: Build Windows and macOS
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # Scoped to v0/v1 tags only -- v2.* tags belong to build-v2.yml, which
+    # builds from the v2/ subdirectory. Both workflows would otherwise
+    # match a bare "v*" glob and race to create/attach to the same release.
+    tags: ["v0.*", "v1.*"]
   pull_request:
   workflow_dispatch:
 

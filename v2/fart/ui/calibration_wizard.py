@@ -1,0 +1,567 @@
+"""Multi-fixture calibration wizard.
+
+Guided flow: pick default or custom target points, then step through
+every (point, fixture) pair one at a time -- only the current fixture is
+lit (at whatever pan/tilt/beam its sliders say), every other fixture stays
+blacked out, "Capture & Next" saves that fixture's aim at the current
+point and advances to the next fixture, cycling through every fixture
+before moving to the next point. Once every point has been captured for
+every fixture, solve and apply per fixture against the shared point list.
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView, QAbstractSpinBox, QApplication, QButtonGroup, QComboBox, QDialog,
+    QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QMessageBox, QPushButton, QRadioButton, QSlider, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+)
+
+from ..calibration import solve_fixture_calibration
+from ..engine import blank_frames_for_settings, fixture_type_for, resolve_fixture, write_fixture_to_frame
+from ..plugins import OUTPUT_PLUGINS
+from .pan_tilt_dial import PanDial, TiltArc
+
+DEFAULT_TARGETS = [
+    ("Centre floor", 0.0, 0.0, 0.0),
+    ("House right floor", 5.0, 0.0, 0.0),
+    ("House left floor", -5.0, 0.0, 0.0),
+    ("Upstage floor", 0.0, 5.0, 0.0),
+    ("Downstage floor", 0.0, -5.0, 0.0),
+    ("Centre at head height", 0.0, 0.0, 1.7),
+]
+
+
+# Pan/tilt sliders resolve to 0.001 degrees (the finest nudge step); the
+# other sliders stay at 0.01 percent.
+AIM_SCALE = 1000
+LEVEL_SCALE = 100
+FINE_STEPS = [("1°", 1.0), ("0.1°", 0.1), ("0.01°", 0.01)]
+DEFAULT_STEP_INDEX = 1
+
+
+class _FixtureRow(QWidget):
+    def __init__(self, fixture, fixture_type):
+        super().__init__()
+        self.fixture = fixture
+        self.fixture_type = fixture_type
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(QLabel(fixture.name))
+
+        pan_min, pan_max = fixture_type.pan_min, fixture_type.pan_max
+        tilt_min, tilt_max = fixture_type.tilt_min, fixture_type.tilt_max
+        self.pan_slider = self._slider(pan_min, pan_max, (pan_min + pan_max) / 2, AIM_SCALE)
+        self.tilt_slider = self._slider(tilt_min, tilt_max, (tilt_min + tilt_max) / 2, AIM_SCALE)
+        self.level_slider = self._slider(0, 100, 100, LEVEL_SCALE)
+        self.zoom_slider = self._slider(0, 100, 50, LEVEL_SCALE)
+        self.iris_slider = self._slider(0, 100, 100, LEVEL_SCALE)
+
+        tabs = QTabWidget()
+        outer.addWidget(tabs)
+
+        sliders_page = QWidget()
+        sliders_layout = QHBoxLayout(sliders_page)
+        for label, slider in (("Pan", self.pan_slider), ("Tilt", self.tilt_slider),
+                               ("Dimmer", self.level_slider), ("Zoom", self.zoom_slider), ("Iris", self.iris_slider)):
+            sliders_layout.addWidget(QLabel(label))
+            sliders_layout.addWidget(slider)
+        tabs.addTab(sliders_page, "Sliders")
+
+        dial_page = QWidget()
+        dial_layout = QHBoxLayout(dial_page)
+        pan_col = QVBoxLayout()
+        pan_col.addWidget(QLabel("Top-down (pan)"))
+        self.pan_dial = PanDial(-180.0, 180.0)
+        pan_col.addWidget(self.pan_dial)
+        dial_layout.addLayout(pan_col)
+        tilt_col = QVBoxLayout()
+        tilt_col.addWidget(QLabel("Side view (tilt)"))
+        # The tilt arc's range always matches this specific fixture's own
+        # tilt_min/tilt_max, not a generic -90..90 -- real fixtures vary
+        # widely, and dragging past what the fixture can physically do
+        # would be misleading.
+        self.tilt_dial = TiltArc(tilt_min, tilt_max)
+        tilt_col.addWidget(self.tilt_dial)
+        dial_layout.addLayout(tilt_col)
+        tabs.addTab(dial_page, "Aim (dial)")
+
+        # Sliders stay the source of truth pan()/tilt() read from; the
+        # dials are just another control bound to the same values, kept in
+        # sync in both directions regardless of which tab is showing.
+        # setValue(..., _emit=False) on the receiving end stops these from
+        # ping-ponging back and forth.
+        self.pan_dial.setValue(self.pan_slider.value() / AIM_SCALE, _emit=False)
+        self.pan_dial.valueChanged.connect(lambda v: self.pan_slider.setValue(int(round(v * AIM_SCALE))))
+        self.pan_slider.valueChanged.connect(lambda v: self.pan_dial.setValue(v / AIM_SCALE, _emit=False))
+
+        self.tilt_dial.setValue(self.tilt_slider.value() / AIM_SCALE, _emit=False)
+        self.tilt_dial.valueChanged.connect(lambda v: self.tilt_slider.setValue(int(round(v * AIM_SCALE))))
+        self.tilt_slider.valueChanged.connect(lambda v: self.tilt_dial.setValue(v / AIM_SCALE, _emit=False))
+
+        outer.addWidget(self._build_fine_adjust(pan_min, pan_max, tilt_min, tilt_max))
+
+    def _build_fine_adjust(self, pan_min, pan_max, tilt_min, tilt_max):
+        """Exact numeric entry plus +/- step buttons for pan and tilt,
+        always visible whichever aiming tab is showing. The sliders stay
+        the source of truth; the spin boxes are another view of them."""
+        box = QGroupBox("Fine adjust (arrow keys also nudge: Left/Right pan, Up/Down tilt; "
+                        "Shift = ÷10, Ctrl = ×10)")
+        grid = QGridLayout(box)
+        grid.addWidget(QLabel("Step"), 0, 0)
+        self.step_combo = QComboBox()
+        for label, value in FINE_STEPS:
+            self.step_combo.addItem(label, value)
+        self.step_combo.setCurrentIndex(DEFAULT_STEP_INDEX)
+        self.step_combo.currentIndexChanged.connect(self._on_step_changed)
+        grid.addWidget(self.step_combo, 0, 2)
+
+        self.pan_spin = self._aim_spin(self.pan_slider, pan_min, pan_max)
+        self.tilt_spin = self._aim_spin(self.tilt_slider, tilt_min, tilt_max)
+        for row, (label, spin, axis) in enumerate((("Pan", self.pan_spin, "pan"), ("Tilt", self.tilt_spin, "tilt")), start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            minus = QPushButton("−")
+            minus.setToolTip(f"{label} down by one step")
+            minus.clicked.connect(lambda _checked=False, a=axis: self.nudge(a, -1))
+            plus = QPushButton("+")
+            plus.setToolTip(f"{label} up by one step")
+            plus.clicked.connect(lambda _checked=False, a=axis: self.nudge(a, +1))
+            grid.addWidget(minus, row, 1)
+            grid.addWidget(spin, row, 2)
+            grid.addWidget(plus, row, 3)
+            setattr(self, f"{axis}_minus_button", minus)
+            setattr(self, f"{axis}_plus_button", plus)
+        grid.setColumnStretch(2, 1)
+        self._on_step_changed()
+        return box
+
+    def _aim_spin(self, slider, lo, hi):
+        spin = QDoubleSpinBox()
+        spin.setDecimals(3)
+        spin.setSuffix("°")
+        spin.setRange(min(lo, hi), max(lo, hi))
+        spin.setKeyboardTracking(False)
+        spin.setValue(slider.value() / AIM_SCALE)
+        spin.valueChanged.connect(lambda v: slider.setValue(int(round(v * AIM_SCALE))))
+
+        def slider_moved(value):
+            spin.blockSignals(True)
+            spin.setValue(value / AIM_SCALE)
+            spin.blockSignals(False)
+
+        slider.valueChanged.connect(slider_moved)
+        return spin
+
+    def step(self, scale=1.0):
+        return self.step_combo.currentData() * scale
+
+    def _on_step_changed(self, _index=None):
+        self.pan_spin.setSingleStep(self.step())
+        self.tilt_spin.setSingleStep(self.step())
+
+    def nudge(self, axis, direction, scale=1.0):
+        """Move pan or tilt by direction (+1/-1) x the selected step x scale
+        (Shift passes 0.1, Ctrl passes 10). Clamped to the slider's range."""
+        slider = self.pan_slider if axis == "pan" else self.tilt_slider
+        delta = int(round(direction * self.step(scale) * AIM_SCALE))
+        slider.setValue(max(slider.minimum(), min(slider.maximum(), slider.value() + delta)))
+
+    def _slider(self, lo, hi, initial, scale):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(lo * scale), int(hi * scale))
+        slider.setValue(int(initial * scale))
+        slider.setMinimumWidth(120)
+        return slider
+
+    def pan(self):
+        return self.pan_slider.value() / AIM_SCALE
+
+    def tilt(self):
+        return self.tilt_slider.value() / AIM_SCALE
+
+    def level(self):
+        return self.level_slider.value() / LEVEL_SCALE / 100.0
+
+    def zoom(self):
+        return self.zoom_slider.value() / LEVEL_SCALE / 100.0
+
+    def iris(self):
+        return self.iris_slider.value() / LEVEL_SCALE / 100.0
+
+
+class CalibrationWizard(QDialog):
+    def __init__(self, main_window, fixture_indices):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.fixture_indices = list(fixture_indices)
+        self.fixtures = {i: main_window.settings.fixtures[i] for i in self.fixture_indices}
+        self.fixture_types = {i: fixture_type_for(main_window.settings, self.fixtures[i]) for i in self.fixture_indices}
+        self.samples = {i: [] for i in self.fixture_indices}
+        self.output = None
+        self.output_running = False
+
+        self.points = []
+        self._custom_points = []
+        self.point_index = 0
+        self.fixture_pos = 0
+
+        self.setWindowTitle("FART calibration wizard")
+        self.resize(1000, 700)
+
+        root = QVBoxLayout(self)
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, stretch=1)
+
+        self.rows = {
+            index: _FixtureRow(self.fixtures[index], self.fixture_types[index])
+            for index in self.fixture_indices
+        }
+        self.fixture_stack = QStackedWidget()
+        for row in self.rows.values():
+            self.fixture_stack.addWidget(row)
+
+        self.setup_page = self._build_setup_page()
+        self.guided_page = self._build_guided_page()
+        self.done_page = self._build_done_page()
+        self.stack.addWidget(self.setup_page)
+        self.stack.addWidget(self.guided_page)
+        self.stack.addWidget(self.done_page)
+        self.stack.setCurrentWidget(self.setup_page)
+
+        self.output_timer = QTimer(self)
+        self.output_timer.timeout.connect(self._output_tick)
+        self.output_timer.start(33)
+
+        # Arrow keys nudge the current fixture's pan/tilt. They have to be
+        # caught app-wide (while this dialog is the one in use) because
+        # buttons and sliders would otherwise consume them for focus
+        # navigation and single-step moves.
+        QApplication.instance().installEventFilter(self)
+
+    # -- Arrow-key nudge ---------------------------------------------------
+
+    _NUDGE_KEYS = {
+        Qt.Key.Key_Left: ("pan", -1), Qt.Key.Key_Right: ("pan", +1),
+        Qt.Key.Key_Up: ("tilt", +1), Qt.Key.Key_Down: ("tilt", -1),
+    }
+
+    def _nudge_for_key(self, event):
+        action = self._NUDGE_KEYS.get(event.key())
+        if action is None or self.stack.currentWidget() is not self.guided_page or not self.points:
+            return False
+        focus = QApplication.focusWidget()
+        # Never steal arrows from something where they mean something else
+        # (moving a text cursor, stepping a spin box, picking a list row).
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QComboBox, QAbstractItemView)):
+            return False
+        if focus is not None and focus.window() is not self:
+            return False
+        modifiers = event.modifiers()
+        scale = 0.1 if modifiers & Qt.KeyboardModifier.ShiftModifier else (
+            10.0 if modifiers & Qt.KeyboardModifier.ControlModifier else 1.0)
+        self.rows[self._current_fixture_index()].nudge(action[0], action[1], scale)
+        return True
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and self.isVisible() and self._nudge_for_key(event):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _remove_key_filter(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+    def done(self, result):
+        self._remove_key_filter()
+        super().done(result)
+
+    # -- Setup page: default vs custom points ---------------------------
+
+    def _build_setup_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        names = ", ".join(f.name for f in self.fixtures.values())
+        layout.addWidget(QLabel(f"Calibrating: {names}"))
+        layout.addWidget(QLabel(
+            "Keep each fixture's lamp/shutter closed until it's this wizard's turn to light it, "
+            "and know where your known points are in the room before starting."
+        ))
+
+        choice_box = QGroupBox("Which points do you want to calibrate against?")
+        choice_layout = QVBoxLayout(choice_box)
+        self.default_radio = QRadioButton(f"Default points ({len(DEFAULT_TARGETS)} standard positions)")
+        self.custom_radio = QRadioButton("Custom points (enter below)")
+        self.default_radio.setChecked(True)
+        group = QButtonGroup(page)
+        group.addButton(self.default_radio)
+        group.addButton(self.custom_radio)
+        choice_layout.addWidget(self.default_radio)
+        choice_layout.addWidget(self.custom_radio)
+        layout.addWidget(choice_box)
+
+        self.custom_points_box = QGroupBox("Custom points")
+        self.custom_points_box.setEnabled(False)
+        self.custom_radio.toggled.connect(self.custom_points_box.setEnabled)
+        custom_layout = QVBoxLayout(self.custom_points_box)
+        self.custom_point_list = QListWidget()
+        custom_layout.addWidget(self.custom_point_list)
+
+        entry_form = QFormLayout()
+        self.setup_x_edit = QLineEdit("0")
+        self.setup_y_edit = QLineEdit("0")
+        self.setup_z_edit = QLineEdit("0")
+        entry_form.addRow("X", self.setup_x_edit)
+        entry_form.addRow("Y", self.setup_y_edit)
+        entry_form.addRow("Z", self.setup_z_edit)
+        custom_layout.addLayout(entry_form)
+
+        custom_buttons = QHBoxLayout()
+        add_point_button = QPushButton("Add point")
+        add_point_button.clicked.connect(self._on_add_setup_point)
+        remove_point_button = QPushButton("Remove selected")
+        remove_point_button.clicked.connect(self._on_remove_setup_point)
+        custom_buttons.addWidget(add_point_button)
+        custom_buttons.addWidget(remove_point_button)
+        custom_layout.addLayout(custom_buttons)
+        layout.addWidget(self.custom_points_box)
+
+        layout.addStretch(1)
+        start_button = QPushButton("Start calibration →")
+        start_button.clicked.connect(self._on_start_guided)
+        layout.addWidget(start_button)
+        return page
+
+    def _on_add_setup_point(self):
+        try:
+            x = float(self.setup_x_edit.text())
+            y = float(self.setup_y_edit.text())
+            z = float(self.setup_z_edit.text())
+        except ValueError as exc:
+            QMessageBox.critical(self, "FART", f"X/Y/Z must be numbers: {exc}")
+            return
+        self._custom_points.append((f"Point {len(self._custom_points) + 1}", x, y, z))
+        self.custom_point_list.addItem(f"Point {len(self._custom_points)}: X {x:g}, Y {y:g}, Z {z:g}")
+
+    def _on_remove_setup_point(self):
+        row = self.custom_point_list.currentRow()
+        if row < 0:
+            return
+        del self._custom_points[row]
+        self.custom_point_list.takeItem(row)
+
+    def _on_start_guided(self):
+        if self.custom_radio.isChecked():
+            if not self._custom_points:
+                QMessageBox.critical(self, "FART", "Add at least one custom point first.")
+                return
+            self.points = list(self._custom_points)
+        else:
+            self.points = list(DEFAULT_TARGETS)
+        self.point_index = 0
+        self.fixture_pos = 0
+        self._start_output_internal()
+        if self.output_running:
+            self._enter_guided_step()
+            self.stack.setCurrentWidget(self.guided_page)
+
+    # -- Guided page: one fixture, one point, at a time ------------------
+
+    def _build_guided_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.progress_label = QLabel()
+        self.progress_label.setStyleSheet("font-weight: 600; font-size: 15px;")
+        layout.addWidget(self.progress_label)
+        self.point_label = QLabel()
+        layout.addWidget(self.point_label)
+
+        layout.addWidget(self.fixture_stack)
+
+        nav_row = QHBoxLayout()
+        self.back_button = QPushButton("← Back")
+        self.back_button.clicked.connect(self._on_guided_back)
+        self.next_button = QPushButton("Capture && Next →")
+        self.next_button.clicked.connect(self._on_guided_next)
+        cancel_button = QPushButton("Cancel / blackout")
+        cancel_button.clicked.connect(self._on_cancel_guided)
+        nav_row.addWidget(self.back_button)
+        nav_row.addWidget(self.next_button)
+        nav_row.addWidget(cancel_button)
+        layout.addLayout(nav_row)
+
+        self.guided_status_label = QLabel("")
+        layout.addWidget(self.guided_status_label)
+
+        self.sample_table = QTableWidget(0, 4)
+        self.sample_table.setHorizontalHeaderLabels(["Fixture", "Captured point", "Pan", "Tilt"])
+        layout.addWidget(self.sample_table, stretch=1)
+        return page
+
+    def _current_fixture_index(self):
+        return self.fixture_indices[self.fixture_pos]
+
+    def _enter_guided_step(self):
+        name, x, y, z = self.points[self.point_index]
+        fixture_index = self._current_fixture_index()
+        self.progress_label.setText(
+            f"Point {self.point_index + 1} of {len(self.points)}  ·  "
+            f"Fixture {self.fixture_pos + 1} of {len(self.fixture_indices)}: {self.fixtures[fixture_index].name}"
+        )
+        self.point_label.setText(f"Aim this fixture at: {name} — X {x:g}, Y {y:g}, Z {z:g}")
+        self.fixture_stack.setCurrentWidget(self.rows[fixture_index])
+        self.back_button.setEnabled(not (self.point_index == 0 and self.fixture_pos == 0))
+        counts = ", ".join(f"{self.fixtures[i].name}: {len(self.samples[i])}" for i in self.fixture_indices)
+        self.guided_status_label.setText(f"Captured so far — {counts}")
+
+    def _on_guided_next(self):
+        name, x, y, z = self.points[self.point_index]
+        fixture_index = self._current_fixture_index()
+        row = self.rows[fixture_index]
+        sample = (x, y, z, row.pan(), row.tilt())
+        self.samples[fixture_index].append(sample)
+        table_row = self.sample_table.rowCount()
+        self.sample_table.insertRow(table_row)
+        self.sample_table.setItem(table_row, 0, QTableWidgetItem(self.fixtures[fixture_index].name))
+        self.sample_table.setItem(table_row, 1, QTableWidgetItem(f"{name} ({x:g}, {y:g}, {z:g})"))
+        self.sample_table.setItem(table_row, 2, QTableWidgetItem(f"{sample[3]:.3f}"))
+        self.sample_table.setItem(table_row, 3, QTableWidgetItem(f"{sample[4]:.3f}"))
+
+        self.fixture_pos += 1
+        if self.fixture_pos >= len(self.fixture_indices):
+            self.fixture_pos = 0
+            self.point_index += 1
+        if self.point_index >= len(self.points):
+            self._finish_guided()
+            return
+        self._enter_guided_step()
+
+    def _on_guided_back(self):
+        self.fixture_pos -= 1
+        if self.fixture_pos < 0:
+            if self.point_index == 0:
+                self.fixture_pos = 0
+                return
+            self.point_index -= 1
+            self.fixture_pos = len(self.fixture_indices) - 1
+        # Undo the capture made for this step, if any, so re-capturing on
+        # Next doesn't leave a duplicate sample behind.
+        fixture_index = self._current_fixture_index()
+        if self.samples[fixture_index]:
+            self.samples[fixture_index].pop()
+            last_row = self.sample_table.rowCount() - 1
+            if last_row >= 0:
+                self.sample_table.removeRow(last_row)
+        self._enter_guided_step()
+
+    def _on_cancel_guided(self):
+        self._stop_output_internal()
+        self.stack.setCurrentWidget(self.setup_page)
+
+    def _finish_guided(self):
+        self._stop_output_internal()
+        self._populate_done_page()
+        self.stack.setCurrentWidget(self.done_page)
+
+    # -- Done page: solve and apply --------------------------------------
+
+    def _build_done_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("All points captured for every fixture."))
+        self.done_summary_table = QTableWidget(0, 2)
+        self.done_summary_table.setHorizontalHeaderLabels(["Fixture", "Samples captured"])
+        layout.addWidget(self.done_summary_table)
+
+        solve_button = QPushButton("Solve and apply all")
+        solve_button.clicked.connect(self._on_solve)
+        layout.addWidget(solve_button)
+        self.done_status_label = QLabel("")
+        self.done_status_label.setWordWrap(True)
+        layout.addWidget(self.done_status_label)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+        layout.addStretch(1)
+        return page
+
+    def _populate_done_page(self):
+        self.done_summary_table.setRowCount(len(self.fixture_indices))
+        for row, index in enumerate(self.fixture_indices):
+            self.done_summary_table.setItem(row, 0, QTableWidgetItem(self.fixtures[index].name))
+            self.done_summary_table.setItem(row, 1, QTableWidgetItem(str(len(self.samples[index]))))
+
+    def _on_solve(self):
+        messages = []
+        try:
+            for index in self.fixture_indices:
+                fixture_type = self.fixture_types[index]
+                solved, rms = solve_fixture_calibration(
+                    self.fixtures[index], fixture_type.pan_min, fixture_type.pan_max, self.samples[index])
+                self.main_window.settings.fixtures[index] = solved
+                messages.append(
+                    f"{solved.name}: XYZ=({solved.x:.3f}, {solved.y:.3f}, {solved.z:.3f}), "
+                    f"pan zero={solved.pan_zero_bearing:.3f}, tilt zero={solved.tilt_zero_elevation:.3f}, "
+                    f"fit={rms:.3f} m"
+                )
+            self.done_status_label.setText("Applied:\n" + "\n".join(messages))
+            self.main_window.fixtures_tab._refresh_list()
+            self.main_window.fixtures_tab._load_fixture(self.fixture_indices[0])
+        except Exception as exc:
+            QMessageBox.critical(self, "FART", str(exc))
+
+    # -- Output --------------------------------------------------------
+
+    def _start_output_internal(self):
+        if self.output_running:
+            return
+        if self.main_window.runner.running:
+            QMessageBox.critical(self, "FART", "Stop the main FART output before calibration output.")
+            return
+        try:
+            settings = self.main_window.settings
+            output_cls = OUTPUT_PLUGINS[settings.dmx_out.active]
+            self.output = output_cls()
+            self.output.start(getattr(settings.dmx_out, settings.dmx_out.active))
+            self.output_running = True
+        except Exception as exc:
+            QMessageBox.critical(self, "FART", str(exc))
+
+    def _stop_output_internal(self):
+        self.output_running = False
+        if self.output:
+            try:
+                self.output.send(blank_frames_for_settings(self.main_window.settings))
+                self.output.close()
+            except Exception:
+                pass
+            self.output = None
+
+    def _output_tick(self):
+        if not (self.output_running and self.output):
+            return
+        try:
+            frames = blank_frames_for_settings(self.main_window.settings)
+            # Only the fixture whose turn it currently is gets written --
+            # every other fixture (including ones already done, or not
+            # reached yet) stays at the blank/blacked-out frame above, even
+            # when it shares a universe with the active fixture.
+            if self.stack.currentWidget() is self.guided_page and self.points:
+                fixture_index = self._current_fixture_index()
+                fixture = self.fixtures[fixture_index]
+                resolved = resolve_fixture(fixture, self.fixture_types[fixture_index])
+                row = self.rows[fixture_index]
+                frame = frames.setdefault(int(fixture.output_universe), bytearray(512))
+                write_fixture_to_frame(frame, resolved, row.pan(), row.tilt(), row.level(), False,
+                                        row.zoom(), row.iris(), self.main_window.runner.focus_value)
+            self.output.send(frames)
+        except Exception as exc:
+            self.guided_status_label.setText("Output error: " + str(exc))
+            self.output_running = False
+
+    def closeEvent(self, event):
+        self._remove_key_filter()
+        self._stop_output_internal()
+        super().closeEvent(event)
