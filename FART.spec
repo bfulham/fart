@@ -3,17 +3,14 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
-
-sacn_datas, sacn_binaries, sacn_hiddenimports = collect_all("sacn")
 app_version = Path("VERSION").read_text().strip()
 
 a = Analysis(
-    ["fart.py"],
+    ["run_fart.py"],
     pathex=[],
-    binaries=sacn_binaries,
-    datas=sacn_datas,
-    hiddenimports=sacn_hiddenimports,
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,13 +23,15 @@ if sys.platform == "darwin":
     # Onefile mode in combination with a macOS .app bundle is deprecated by
     # PyInstaller ("don't make sense... will become an error in v7.0"), so
     # macOS builds a onedir EXE and wraps it in BUNDLE() below. Windows (the
-    # else branch) keeps the existing single-file EXE unchanged.
+    # else branch) keeps a single-file EXE. Named "FART2" (not "FART") so a
+    # user can keep the v1 and v2 builds side by side without one
+    # overwriting the other.
     exe = EXE(
         pyz,
         a.scripts,
         [],
         exclude_binaries=True,
-        name="FART",
+        name="FART2",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -50,16 +49,16 @@ if sys.platform == "darwin":
         a.datas,
         strip=False,
         upx=True,
-        name="FART",
+        name="FART2",
     )
     app = BUNDLE(
         coll,
-        name="FART.app",
+        name="FART2.app",
         icon=None,
-        bundle_identifier="com.bfulham.fart",
+        bundle_identifier="com.bfulham.fart2",
         info_plist={
-            "CFBundleName": "FART",
-            "CFBundleDisplayName": "FART",
+            "CFBundleName": "FART2",
+            "CFBundleDisplayName": "FART 2",
             "CFBundleShortVersionString": app_version,
             "CFBundleVersion": app_version,
             "NSHighResolutionCapable": True,
@@ -73,7 +72,7 @@ else:
         a.binaries,
         a.datas,
         [],
-        name="FART",
+        name="FART2",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
