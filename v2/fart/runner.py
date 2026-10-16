@@ -61,6 +61,10 @@ class Runner:
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        for fixture in settings.fixtures:
+            if fixture.enabled and int(fixture.console_mode_channel) > 0 and int(fixture.shadow_universe) <= 0:
+                self.log(f"WARNING: {fixture.name} has a console mode channel but no shadow universe -- "
+                         "in full passthrough (mode < 128) it will output nothing")
         self.log(f"Started: PSN in, DMX in ({settings.dmx_in.active}), DMX out ({settings.dmx_out.active})")
 
     def _loop(self):

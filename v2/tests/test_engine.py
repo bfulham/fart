@@ -195,7 +195,32 @@ class RunCycleTests(unittest.TestCase):
         bus.update(0, console_frame)
         state = CycleState()
         frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, time.monotonic(), state)
-        self.assertEqual(statuses[0]["error"], "MANUAL (console)")
+        self.assertTrue(statuses[0]["error"].startswith("MANUAL (console)"))
+
+    def _manual_passthrough_status(self, shadow_universe, publish_shadow=True, **type_overrides):
+        settings = self._settings(
+            type_overrides={"dimmer": 5, "pan_coarse": 1, "footprint": 10, **type_overrides},
+            console_universe=1, console_mode_channel=10, shadow_universe=shadow_universe, shadow_start_address=1,
+        )
+        trackers = TrackerBank()
+        trackers.update(1, 5.0, 0.0, 5.0)
+        bus = ExternalInputBus()
+        bus.update(1, bytearray(512))  # mode channel 10 = 0 -> manual
+        if publish_shadow and shadow_universe:
+            bus.update(shadow_universe, bytearray(512))
+        _frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, time.monotonic(), CycleState())
+        return statuses[0]["error"]
+
+    def test_manual_passthrough_says_why_when_there_is_nothing_to_pass(self):
+        self.assertIn("no shadow universe", self._manual_passthrough_status(shadow_universe=0))
+        self.assertIn("waiting for shadow feed on universe 2",
+                      self._manual_passthrough_status(shadow_universe=2, publish_shadow=False))
+        self.assertIn("footprint is 0", self._manual_passthrough_status(
+            shadow_universe=2, footprint=0, dimmer=0, pan_coarse=0, pan_fine=0, tilt_coarse=0, tilt_fine=0,
+            dimmer_fine=0, shutter=0, zoom=0, zoom_fine=0, iris=0, focus=0, focus_fine=0))
+
+    def test_manual_passthrough_with_a_working_feed_has_no_complaint(self):
+        self.assertEqual(self._manual_passthrough_status(shadow_universe=2), "MANUAL (console)")
 
     def test_console_relay_manual_mode_with_shadow_patch_passes_dimmer_through(self):
         settings = self._settings(

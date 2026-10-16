@@ -443,6 +443,20 @@ def fixture_has_shadow(fixture: FixtureConfig) -> bool:
     return int(fixture.shadow_universe) > 0
 
 
+def passthrough_problem(fixture: FixtureConfig, footprint: int, shadow_frame) -> str:
+    """Why full passthrough (mode < 128) is putting nothing on the wire, as a
+    suffix for the Operator table's state, or "" if it is working. In full
+    passthrough FART writes nothing itself, so with no usable shadow feed the
+    light silently gets all zeros -- this makes that visible instead."""
+    if not fixture_has_shadow(fixture):
+        return " -- NOTHING TO PASS: no shadow universe patched on this fixture"
+    if footprint <= 0:
+        return " -- NOTHING TO PASS: fixture footprint is 0 (pick a GDTF mode or set the type's footprint)"
+    if shadow_frame is None:
+        return f" -- waiting for shadow feed on universe {int(fixture.shadow_universe)}"
+    return ""
+
+
 def _source_label(wants_dmx: bool, has_feed: bool, use_dmx_in: bool) -> str:
     """'dmx' | 'manual' | 'manual (no DMX feed)' | 'manual (DMX in off)' --
     for the Operator tab's per-fixture source columns, so a fixture that
@@ -508,6 +522,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                       if console_relay and int(fixture.console_marker_channel) > 0 else None)
 
         shadow_stale = False
+        shadow_frame = None
         if has_shadow:
             shadow_frame, shadow_ts = bus.get(fixture.shadow_universe)
             shadow_stale = shadow_frame is None or (cycle_start - shadow_ts) > dmx_timeout_s
@@ -531,7 +546,9 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
                 "index": index, "name": fixture.name, "marker_id": fixture.marker_id,
                 "output_universe": fixture.output_universe,
                 "marker_xyz": marker_xyz, "fixture_xyz": (fixture.x, fixture.y, fixture.z),
-                "error": "MANUAL (console)", "stale": False, "blackout": False,
+                "error": "MANUAL (console)" + passthrough_problem(
+                    fixture, resolved.footprint, shadow_frame if has_shadow else None),
+                "stale": False, "blackout": False,
                 "pan_limit": False, "tilt_limit": False,
                 "dmx_mode": dmx_mode, "dmx_marker": dmx_marker, "dmx_lost": False,
                 "dimmer_source": "passthrough", "beam_source": "passthrough",
