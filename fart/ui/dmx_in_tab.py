@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QRadioButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from .binding import bind_int
+from .binding import bind_float, bind_int
 from .dmx_channel_grid import DmxChannelGrid
 
 
@@ -35,6 +35,14 @@ class DMXInTab(QWidget):
 
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
+
+        timeout_form = QFormLayout()
+        self.timeout_edit = bind_float(QLineEdit(), dmx_in, "timeout_s", lo=0.1)
+        self.timeout_edit.setToolTip(
+            "How long a universe can go without a packet before the console feed counts as lost. "
+            "Set it comfortably above your console's send interval.")
+        timeout_form.addRow("Input timeout (s)", self.timeout_edit)
+        layout.addLayout(timeout_form)
 
         artnet_panel = QWidget()
         artnet_form = QFormLayout(artnet_panel)

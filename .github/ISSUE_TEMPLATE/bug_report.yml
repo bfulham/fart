@@ -10,33 +10,47 @@ body:
     id: version
     attributes:
       label: FART version
-      placeholder: 0.4.0
+      placeholder: 2.2.1
     validations:
       required: true
   - type: dropdown
     id: output
     attributes:
-      label: Output mode
+      label: DMX out protocol
       options: [Open DMX, Art-Net, sACN, Not applicable]
     validations:
       required: true
   - type: dropdown
-    id: fader
+    id: input
     attributes:
-      label: Fader mode
-      options: [Manual, OSC, Art-Net Input, Not applicable]
+      label: DMX in protocol
+      options: [Art-Net, sACN, Not used]
+    validations:
+      required: true
+  - type: dropdown
+    id: dimmer
+    attributes:
+      label: Dimmer mode (Operator tab)
+      options: [Manual, DMX in, Not applicable]
+    validations:
+      required: true
+  - type: dropdown
+    id: beam
+    attributes:
+      label: Beam mode (Operator tab)
+      options: [Manual, Auto size, DMX passthrough, Not applicable]
     validations:
       required: true
   - type: textarea
     id: fixture
     attributes:
       label: Fixture and channel mapping
-      description: Include model, mode, start address, and relevant absolute DMX channels.
+      description: Include the fixture model, DMX mode, output and shadow/console patches (universe and start address), and the fixture type's channel offsets.
   - type: textarea
     id: psn
     attributes:
       label: PSN status
-      description: Include packets, data, selected, and positions counters.
+      description: Include the PSN counters from the Operator tab, and the PSN In tab's tracker table if relevant.
   - type: textarea
     id: steps
     attributes:

@@ -404,6 +404,16 @@ class DMXInTabTests(WindowTestCase):
         self.assertEqual(self.window.settings.dmx_in.sacn.universe, 9)
 
 
+class DMXInTimeoutFieldTests(WindowTestCase):
+    def test_timeout_is_editable_and_saved_to_settings(self):
+        tab = self.window.dmx_in_tab
+        self.assertEqual(tab.timeout_edit.text(), "3")
+        tab.timeout_edit.clear()
+        QTest.keyClicks(tab.timeout_edit, "7.5")
+        QTest.keyClick(tab.timeout_edit, Qt.Key.Key_Return)
+        self.assertEqual(self.window.settings.dmx_in.timeout_s, 7.5)
+
+
 class OperatorTabStartStopTests(WindowTestCase):
     def test_start_click_runs_and_stop_click_stops(self):
         self.window.settings.dmx_out.active = "artnet"
@@ -439,6 +449,19 @@ class OperatorTabStartStopTests(WindowTestCase):
         QTest.mouseClick(tab.start_button, Qt.MouseButton.LeftButton)
         self.assertEqual(tab.fader_slider.value(), 0)
         self.assertEqual(self.window.runner.fader.get()[0], 0.0)
+
+
+class OperatorPSNStatusTests(WindowTestCase):
+    def test_psn_counters_show_while_running_and_dash_when_stopped(self):
+        tab = self.window.operator_tab
+        tab.refresh_status(None)
+        self.assertEqual(tab.status_labels["PSN"].text(), "—")
+        self.window.settings.psn_in.multicast, self.window.settings.psn_in.port = "236.10.10.15", 56579
+        self.window.settings.dmx_out.active = "artnet"
+        self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        QTest.mouseClick(tab.start_button, Qt.MouseButton.LeftButton)
+        tab.refresh_status(None)
+        self.assertTrue(tab.status_labels["PSN"].text().startswith("packets 0"))
 
 
 class OperatorControlModelTests(WindowTestCase):

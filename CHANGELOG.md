@@ -1,4 +1,11 @@
-# FART v2 changelog
+# Changelog
+
+## Unreleased
+
+- **v2 is now the whole project.** The v1 Tkinter app (`fart.py`) and its tests, packaging and CI are removed from `main`; v2 moves from `v2/` to the repository root. v1 stays available in the git history and under the `v1.x` tags. Release builds are named `FART.exe` / `FART.app` (`FART-Windows-x64.zip` / `FART-macOS-arm64.zip`) rather than `FART2`, which only existed so v2 could sit beside v1; settings files keep their `FART2.fart` name so nothing is orphaned.
+- New root README, contributing guide, release checklist, and issue and PR templates for v2; the code walkthrough moves to `docs/ARCHITECTURE.md`.
+- DMX In tab: the DMX-in input timeout (added in 2.2.0) now has a field.
+- Operator tab: the PSN packet counters line is now filled in.
 
 ## 2.2.1
 
@@ -50,3 +57,151 @@ Changes from field testing. Breaking changes first.
 **Fixed**
 - The PSN decoder stopped reading a tracker's fields at the position chunk;
   it now reads them all.
+
+---
+
+# v1 history
+
+Changes for the earlier single-file Tkinter application (v0.x–v1.x), kept for reference.
+
+## 1.6.0
+
+- Add a macOS build (Apple Silicon), alongside the existing Windows build: `FART.spec` now produces a proper `FART.app` bundle on macOS (onedir + `BUNDLE()`, distinct from Windows' onefile `EXE`), CI builds and tests on both platforms and attaches both zips to tagged releases, and new `build_macos_app.sh`/`run_source_macos.command` scripts mirror the existing Windows ones. Not yet verified on real macOS hardware — CI-built and launched successfully in CI, but no real console, Open DMX interface, or physical fixture testing has been done on macOS yet.
+- Rewrite README.md and the supporting docs (`docs/CALIBRATION.md`, `docs/GRANDMA3_TESTING.md`, `docs/RELEASE_CHECKLIST.md`, `CONTRIBUTING.md`, `SECURITY.md`) for structure and accuracy — no behavioural changes.
+
+## 1.5.0
+
+- Add optional live console control (Art-Net only): patch a fixture normally, then patch a companion "FART control" fixture on the same output universe exposing a mode channel and a marker-select channel. Mode <128 relays that fixture's own channels straight through from the console untouched; >=128 hands pan/tilt (and zoom/iris, unless Auto beam size applies) back to FART while dimmer keeps passing through from the console.
+- Add per-fixture "On tracking loss" (Blackout / Keep current intensity) and "On console signal loss" (Blackout / Keep tracking, force dimmer off / Keep tracking, hold last dimmer) policies, so losing PSN tracking and losing the console's own signal can be handled independently.
+- Live console marker reassignment: switching which PSN marker a fixture follows (or returning from manual passthrough to auto-follow) now forces a fresh snap and a brief configurable blackout window instead of sweeping across the space while lit.
+- Fix worker-thread Tk access in the live output loop that could intermittently crash the whole running session.
+- Fix position smoothing continuing to blend through a tracking dropout, which could sweep a lit fixture across the space once tracking reacquired somewhere else.
+- Fix the multi-fixture calibration solver freezing the wizard UI (and the live calibration DMX tick) while solving; it now runs on a background thread.
+- Relabel "stage right/left" as "house right/left" in the calibration wizard and documentation, to avoid confusion with the opposite, traditional actor-perspective meaning of "stage right/left".
+- Remove dead "set current bearing/elevation as zero" code and stale repository files (`fart.py.bak`, committed bytecode).
+
+## 1.4.1
+
+- Import pan and tilt physical limits from GDTF files when available.
+- Keep configured fixture positions fixed in the 3D preview instead of recentering around moving markers.
+- Add live spot-diameter slider and numeric entry for Auto Beam mode.
+- Disable manual zoom and iris sliders when Auto Beam mode is active.
+- Add per-fixture Blackout on Limit, with optional zoom/iris-to-100% during limit blackout.
+- Add optional setup-tab locking while live output is running.
+- Add lead/lag marker prediction in milliseconds for fast motion or intentional delay.
+
+## 1.3.0
+
+- Added per-light output universe assignment.
+- Art-Net output now sends every enabled fixture universe in use.
+- sACN output now activates and sends every enabled fixture universe in use.
+- Open DMX now supports multiple USB adapters with `COMx=universe` mapping, for example `COM3=0, COM4=1`.
+- Channel-overlap validation is now per universe.
+- Calibration output and blackout now honour multi-universe routing.
+- Added automated tests for per-universe channel validation and Open DMX adapter parsing.
+
+## 1.2.0
+
+- Added iris-assisted Auto beam size. FART now uses zoom first, then closes iris if the requested spot diameter is smaller than the tightest zoom beam.
+- Added per-fixture iris physical model fields: Iris physical at 0% and Iris physical at 100%.
+- GDTF import now reads Iris `PhysicalFrom` / `PhysicalTo` values when available, including common `1=open` to `0=closed` files.
+- Operator overview now shows auto beam zoom and iris values.
+- Added automated tests for iris-assisted beam sizing and GDTF iris physical import.
+
+## 1.2.0
+
+- Renamed the live run page to Operator and setup pages to Setup: Lights/I/O/Calibration.
+- Added Auto beam size zoom mode.
+- Added per-fixture beam angle fields for zoom 0% and 100%.
+- GDTF import now attempts to import Zoom PhysicalFrom/PhysicalTo beam angles for the selected mode.
+- Auto beam mode is greyed out when no enabled fixture has usable beam-angle data.
+- Added automated tests for GDTF zoom physical import and auto zoom calculation.
+
+## 1.0.2 - Production baseline
+
+- Rebuilt the repository as a clean GitHub-ready release with no generated caches or prototype leftovers.
+- Kept existing tested functionality: PSN marker tracking, per-light marker assignment, multi-light aiming, manual/OSC/Art-Net fader modes, Art-Net/sACN/Open DMX output, GDTF import, beam controls, and multi-fixture calibration.
+- Polished the UI spacing, window sizing, notebook tabs, and labelframe/table styling.
+- Retained backwards-compatible settings migration from earlier FART/OpenFollow Followspot configurations.
+- Re-ran the geometry, PSN, DMX, calibration, and GDTF importer test suite.
+
+## 0.8.0
+
+- Added zoom and iris controls to the calibration wizard so users can aim with a tighter beam.
+- Added fine pan/tilt nudge controls for accurate calibration aiming.
+- Added multi-fixture calibration: select multiple lights, aim all of them at the same target point, capture, then solve all selected fixture positions at once.
+- Changed the Lights list to support multi-select for calibration.
+
+## 0.7.3
+
+- GDTF import now prompts for the fixture DMX mode instead of always using the first mode in the file.
+- GDTF import now applies the selected mode in both the main light editor and the pre-calibration DMX setup wizard.
+- GDTF import now attempts to derive shutter-open DMX values from open shutter ranges.
+- GDTF import now attempts to derive the iris 100% cap from the normal iris range before effect/pulse/pattern ranges.
+- Added automated GDTF importer coverage for mode selection, shutter open, iris cap, and 16-bit attributes.
+
+## 0.7.2
+
+- Fixed calibration dialogs calling the old light-editor method name.
+- Added zoom, iris, focus, and iris 100% DMX point fields to the DMX setup wizard.
+- Changed new-fixture default tilt direction to -1 to match common moving-head tilt behaviour.
+- Added basic GDTF channel import for pan, tilt, dimmer, shutter, zoom, iris, and focus setup.
+- Capped iris output at a configurable DMX value so 100% can avoid effect ranges above the usable iris band.
+
+## 0.7.1 - 2026-07-20
+
+- Calibration now requires DMX setup first.
+- Added a DMX setup dialog before calibration so pan, tilt, dimmer, and optional shutter channels are confirmed before any calibration output can start.
+- Starting calibration on an incomplete fixture now opens DMX setup instead of the pan/tilt aiming wizard.
+
+## 0.7.0 - 2026-07-20
+
+- Replaced confusing set-zero calibration buttons with a fixture calibration wizard.
+- New fixtures now prompt for manual setup or calibration.
+- Calibration mode provides pan/tilt faders, aiming output, fixed/custom target points, capture workflow, and solver.
+- Solver estimates fixture optical-centre XYZ plus pan-zero bearing and tilt-zero elevation from captured aim samples.
+- Added automated calibration-solver test.
+
+All notable changes to FART are documented here.
+
+## 0.6.0 - 2026-07-05
+
+- Added live shared zoom, iris, and focus controls to the Overview tab.
+- Added per-light zoom, iris, and focus DMX channel mapping.
+- Added optional 16-bit fine channels for zoom and focus.
+- Added per-light reverse controls for fixture personalities with inverted attribute ranges.
+- Extended channel conflict validation, duplication, configuration migration, tests, and the MAC Quantum example.
+
+## 0.5.0 - 2026-07-04
+
+- Added independent PSN marker selection for every light.
+- PSN receiver now retains live positions for all discovered trackers simultaneously.
+- Rebuilt the Overview tab for multi-light operation.
+- Added a live per-light status table with marker, XYZ, pan/tilt, distance, limits, and tracking state.
+- Added a lightweight interactive 3D preview showing fixtures, markers, and beam lines.
+- Added per-light tracking-loss blackout so one lost marker does not black out lights following other healthy markers.
+- Added migration of existing configurations so each light inherits the previous global marker ID.
+- Added multi-tracker PSN decoder test coverage.
+
+## 0.4.0 - 2026-06-28
+
+- Renamed the application to **FART — Fixture Aiming and Remote Tracking**.
+- Renamed the executable to `FART.exe`.
+- Moved the normal settings file to `%APPDATA%\FART.json`.
+- Added automatic migration from `%APPDATA%\OpenFollowFollowspot.json`.
+- Added a complete GitHub-ready repository structure, tests, documentation, examples, issue templates, and Windows build automation.
+
+## 0.3.1 - 2026-06-28
+
+- Fixed sACN startup with the current `sacn` package.
+- Enabled multicast output and validated sACN universe ranges.
+
+## 0.3.0 - 2026-06-28
+
+- Added support for multiple independently calibrated fixtures aimed at one PSN marker.
+- Added per-light channel conflict detection and optional 16-bit dimmer output.
+
+## 0.2.1 - 2026-06-28
+
+- Fixed OpenFollow/pypsn position-chunk decoding.
+- Added detailed PSN diagnostics.

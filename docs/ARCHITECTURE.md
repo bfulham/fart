@@ -1,13 +1,14 @@
-# FART v2 (in progress)
+# FART architecture
 
-A ground-up redesign, developed here alongside the shipped v1 (`fart.py` at
-the repo root, untouched) until it's ready to replace it. Nothing here is
-wired into the v1 app, its tests, or its CI.
+How the code is organised. The engine, plugins and PySide6 UI are separate
+layers: the engine is plain functions on plain data (no sockets, no UI), the
+plugins own the network and serial I/O, the runner wires them together on a
+background thread, and the UI only ever reads settings and the runner's live
+state. Run the app with `python3 -m fart` from the repository root.
 
-The engine, plugins, and PySide6 UI are all in place and runnable
-(`python3 -m fart` from this directory). What's left before this can
-replace v1 is packaging and real-hardware verification -- see "What's *not*
-here yet" below.
+FART was rewritten from a single-file Tkinter app (v1, still in the git
+history and under the `v1.x` tags); several notes below refer to what v1 did
+where that explains a design choice.
 
 ## Why
 
@@ -150,12 +151,14 @@ avoided by convention -- it's not a state the system can be in.
 OSC support is dropped entirely (was only ever an intensity-fader input
 option in v1; not needed going forward).
 
-## What's *not* here yet
+## Known gaps
 
 - Real hardware testing for `open_dmx_out.py` (no Open DMX USB adapter
   available to test against here).
-- Packaging (PyInstaller spec, CI build workflow) -- v1's exists at the repo
-  root; v2 needs its own once the app is otherwise feature-complete.
+- v1 refused to start when enabled fixtures overlapped on a DMX channel in
+  the same universe; that validation was not carried over.
+- Nothing here has been verified against a wide range of consoles, nodes and
+  fixtures; the console-control path has been run on one real rig.
 
 ## How this has been verified
 
@@ -174,10 +177,9 @@ resulting Art-Net (and separately sACN) output against an independently
 computed expected pan/tilt -- proving the full pipeline end to end, not
 just each piece in isolation.
 
-`tests/test_calibration.py` and `tests/test_gdtf.py` are carried over
-directly from v1's test suite (same fixture geometry, same synthetic GDTF
-file), confirming the ported solver and importer still produce the same
-results.
+`tests/test_calibration.py` and `tests/test_gdtf.py` were carried over
+from v1's test suite (same fixture geometry, same synthetic GDTF file),
+confirming the ported solver and importer produce the same results.
 
 `tests/test_ui.py` drives the real PySide6 widgets with `QTest` (real
 synthesized clicks and key events against a real, shown `MainWindow`, run
@@ -192,9 +194,6 @@ table until it shows the tracked fixture as "LIVE".
 Run the tests:
 
 ```bash
-cd v2
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
-
-67/67 passing as of this writing.

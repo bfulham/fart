@@ -2,25 +2,25 @@
 
 `fart_test_tool.py` is a standalone script that simulates OpenFollow's PSN
 traffic and decodes FART's actual DMX output, so FART's tracking math and
-[live console control](../README.md#live-console-control-optional) can be
+[console control](../README.md#console-control-shadow-patch-and-modemarker) can be
 exercised without OpenFollow, a real lighting console, or a physical
 fixture. It is dependency-free (standard library only) and does not import
-`fart.py`, so it can run on a different, lighter machine than FART itself.
+the `fart` package, so it can run on a different, lighter machine than FART itself.
 
 Run `python3 fart_test_tool.py --help` or `python3 fart_test_tool.py <command> --help`
 for the full flag list. The sections below cover the common cases.
 
 ## Setup
 
-In FART: add or use one light, set **Output** to **Art-Net** targeting this
+In FART: add or use one light, set **DMX Out** to **Art-Net** targeting this
 machine's IP (`127.0.0.1` if running the tool on the same machine as FART),
-and note its universe (default `0`). Click **Start**. For the most accurate
-`verify` results, also set **Smoothing** to `0` and **Lead/lag** to `0` —
-otherwise error is dominated by the smoothing filter's lag rather than any
-real problem.
+and note the fixture's output universe (default `0`). Click **START**. For the
+most accurate `verify` results, also set **Smoothing** to `0` and **Lead/lag**
+to `0` on the **PSN In** tab — otherwise error is dominated by the smoothing
+filter's lag rather than any real problem.
 
-You do not need to click **Arm all light dimmers** — pan/tilt is written to
-the DMX frame regardless of arming; only intensity depends on it.
+You do not need to raise the dimmer fader — pan/tilt is written to the DMX
+frame regardless; only intensity depends on it.
 
 ## Watch FART track a moving marker
 
@@ -28,9 +28,9 @@ the DMX frame regardless of arming; only intensity depends on it.
 python3 fart_test_tool.py send-psn --pattern circle --radius 2 --z 1.7 --speed 0.2
 ```
 
-Sends a marker slowly circling 2m out at head height. In FART, click
-**Auto-detect PSN trackers** (it should find marker `1`), assign it to your
-light, and watch the Light overview / 3D preview tabs update live.
+Sends a marker slowly circling 2m out at head height. In FART, the **PSN In**
+tab's tracker table should show marker `1`; assign it to your light as its PSN
+marker ID, and watch the Operator tab's overview table update live.
 `--pattern static` sends one fixed point; `--pattern line` sweeps back and
 forth. Multiple markers: run the command again in another terminal with a
 different `--marker-id`.
@@ -81,9 +81,9 @@ python3 fart_test_tool.py send-console --mode-channel 6 --marker-channel 7 --mod
 ```
 
 Sends a synthetic Art-Net frame acting as the console side of
-[live console control](../README.md#live-console-control-optional): set
+[console control](../README.md#console-control-shadow-patch-and-modemarker): set
 `--mode-channel`/`--marker-channel` to whatever you configured in FART's
-fixture (Lights tab -> DMX channels -> Live console control), and
+fixture (Fixtures tab -> Enable console mode/marker control), and
 `--mode manual`/`--mode auto` plus `--marker-id` to exercise passthrough vs.
 auto-follow and live marker reassignment. `--repeat` keeps sending (a single
 frame will eventually look stale to FART's console-signal-loss timeout).
