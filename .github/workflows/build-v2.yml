@@ -2,7 +2,8 @@ name: Build v2 (Windows and macOS)
 
 on:
   push:
-    branches: [v2/redesign]
+    branches: [main]
+    paths: ["v2/**"]
     tags: ["v2.*"]
   pull_request:
     paths: ["v2/**"]
