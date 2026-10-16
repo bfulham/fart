@@ -11,6 +11,10 @@ stays a clean, consistent semicircle regardless. Pan stays a plain
 -180..180 dial rather than trying to match a fixture's real (often wider
 than 360-degree) pan range, which a single-turn dial can't represent
 without ambiguity.
+
+Holding Shift while dragging switches to fine control: the needle no longer
+jumps to the mouse, it moves at a tenth of the mouse's own angular speed
+from wherever it already was, for precise last-degree alignment.
 """
 from __future__ import annotations
 
@@ -21,7 +25,45 @@ from PySide6.QtGui import QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 
-class PanDial(QWidget):
+FINE_FACTOR = 0.1
+
+
+class _FineDragMixin:
+    """Shared press/move handling: plain drag points the needle at the mouse;
+    Shift-drag moves it FINE_FACTOR as fast, relative to where it was when
+    Shift went down (re-based whenever Shift is pressed or released
+    mid-drag, so toggling never makes the needle jump)."""
+
+    def _delta(self, raw, reference):
+        return raw - reference
+
+    def _value_for_mouse(self, event):
+        raw = self._angle_from_pos(event.position())
+        fine = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if fine != self._fine_active or self._reference is None:
+            self._fine_active = fine
+            self._reference = (raw, self._value)
+        if not fine:
+            return raw
+        reference_raw, reference_value = self._reference
+        return reference_value + self._delta(raw, reference_raw) * FINE_FACTOR
+
+    def mousePressEvent(self, event):
+        self._dragging = True
+        self._reference = None
+        self._fine_active = None
+        self.setValue(self._value_for_mouse(event))
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self.setValue(self._value_for_mouse(event))
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        self._reference = None
+
+
+class PanDial(_FineDragMixin, QWidget):
     """Top-down view: 0 at top (facing upstage), positive angles clockwise
     (house right), matching the app's own bearing convention."""
 
@@ -32,6 +74,8 @@ class PanDial(QWidget):
         self.lo, self.hi = lo, hi
         self._value = 0.0
         self._dragging = False
+        self._reference = None
+        self._fine_active = None
         self.setMinimumSize(150, 150)
 
     def value(self):
@@ -56,16 +100,10 @@ class PanDial(QWidget):
         dx, dy = pos.x() - cx, pos.y() - cy
         return math.degrees(math.atan2(dx, -dy))
 
-    def mousePressEvent(self, event):
-        self._dragging = True
-        self.setValue(self._angle_from_pos(event.position()))
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            self.setValue(self._angle_from_pos(event.position()))
-
-    def mouseReleaseEvent(self, event):
-        self._dragging = False
+    def _delta(self, raw, reference):
+        # The dial wraps at +/-180, so a fine drag across the bottom must
+        # take the short way round rather than a near-360 degree jump.
+        return (raw - reference + 180.0) % 360.0 - 180.0
 
     def paintEvent(self, event):
         cx, cy, r = self._geometry()
@@ -98,7 +136,7 @@ class PanDial(QWidget):
         painter.drawRect(int(cx - 9), int(cy - 9), 18, 18)
 
 
-class TiltArc(QWidget):
+class TiltArc(_FineDragMixin, QWidget):
     """Side view: a fixture hanging from a truss, needle sweeping through
     an arc below it. lo/hi is that specific fixture's own tilt_min/
     tilt_max, drawn at its true angular width -- tilt 0 always points
@@ -114,6 +152,8 @@ class TiltArc(QWidget):
         self.lo, self.hi = lo, hi
         self._value = 0.0
         self._dragging = False
+        self._reference = None
+        self._fine_active = None
         self.setMinimumSize(190, 190)
 
     def value(self):
@@ -171,17 +211,6 @@ class TiltArc(QWidget):
         best = min((raw, raw + 360.0, raw - 360.0), key=distance_outside)
         angle = max(start, min(end, best))
         return self._value_from_display_angle(angle)
-
-    def mousePressEvent(self, event):
-        self._dragging = True
-        self.setValue(self._angle_from_pos(event.position()))
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            self.setValue(self._angle_from_pos(event.position()))
-
-    def mouseReleaseEvent(self, event):
-        self._dragging = False
 
     def paintEvent(self, event):
         cx, cy, r = self._geometry()

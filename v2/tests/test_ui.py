@@ -942,6 +942,160 @@ class CalibrationWizardTests(WindowTestCase):
             QTest.qWait(20)
 
 
+class CalibrationFineAdjustTests(WindowTestCase):
+    """Fine adjust in the calibration wizard: step buttons, exact numeric
+    entry, and arrow-key nudging (Shift = finer, Ctrl = coarser)."""
+
+    def setUp(self):
+        super().setUp()
+        self.window.settings.dmx_out.active = "artnet"
+        self.window.settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        self.wizard = CalibrationWizard(self.window, [0])
+        self.wizard.show()
+        QTest.qWait(50)
+        self.row = self.wizard.rows[0]
+        self.row.pan_slider.setValue(0)
+        self.row.tilt_slider.setValue(0)
+
+    def tearDown(self):
+        self.wizard._stop_output_internal()
+        self.wizard.output_timer.stop()
+        self.wizard.close()
+        self.wizard.deleteLater()
+        QTest.qWait(20)
+        super().tearDown()
+
+    def _go_guided(self):
+        self.wizard._on_start_guided()
+        self.assertIs(self.wizard.stack.currentWidget(), self.wizard.guided_page)
+
+    def _key(self, key, modifier=Qt.KeyboardModifier.NoModifier):
+        QTest.keyClick(self.wizard, key, modifier)
+
+    def test_plus_and_minus_buttons_move_by_the_selected_step(self):
+        row = self.row
+        self.assertEqual(row.step_combo.currentData(), 0.1, "0.1 degree is the default step")
+        QTest.mouseClick(row.pan_plus_button, Qt.MouseButton.LeftButton)
+        self.assertAlmostEqual(row.pan(), 0.1, places=6)
+        row.step_combo.setCurrentIndex(row.step_combo.findData(1.0))
+        QTest.mouseClick(row.pan_plus_button, Qt.MouseButton.LeftButton)
+        self.assertAlmostEqual(row.pan(), 1.1, places=6)
+        row.step_combo.setCurrentIndex(row.step_combo.findData(0.01))
+        QTest.mouseClick(row.tilt_minus_button, Qt.MouseButton.LeftButton)
+        self.assertAlmostEqual(row.tilt(), -0.01, places=6)
+
+    def test_numeric_entry_is_exact_and_stays_in_sync_with_the_slider(self):
+        row = self.row
+        row.pan_spin.setValue(12.345)
+        self.assertAlmostEqual(row.pan(), 12.345, places=6)
+        row.pan_slider.setValue(-45500)
+        self.assertAlmostEqual(row.pan_spin.value(), -45.5, places=6)
+        row.tilt_spin.setValue(-7.125)
+        self.assertAlmostEqual(row.tilt(), -7.125, places=6)
+
+    def test_dial_slider_and_spin_all_agree_after_a_nudge(self):
+        row = self.row
+        row.nudge("pan", +1, scale=10.0)  # 0.1 x 10 = 1 degree
+        self.assertAlmostEqual(row.pan(), 1.0, places=6)
+        self.assertAlmostEqual(row.pan_dial.value(), 1.0, places=6)
+        self.assertAlmostEqual(row.pan_spin.value(), 1.0, places=6)
+
+    def test_nudge_is_clamped_to_the_fixtures_range(self):
+        row = self.row
+        row.pan_slider.setValue(row.pan_slider.maximum())
+        row.nudge("pan", +1, scale=10.0)
+        self.assertEqual(row.pan_slider.value(), row.pan_slider.maximum())
+        row.tilt_slider.setValue(row.tilt_slider.minimum())
+        row.nudge("tilt", -1, scale=10.0)
+        self.assertEqual(row.tilt_slider.value(), row.tilt_slider.minimum())
+
+    def test_arrow_keys_nudge_pan_and_tilt_with_shift_fine_and_ctrl_coarse(self):
+        self._go_guided()
+        row = self.row
+        self._key(Qt.Key.Key_Right)
+        self.assertAlmostEqual(row.pan(), 0.1, places=6)
+        self._key(Qt.Key.Key_Left)
+        self._key(Qt.Key.Key_Left)
+        self.assertAlmostEqual(row.pan(), -0.1, places=6)
+        self._key(Qt.Key.Key_Up)
+        self.assertAlmostEqual(row.tilt(), 0.1, places=6)
+        self._key(Qt.Key.Key_Down)
+        self._key(Qt.Key.Key_Down)
+        self.assertAlmostEqual(row.tilt(), -0.1, places=6)
+        row.pan_slider.setValue(0)
+        self._key(Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier)
+        self.assertAlmostEqual(row.pan(), 0.01, places=6, msg="Shift = a tenth of the step")
+        row.pan_slider.setValue(0)
+        self._key(Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+        self.assertAlmostEqual(row.pan(), 1.0, places=6, msg="Ctrl = ten times the step")
+
+    def test_arrow_keys_do_nothing_outside_the_guided_page(self):
+        self.assertIs(self.wizard.stack.currentWidget(), self.wizard.setup_page)
+        self._key(Qt.Key.Key_Right)
+        self.assertEqual(self.row.pan(), 0.0)
+
+    def test_arrow_keys_are_left_alone_while_typing_in_a_spin_box(self):
+        self._go_guided()
+        with unittest.mock.patch("fart.ui.calibration_wizard.QApplication.focusWidget",
+                                 return_value=self.row.pan_spin):
+            self._key(Qt.Key.Key_Right)
+        self.assertEqual(self.row.pan(), 0.0, "the spin box's own arrow handling must win when it has focus")
+
+    def test_arrow_keys_stop_nudging_once_the_wizard_is_closed(self):
+        self._go_guided()
+        self.wizard.close()
+        QTest.qWait(20)
+        self.wizard.show()
+        self.wizard._remove_key_filter()
+        self._key(Qt.Key.Key_Right)
+        self.assertEqual(self.row.pan(), 0.0)
+
+    def test_shift_drag_on_the_pan_dial_moves_at_a_tenth_speed_without_jumping(self):
+        from PySide6.QtCore import QPointF, QEvent
+        from PySide6.QtGui import QMouseEvent
+        dial = self.row.pan_dial
+        dial.setValue(10.0)
+        cx, cy, r = dial._geometry()
+
+        def mouse(kind, x, y, modifier):
+            buttons = Qt.MouseButton.LeftButton if kind != QEvent.Type.MouseButtonRelease else Qt.MouseButton.NoButton
+            return QMouseEvent(kind, QPointF(x, y), Qt.MouseButton.LeftButton, buttons, modifier)
+
+        shift = Qt.KeyboardModifier.ShiftModifier
+        # Press at the top (raw angle 0) with Shift: must NOT jump from 10.
+        dial.mousePressEvent(mouse(QEvent.Type.MouseButtonPress, cx, cy - r, shift))
+        self.assertAlmostEqual(dial.value(), 10.0, places=6)
+        # Drag to house right (raw angle 90): 10 + 90 * 0.1 = 19.
+        dial.mouseMoveEvent(mouse(QEvent.Type.MouseMove, cx + r, cy, shift))
+        self.assertAlmostEqual(dial.value(), 19.0, places=4)
+        # Release Shift mid-drag: now it follows the mouse directly again.
+        dial.mouseMoveEvent(mouse(QEvent.Type.MouseMove, cx + r, cy, Qt.KeyboardModifier.NoModifier))
+        self.assertAlmostEqual(dial.value(), 90.0, places=4)
+        dial.mouseReleaseEvent(mouse(QEvent.Type.MouseButtonRelease, cx + r, cy, Qt.KeyboardModifier.NoModifier))
+
+    def test_pan_dial_fine_drag_wraps_the_short_way_round(self):
+        from PySide6.QtCore import QPointF, QEvent
+        from PySide6.QtGui import QMouseEvent
+        dial = self.row.pan_dial
+        dial.setValue(0.0)
+        cx, cy, r = dial._geometry()
+        shift = Qt.KeyboardModifier.ShiftModifier
+        # Raw angle goes 179 -> -179 (2 degrees across the bottom), which is
+        # a +2 move, not -358: fine value must change by 0.2, not by -35.8.
+        import math
+        def pos(angle):
+            return cx + r * math.sin(math.radians(angle)), cy - r * math.cos(math.radians(angle))
+        x, y = pos(179.0)
+        dial.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(x, y), Qt.MouseButton.LeftButton,
+                                         Qt.MouseButton.LeftButton, shift))
+        x, y = pos(-179.0)
+        dial.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, QPointF(x, y), Qt.MouseButton.LeftButton,
+                                        Qt.MouseButton.LeftButton, shift))
+        self.assertAlmostEqual(dial.value(), 0.2, places=3)
+        dial.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, QPointF(x, y), Qt.MouseButton.LeftButton,
+                                           Qt.MouseButton.NoButton, shift))
+
+
 class PanTiltDialTests(WindowTestCase):
     """The "Aim (dial)" tab added to each fixture row: drag the needle
     directly instead of reading a linear slider. The old sliders stay the
@@ -962,12 +1116,12 @@ class PanTiltDialTests(WindowTestCase):
             QTest.mouseMove(row.pan_dial, pos=QPoint(int(cx + r), int(cy)))
             QTest.mouseRelease(row.pan_dial, Qt.MouseButton.LeftButton, pos=QPoint(int(cx + r), int(cy)))
             self.assertAlmostEqual(row.pan_dial.value(), 90.0, delta=1.0)
-            self.assertAlmostEqual(row.pan_slider.value() / 100.0, row.pan_dial.value(), delta=0.1,
+            self.assertAlmostEqual(row.pan_slider.value() / 1000.0, row.pan_dial.value(), delta=0.1,
                                     msg="dragging the dial must update the paired slider")
 
             # And the reverse direction: moving the old slider updates the
             # dial too, so whichever tab you look at is always current.
-            row.pan_slider.setValue(-9000)
+            row.pan_slider.setValue(-90000)
             self.assertAlmostEqual(row.pan_dial.value(), -90.0, delta=0.1,
                                     msg="moving the slider must update the dial")
         finally:

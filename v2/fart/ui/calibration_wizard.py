@@ -10,11 +10,12 @@ every fixture, solve and apply per fixture against the shared point list.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtWidgets import (
-    QButtonGroup, QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QMessageBox, QPushButton, QRadioButton, QSlider,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QButtonGroup, QComboBox, QDialog,
+    QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QMessageBox, QPushButton, QRadioButton, QSlider, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..calibration import solve_fixture_calibration
@@ -32,6 +33,14 @@ DEFAULT_TARGETS = [
 ]
 
 
+# Pan/tilt sliders resolve to 0.001 degrees (the finest nudge step); the
+# other sliders stay at 0.01 percent.
+AIM_SCALE = 1000
+LEVEL_SCALE = 100
+FINE_STEPS = [("1°", 1.0), ("0.1°", 0.1), ("0.01°", 0.01)]
+DEFAULT_STEP_INDEX = 1
+
+
 class _FixtureRow(QWidget):
     def __init__(self, fixture, fixture_type):
         super().__init__()
@@ -43,11 +52,11 @@ class _FixtureRow(QWidget):
 
         pan_min, pan_max = fixture_type.pan_min, fixture_type.pan_max
         tilt_min, tilt_max = fixture_type.tilt_min, fixture_type.tilt_max
-        self.pan_slider = self._slider(pan_min, pan_max, (pan_min + pan_max) / 2)
-        self.tilt_slider = self._slider(tilt_min, tilt_max, (tilt_min + tilt_max) / 2)
-        self.level_slider = self._slider(0, 100, 100)
-        self.zoom_slider = self._slider(0, 100, 50)
-        self.iris_slider = self._slider(0, 100, 100)
+        self.pan_slider = self._slider(pan_min, pan_max, (pan_min + pan_max) / 2, AIM_SCALE)
+        self.tilt_slider = self._slider(tilt_min, tilt_max, (tilt_min + tilt_max) / 2, AIM_SCALE)
+        self.level_slider = self._slider(0, 100, 100, LEVEL_SCALE)
+        self.zoom_slider = self._slider(0, 100, 50, LEVEL_SCALE)
+        self.iris_slider = self._slider(0, 100, 100, LEVEL_SCALE)
 
         tabs = QTabWidget()
         outer.addWidget(tabs)
@@ -83,35 +92,102 @@ class _FixtureRow(QWidget):
         # sync in both directions regardless of which tab is showing.
         # setValue(..., _emit=False) on the receiving end stops these from
         # ping-ponging back and forth.
-        self.pan_dial.setValue(self.pan_slider.value() / 100.0, _emit=False)
-        self.pan_dial.valueChanged.connect(lambda v: self.pan_slider.setValue(int(round(v * 100))))
-        self.pan_slider.valueChanged.connect(lambda v: self.pan_dial.setValue(v / 100.0, _emit=False))
+        self.pan_dial.setValue(self.pan_slider.value() / AIM_SCALE, _emit=False)
+        self.pan_dial.valueChanged.connect(lambda v: self.pan_slider.setValue(int(round(v * AIM_SCALE))))
+        self.pan_slider.valueChanged.connect(lambda v: self.pan_dial.setValue(v / AIM_SCALE, _emit=False))
 
-        self.tilt_dial.setValue(self.tilt_slider.value() / 100.0, _emit=False)
-        self.tilt_dial.valueChanged.connect(lambda v: self.tilt_slider.setValue(int(round(v * 100))))
-        self.tilt_slider.valueChanged.connect(lambda v: self.tilt_dial.setValue(v / 100.0, _emit=False))
+        self.tilt_dial.setValue(self.tilt_slider.value() / AIM_SCALE, _emit=False)
+        self.tilt_dial.valueChanged.connect(lambda v: self.tilt_slider.setValue(int(round(v * AIM_SCALE))))
+        self.tilt_slider.valueChanged.connect(lambda v: self.tilt_dial.setValue(v / AIM_SCALE, _emit=False))
 
-    def _slider(self, lo, hi, initial):
+        outer.addWidget(self._build_fine_adjust(pan_min, pan_max, tilt_min, tilt_max))
+
+    def _build_fine_adjust(self, pan_min, pan_max, tilt_min, tilt_max):
+        """Exact numeric entry plus +/- step buttons for pan and tilt,
+        always visible whichever aiming tab is showing. The sliders stay
+        the source of truth; the spin boxes are another view of them."""
+        box = QGroupBox("Fine adjust (arrow keys also nudge: Left/Right pan, Up/Down tilt; "
+                        "Shift = ÷10, Ctrl = ×10)")
+        grid = QGridLayout(box)
+        grid.addWidget(QLabel("Step"), 0, 0)
+        self.step_combo = QComboBox()
+        for label, value in FINE_STEPS:
+            self.step_combo.addItem(label, value)
+        self.step_combo.setCurrentIndex(DEFAULT_STEP_INDEX)
+        self.step_combo.currentIndexChanged.connect(self._on_step_changed)
+        grid.addWidget(self.step_combo, 0, 2)
+
+        self.pan_spin = self._aim_spin(self.pan_slider, pan_min, pan_max)
+        self.tilt_spin = self._aim_spin(self.tilt_slider, tilt_min, tilt_max)
+        for row, (label, spin, axis) in enumerate((("Pan", self.pan_spin, "pan"), ("Tilt", self.tilt_spin, "tilt")), start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            minus = QPushButton("−")
+            minus.setToolTip(f"{label} down by one step")
+            minus.clicked.connect(lambda _checked=False, a=axis: self.nudge(a, -1))
+            plus = QPushButton("+")
+            plus.setToolTip(f"{label} up by one step")
+            plus.clicked.connect(lambda _checked=False, a=axis: self.nudge(a, +1))
+            grid.addWidget(minus, row, 1)
+            grid.addWidget(spin, row, 2)
+            grid.addWidget(plus, row, 3)
+            setattr(self, f"{axis}_minus_button", minus)
+            setattr(self, f"{axis}_plus_button", plus)
+        grid.setColumnStretch(2, 1)
+        self._on_step_changed()
+        return box
+
+    def _aim_spin(self, slider, lo, hi):
+        spin = QDoubleSpinBox()
+        spin.setDecimals(3)
+        spin.setSuffix("°")
+        spin.setRange(min(lo, hi), max(lo, hi))
+        spin.setKeyboardTracking(False)
+        spin.setValue(slider.value() / AIM_SCALE)
+        spin.valueChanged.connect(lambda v: slider.setValue(int(round(v * AIM_SCALE))))
+
+        def slider_moved(value):
+            spin.blockSignals(True)
+            spin.setValue(value / AIM_SCALE)
+            spin.blockSignals(False)
+
+        slider.valueChanged.connect(slider_moved)
+        return spin
+
+    def step(self, scale=1.0):
+        return self.step_combo.currentData() * scale
+
+    def _on_step_changed(self, _index=None):
+        self.pan_spin.setSingleStep(self.step())
+        self.tilt_spin.setSingleStep(self.step())
+
+    def nudge(self, axis, direction, scale=1.0):
+        """Move pan or tilt by direction (+1/-1) x the selected step x scale
+        (Shift passes 0.1, Ctrl passes 10). Clamped to the slider's range."""
+        slider = self.pan_slider if axis == "pan" else self.tilt_slider
+        delta = int(round(direction * self.step(scale) * AIM_SCALE))
+        slider.setValue(max(slider.minimum(), min(slider.maximum(), slider.value() + delta)))
+
+    def _slider(self, lo, hi, initial, scale):
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(int(lo * 100), int(hi * 100))
-        slider.setValue(int(initial * 100))
+        slider.setRange(int(lo * scale), int(hi * scale))
+        slider.setValue(int(initial * scale))
         slider.setMinimumWidth(120)
         return slider
 
     def pan(self):
-        return self.pan_slider.value() / 100.0
+        return self.pan_slider.value() / AIM_SCALE
 
     def tilt(self):
-        return self.tilt_slider.value() / 100.0
+        return self.tilt_slider.value() / AIM_SCALE
 
     def level(self):
-        return self.level_slider.value() / 100.0 / 100.0
+        return self.level_slider.value() / LEVEL_SCALE / 100.0
 
     def zoom(self):
-        return self.zoom_slider.value() / 100.0 / 100.0
+        return self.zoom_slider.value() / LEVEL_SCALE / 100.0
 
     def iris(self):
-        return self.iris_slider.value() / 100.0 / 100.0
+        return self.iris_slider.value() / LEVEL_SCALE / 100.0
 
 
 class CalibrationWizard(QDialog):
@@ -156,6 +232,50 @@ class CalibrationWizard(QDialog):
         self.output_timer = QTimer(self)
         self.output_timer.timeout.connect(self._output_tick)
         self.output_timer.start(33)
+
+        # Arrow keys nudge the current fixture's pan/tilt. They have to be
+        # caught app-wide (while this dialog is the one in use) because
+        # buttons and sliders would otherwise consume them for focus
+        # navigation and single-step moves.
+        QApplication.instance().installEventFilter(self)
+
+    # -- Arrow-key nudge ---------------------------------------------------
+
+    _NUDGE_KEYS = {
+        Qt.Key.Key_Left: ("pan", -1), Qt.Key.Key_Right: ("pan", +1),
+        Qt.Key.Key_Up: ("tilt", +1), Qt.Key.Key_Down: ("tilt", -1),
+    }
+
+    def _nudge_for_key(self, event):
+        action = self._NUDGE_KEYS.get(event.key())
+        if action is None or self.stack.currentWidget() is not self.guided_page or not self.points:
+            return False
+        focus = QApplication.focusWidget()
+        # Never steal arrows from something where they mean something else
+        # (moving a text cursor, stepping a spin box, picking a list row).
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QComboBox, QAbstractItemView)):
+            return False
+        if focus is not None and focus.window() is not self:
+            return False
+        modifiers = event.modifiers()
+        scale = 0.1 if modifiers & Qt.KeyboardModifier.ShiftModifier else (
+            10.0 if modifiers & Qt.KeyboardModifier.ControlModifier else 1.0)
+        self.rows[self._current_fixture_index()].nudge(action[0], action[1], scale)
+        return True
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and self.isVisible() and self._nudge_for_key(event):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _remove_key_filter(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+    def done(self, result):
+        self._remove_key_filter()
+        super().done(result)
 
     # -- Setup page: default vs custom points ---------------------------
 
@@ -442,5 +562,6 @@ class CalibrationWizard(QDialog):
             self.output_running = False
 
     def closeEvent(self, event):
+        self._remove_key_filter()
         self._stop_output_internal()
         super().closeEvent(event)
