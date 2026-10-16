@@ -201,6 +201,7 @@ class OperatorTab(QWidget):
 
     def refresh_status(self, live):
         self._update_enabled_states()
+        self._refresh_psn_status()
         self._refresh_dmx_in_status()
         if live is None:
             return
@@ -253,6 +254,18 @@ class OperatorTab(QWidget):
             ]
             for col, value in enumerate(values):
                 self.overview_table.setItem(row, col, QTableWidgetItem(value))
+
+    def _refresh_psn_status(self):
+        """PSN packet counters, the first thing to check when tracking looks
+        dead: the numbers should keep increasing while OpenFollow is sending."""
+        plugin = self.main_window.runner.position_plugin
+        if plugin is None:
+            self.status_labels["PSN"].setText("—")
+            return
+        stats = plugin.stats()
+        age = "never" if stats["last_packet_age"] is None else f"{stats['last_packet_age']:.1f}s ago"
+        self.status_labels["PSN"].setText(
+            f"packets {stats['packets']}, data {stats['data_packets']}, positions {stats['positions']} (last {age})")
 
     def _refresh_dmx_in_status(self):
         """Per-universe packet rate and last-packet age for every universe

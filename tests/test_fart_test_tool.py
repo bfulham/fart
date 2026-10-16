@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import fart_test_tool as tool  # noqa: E402
 
@@ -44,21 +45,19 @@ class PSNPacketTests(unittest.TestCase):
 
 
 class PSNRoundTripAgainstFartTests(unittest.TestCase):
-    """Cross-checks the tool's PSN encoder against fart.py's actual decoder,
-    so this file drifting out of sync with the real wire format is caught."""
+    """Cross-checks the tool's PSN encoder against FART's actual decoder
+    (fart/plugins/psn_in.py), so this file drifting out of sync with the real
+    wire format is caught."""
 
     def test_decodes_correctly_with_real_psn_receiver(self):
-        try:
-            import fart
-        except ImportError as exc:
-            self.skipTest(f"fart.py could not be imported here (likely no tkinter): {exc}")
+        from fart.bus import TrackerBank
+        from fart.plugins.psn_in import PSNInPlugin
 
-        tracker_state = fart.TrackerBank()
-        receiver = fart.PSNReceiver(
-            "236.10.10.10", 56565, "0.0.0.0", 7, tracker_state, lambda _msg: None
-        )
+        tracker_state = TrackerBank()
+        plugin = PSNInPlugin()
+        plugin._positions = tracker_state
         packet = tool.build_psn_packet([(7, 1.25, -2.5, 3.75)])
-        receiver._decode(packet)
+        plugin._decode(packet)
         x, y, z, timestamp = tracker_state.get(7)
         self.assertAlmostEqual(x, 1.25, places=5)
         self.assertAlmostEqual(y, -2.5, places=5)
@@ -86,16 +85,15 @@ class ArtNetTests(unittest.TestCase):
 
 
 class GeometryTests(unittest.TestCase):
-    def test_expected_pan_tilt_matches_calculate_aim_when_available(self):
+    def test_expected_pan_tilt_matches_calculate_aim(self):
+        from fart.config import FixtureConfig, FixtureType
+        from fart.engine import calculate_aim, resolve_fixture
+
         args = ArgsStub()
         marker = (5.0, 0.0, 4.0)
         pan, tilt = tool.expected_pan_tilt(marker, args)
-        try:
-            import fart
-        except ImportError as exc:
-            self.skipTest(f"fart.py could not be imported here (likely no tkinter): {exc}")
-        fixture = fart.FixtureConfig()
-        _b, _e, fart_pan, fart_tilt, _d = fart.calculate_aim(fixture, *marker)
+        fixture = resolve_fixture(FixtureConfig(), FixtureType())
+        _b, _e, fart_pan, fart_tilt, _d = calculate_aim(fixture, *marker)
         self.assertAlmostEqual(pan, fart_pan, places=6)
         self.assertAlmostEqual(tilt, fart_tilt, places=6)
 

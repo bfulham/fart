@@ -2,14 +2,14 @@
 
 **Fixture Aiming and Remote Tracking**
 
-[![Build Windows and macOS](https://github.com/bfulham/fart/actions/workflows/build-windows.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build-windows.yml)
+[![Build Windows and macOS](https://github.com/bfulham/fart/actions/workflows/build.yml/badge.svg)](https://github.com/bfulham/fart/actions/workflows/build.yml)
 [![Latest release](https://img.shields.io/github/v/release/bfulham/fart?include_prereleases)](https://github.com/bfulham/fart/releases/latest)
 [![MIT License](https://img.shields.io/github/license/bfulham/fart)](LICENSE)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5F8279CAL)
 
-FART is a GUI application (Windows and macOS) that receives live marker positions from OpenFollow over PosiStageNet (PSN), calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX to aim them. It's meant to sit in the signal path for a lighting console that doesn't do 3D position tracking natively — the console still owns the show; FART owns the aiming math for whichever fixtures are following a tracked performer. FART is developed primarily on Windows; the macOS build is newer and less battle-tested.
+FART is a GUI application (Windows and macOS) that receives live marker positions from OpenFollow over PosiStageNet (PSN), calculates the exact line of sight from one or more moving fixtures to independently selected PSN markers, and outputs 16-bit pan/tilt DMX to aim them. It sits between your lighting console and the lights: the console still owns the show, and FART owns the aiming maths for whichever fixtures are following a tracked performer. It can take any part of a fixture back to the console, or hand the whole fixture over, while it runs.
 
-See [CHANGELOG.md](CHANGELOG.md) for what's new in each release.
+FART is developed primarily on Windows; the macOS build is newer and less battle-tested. See [CHANGELOG.md](CHANGELOG.md) for what's new in each release.
 
 > **Safety warning:** FART is experimental software, not a safety-rated tracking or motion-control system. Test with shutters closed or lamps disabled, use conservative movement limits, and keep an operator able to remove DMX or power immediately. Never use it where unexpected movement or light output could injure people.
 
@@ -18,17 +18,16 @@ See [CHANGELOG.md](CHANGELOG.md) for what's new in each release.
 - [What FART does](#what-fart-does)
 - [Quick start](#quick-start)
 - [Recommended workflow](#recommended-workflow)
+- [The Operator tab: dimmer and beam control](#the-operator-tab-dimmer-and-beam-control)
 - [PSN input (OpenFollow)](#psn-input-openfollow)
 - [Coordinate convention](#coordinate-convention)
-- [Adding and patching lights](#adding-and-patching-lights)
+- [Fixture types and fixtures](#fixture-types-and-fixtures)
 - [Calibration](#calibration)
-- [Intensity input (fader modes)](#intensity-input-fader-modes)
-- [DMX output modes](#dmx-output-modes)
-- [Zoom, iris, and focus](#zoom-iris-and-focus)
-- [Live console control (optional)](#live-console-control-optional)
+- [DMX in and DMX out](#dmx-in-and-dmx-out)
+- [Console control: shadow patch and mode/marker](#console-control-shadow-patch-and-modemarker)
 - [Safety behaviour reference](#safety-behaviour-reference)
-- [Multi-light overview and 3D preview](#multi-light-overview-and-3d-preview)
 - [Configuration files](#configuration-files)
+- [Coming from v1](#coming-from-v1)
 - [Testing against grandMA3 onPC](#testing-against-grandma3-onpc)
 - [Development](#development)
 - [Contributing and support](#contributing-and-support)
@@ -41,9 +40,9 @@ For each enabled light, FART:
 1. Reads that light's assigned PSN marker's XYZ position (with optional smoothing and lead/lag prediction).
 2. Calculates the bearing and elevation from that fixture's configured optical centre to the marker.
 3. Converts that into the fixture's own pan/tilt angles, using its calibrated zero points, direction, trim, and mechanical limits.
-4. Outputs 16-bit pan/tilt DMX, plus dimmer, shutter, zoom, iris, and focus if configured.
+4. Outputs 16-bit pan/tilt DMX, plus dimmer, shutter, zoom, iris, and focus if the fixture has them.
 
-Several lights can follow the same marker, or different lights can follow different markers, all independently. Intensity comes from a manual fader, OSC, or an Art-Net channel — separately from the PSN position data.
+Several lights can follow the same marker, or different lights can follow different markers, all independently. Dimmer and beam (zoom/iris/focus) come either from FART's own faders or straight from your console, depending on the [modes you pick](#the-operator-tab-dimmer-and-beam-control).
 
 ## Quick start
 
@@ -52,7 +51,7 @@ Several lights can follow the same marker, or different lights can follow differ
 Download the archive for your platform from the [latest release](https://github.com/bfulham/fart/releases/latest):
 
 - **Windows**: `FART-Windows-x64.zip` → extract `FART.exe` and run it. Windows SmartScreen may warn because community builds are not code-signed.
-- **macOS (Apple Silicon)**: `FART-macOS-arm64.zip` → extract `FART.app` and open it. Gatekeeper will refuse to open an unsigned app from an unidentified developer the first time — right-click (or Control-click) `FART.app`, choose **Open**, then confirm in the dialog that appears; this is only needed once. Intel Macs are not currently built or tested.
+- **macOS (Apple Silicon)**: `FART-macOS-arm64.zip` → extract `FART.app` and open it. Gatekeeper will refuse to open an unsigned app from an unidentified developer the first time — right-click (or Control-click) `FART.app`, choose **Open**, then confirm in the dialog; this is only needed once. Intel Macs are not currently built or tested.
 
 ### Run from source
 
@@ -62,36 +61,46 @@ Install Python 3.10 or newer, then:
 
 ```powershell
 py -3 -m pip install -r requirements.txt
-py -3 fart.py
+py -3 -m fart
 ```
 
 **macOS** — double-click `run_source_macos.command`, or run:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 fart.py
+python3 -m fart
 ```
-
-Use a Python that includes Tk — the official [python.org macOS installer](https://www.python.org/downloads/macos/) does; some other distributions (for example a plain `pyenv` build) do not, and will fail with `No module named '_tkinter'`.
 
 ### Build a standalone app yourself
 
 **Windows** — double-click `build_windows_exe.bat`. The resulting executable is `dist\FART.exe`.
 
-**macOS** — run `./build_macos_app.sh` (same Tk requirement as above). The resulting app is `dist/FART.app`.
+**macOS** — run `./build_macos_app.sh`. The resulting app is `dist/FART.app`.
 
 ## Recommended workflow
 
-1. Configure output first: Art-Net, sACN, or Open DMX (Setup: I/O tab).
-2. Add a fixture and either enter its DMX setup manually or use the calibration wizard.
-3. Calibrate manually or with the multi-fixture calibration wizard (see [Calibration](#calibration)).
-4. Auto-detect PSN trackers and assign a marker to each light.
-5. Optionally set up [live console control](#live-console-control-optional) for lights the console should be able to reclaim mid-show.
-6. Start FART with dimmers locked, confirm tracking and aim look correct, then arm output.
+1. **DMX Out** tab: choose Art-Net, sACN, or Open DMX and set where FART's output goes.
+2. **Fixtures** tab: create a fixture type (import it from a GDTF file, or browse GDTF Share), then add a fixture of that type and patch its output universe and start address.
+3. **PSN In** tab: start FART and watch the tracker table fill with the markers OpenFollow is sending; give each light its PSN marker ID.
+4. **Calibration** tab: run the calibration wizard for each fixture (see [Calibration](#calibration)).
+5. Optionally set up [console control](#console-control-shadow-patch-and-modemarker) for lights the console should be able to take back mid-show, and pick your dimmer and beam modes on the Operator tab.
+6. **Operator** tab: click **START**, confirm tracking and aim look right with the dimmer fader still at 0, then bring the dimmer up.
+
+## The Operator tab: dimmer and beam control
+
+There is no separate arm step: **START** is the only gate, and the manual dimmer fader always starts at 0, so nothing lights until you raise it.
+
+- **Use DMX in** — unticked, FART behaves exactly as if every fixture's DMX-in addresses were 0: FART-only control (auto mode, the configured marker, the faders). It is a live toggle and is saved with your settings.
+- **Dimmer mode** — **Manual** drives each light's dimmer from the dimmer fader; **DMX in** passes each light's own dimmer channel through from the console.
+- **Beam mode** — **Manual** uses the zoom, iris and focus faders; **Auto size** has FART calculate zoom (and iris, once zoom is as tight as it goes) to hit the requested spot diameter at the marker; **DMX passthrough** passes zoom, iris and focus through from the console.
+
+Any fader that currently has no effect is greyed out, so what you can touch is always what is in control. A light with no shadow feed patched falls back to the faders for any DMX-in mode, and the overview table shows that in its Dimmer and Beam columns. Passing a dimmer through never overrides the safety blackouts below.
+
+The Operator tab also shows PSN packet counters (they should keep increasing while OpenFollow is sending) and DMX-in status (each universe's packet rate and age, the quickest way to see a slow or dead console feed), a live overview row per light, and the log.
 
 ## PSN input (OpenFollow)
 
-Typical OpenFollow PSN settings, set on the Operator tab:
+Typical OpenFollow PSN settings, on the **PSN In** tab:
 
 | Setting | Value |
 |---|---:|
@@ -99,9 +108,9 @@ Typical OpenFollow PSN settings, set on the Operator tab:
 | UDP port | `56565` |
 | Interface | `0.0.0.0`, or the PC's IPv4 address on the OpenFollow network |
 
-Click **Auto-detect PSN trackers** to populate the default tracker selector and each light's marker selector. The default marker is used for newly added lights; every light can then be assigned independently. During operation, the PSN status counters on the Operator tab should continuously increase.
+Once FART is started, the tab shows a live table of **every** tracker being received, whether or not any light uses it: position, speed (as sent, and as derived from successive positions), orientation, acceleration, target, status, update rate, age, and which fixtures follow it. A tracker's age turns red past the tracking timeout. **Clear table** forgets every tracker; live ones reappear on their next packet.
 
-FART uses PSN for XYZ position only — intensity always comes from a separate [fader source](#intensity-input-fader-modes).
+FART uses PSN for XYZ position only.
 
 ## Coordinate convention
 
@@ -116,130 +125,98 @@ FART assumes:
 
 The aim vector is always calculated as `marker position - fixture optical-centre position`. Fixture calibration then maps that world-space bearing and elevation into the fixture's own physical pan and tilt angles.
 
-## Adding and patching lights
+## Fixture types and fixtures
 
-Add a light on the **Setup: Lights** tab. Each light configures, across its **Geometry and calibration** and **DMX channels** sub-tabs:
+Like a lighting console, FART separates a **fixture type** (a reusable personality) from a **fixture** (one patched instance of it).
 
-- PSN marker ID and output universe
-- Optical-centre/pan-tilt-pivot X, Y, and Z, in the [coordinate convention](#coordinate-convention) above
-- World bearing represented by physical pan zero, and world elevation represented by physical tilt zero
-- Pan/tilt direction and trim
-- Mechanical/personality angle limits
-- Absolute DMX channels for pan, tilt, dimmer, shutter, zoom, iris, and focus (including fine channels), and per-channel direction reversal
-- Intensity scale, and the [limit-blackout](#safety-behaviour-reference) and [live console control](#live-console-control-optional) options described below
+- A **fixture type** holds the channel offsets within the fixture's own footprint (pan, tilt, dimmer, shutter, zoom, iris, focus and their fine channels), the footprint size, its physical pan/tilt range, reverse flags, and an optional zoom/iris beam model for Auto size. Define it once and patch as many fixtures of it as you need.
+- A **fixture** holds its name, PSN marker, optical-centre position, calibration (pan-zero bearing, tilt-zero elevation, direction, trim), the DMX patches described below, and its safety options.
 
-Channel fields are **absolute DMX slots**, not fixture offsets: for a fixture starting at channel 101, an attribute at fixture offset 18 is absolute channel `118`. FART blocks startup if enabled fixtures overlap on any configured DMX channel within the same universe; the same channel numbers can be reused safely on different universes.
+Channels are **offsets within the fixture's own footprint** (1-based, `0` disables), not absolute DMX slots; FART adds the fixture's start address.
 
-### GDTF import
+### GDTF import and GDTF Share
 
-Click **Import channels from GDTF…** (in the DMX channels sub-tab, or during calibration DMX setup) to load a channel map from a `.gdtf` fixture file. When a GDTF contains multiple DMX modes, FART asks which mode to import so it can match the mode patched in the console or visualiser.
+**Import from GDTF…** creates a type from a `.gdtf` file, and **Browse GDTF Share…** searches and imports from [gdtf-share.com](https://gdtf-share.com) (an account is required; your password is kept in your OS keychain). A GDTF-backed type keeps the whole file, and **which DMX mode a fixture runs is chosen per fixture**, so two fixtures of one type can run different modes. A GDTF type's channel fields are read-only; use **Convert to custom copy…** if you need to edit them by hand.
 
-The importer fills common attributes present in the selected mode — pan, tilt, dimmer, shutter, zoom, iris, focus, and their fine channels — and derives practical defaults from the GDTF channel ranges: a shutter-open value, an iris 100% cap (so the iris control doesn't run into pulse/pattern/effect ranges), zoom beam angles from `PhysicalFrom`/`PhysicalTo`, and iris physical aperture values such as `1` open to `0` closed when present.
+The importer derives pan/tilt/dimmer/shutter/zoom/iris/focus offsets, the real footprint of the mode, a shutter-open value, an iris 100% cap (so the iris control stays out of pulse and effect ranges), zoom beam angles from `PhysicalFrom`/`PhysicalTo`, and iris physical apertures where present.
 
-GDTF import is a setup helper, not a source of truth: always verify the imported channels and values against the fixture's manual before moving a real fixture. Complex GDTF personalities may still need manual correction.
+GDTF import is a setup helper, not a source of truth: always verify the result against the fixture's manual before moving a real fixture.
+
+### The patches
+
+Every fixture has up to three independent DMX patches, each with its own universe and start address, so DMX in and DMX out never have to share a universe number:
+
+| Patch | Purpose | Always on? |
+|---|---|---|
+| **DMX Out patch** | Where FART sends its computed output to the real light | Yes |
+| **Console shadow patch** | A live copy of the fixture's full real channel footprint from the console, for passthrough | Tickbox |
+| **Console mode/marker control** | A small block of channels from the console that switches the fixture between manual and auto, and picks its marker | Tickbox |
+
+See [Console control](#console-control-shadow-patch-and-modemarker) for how the last two work.
 
 ## Calibration
 
-Calibration estimates a fixture's real-world optical-centre position and its pan-zero/tilt-zero angles by aiming it at several known points and solving for the geometry that fits. See **[docs/CALIBRATION.md](docs/CALIBRATION.md)** for the full step-by-step workflow, including the required DMX setup, capture workflow, and how to read the solver's fit-quality warnings.
+Calibration estimates a fixture's real-world optical-centre position and its pan-zero/tilt-zero angles by aiming it at several known points and solving for the geometry that fits. See **[docs/CALIBRATION.md](docs/CALIBRATION.md)** for the full step-by-step workflow.
 
-In short: from the Lights tab, select one or more fixtures and click **Calibrate selected light**, or **Open fixture calibration wizard** from the Setup: Calibration tab. FART asks for pan/tilt/dimmer (and optional shutter) DMX channels first, since the wizard's faders drive the real fixture directly. Aim at least four known points (five or six is better, spread across house left/right, upstage/downstage, centre, and one raised point), capturing each with **Capture point for all fixtures**, then click **Solve and apply all**. Multiple selected fixtures are solved independently against the same shared point list, and the multi-fixture solve runs in the background so the wizard (including its own blackout button) stays responsive.
+In short: on the **Calibration** tab, select one or more fixtures and open the wizard. Aim each fixture at each known point (using the sliders, the dials, or the fine-adjust controls), capture it, then solve. The wizard has arrow-key nudging (Left/Right pan, Up/Down tilt; Shift = a tenth of the step, Ctrl = ten times), a step selector (1°, 0.1°, 0.01°), exact numeric pan/tilt entry, and Shift-drag fine control on the pan dial and tilt arc.
 
-## Intensity input (fader modes)
+## DMX in and DMX out
 
-Set the fader source on the Operator tab.
+### DMX in
 
-### Manual
+On the **DMX In** tab choose **Art-Net** or **sACN** (one at a time; both protocols' settings are remembered). The tab includes a live 512-channel monitor for any universe — hover a cell to see its channel number and value — which doubles as a console-feed debugging tool.
 
-The on-screen 0–100% fader controls all enabled fixtures, with each fixture's own intensity scale applied afterward.
+- **Input timeout** — how long a universe can go without a packet before the console feed counts as lost (default 3 s). Set it comfortably above your console's send interval; a console sending slowly (even under 1 frame a second) is fine as long as the timeout is longer than its interval.
+- **sACN** — FART joins the multicast group for every universe a fixture needs, and when several sources send to one universe it locks onto the highest-priority one (first seen wins among equals, failing over after 2.5 s of silence), so two sources never fight over a universe.
 
-### OSC
+### DMX out
 
-Configure a UDP port, OSC address, zero-based argument index, and input range. For OpenFollow's common message:
+On the **DMX Out** tab choose one output (the same live monitor shows exactly what was last sent):
 
-```text
-/openfollow/1/xyzf x y z markerfader
-```
+- **Art-Net** — universe numbering starts at `0`. Unicast to the receiving node where possible. FART sends one ArtDMX stream per enabled fixture universe.
+- **sACN** — multicast, universe numbering starts at `1` (`1–63999`). FART transmits every enabled fixture universe.
+- **Open DMX (ENTTEC USB)** — choose the FTDI virtual serial port (`COMx` on Windows, `/dev/cu.usbserial-*` on macOS). For several adapters, map them to software universes, e.g. `COM3=0, COM4=1`. Open DMX is unbuffered, so the OS must generate the break and slots continuously; this has only been verified on Windows. Prefer Art-Net, sACN or a buffered interface for anything critical.
 
-use argument index `3`, minimum `0`, and maximum `1`. Wildcard OSC addresses such as `/openfollow/*/xyzf` are supported by `python-osc`.
+## Console control: shadow patch and mode/marker
 
-### Art-Net input
+This is the intended way to use FART alongside a console that doesn't do 3D tracking natively: the console owns the show and can reclaim a tracked fixture whenever it needs to.
 
-Choose an Art-Net universe and one 8-bit DMX channel. Values `0–255` map to `0–100%`. Avoid using the same broadcast universe for this fader input and for fixture output.
+> Unit-tested and field-tested on one rig, but not verified across consoles, networks and fixtures. Test with shutters closed before relying on it in a show.
 
-## DMX output modes
+**Shadow patch.** Tick **Enable console shadow patch** on a fixture and give the universe and start address where the console's *own* patch of that fixture lives. Each cycle FART copies that fixture's whole footprint from there into its output, then overwrites only what it owns. Anything it doesn't understand (colour, gobo, prism, effects) therefore always passes through. Universe 0 is a real Art-Net universe, so the tickbox, not the universe number, turns this on. With nothing patched, there is nothing to pass.
 
-Set the output mode on the Setup: I/O tab.
+**Mode and marker control.** Tick **Enable console mode/marker control** and give the console universe plus a mode channel and/or a marker-select channel (`0` means that channel isn't used). These channels are not part of the fixture's footprint, so they are read by FART and never sent to the light.
 
-### ENTTEC Open DMX USB
+- **Mode** — below `128` is **full passthrough**: FART writes nothing for that fixture, and its whole footprint — dimmer, pan, tilt, beam, everything — comes from the console. `128` and above is **auto**: FART drives pan and tilt, and the dimmer and beam follow your [Dimmer and Beam modes](#the-operator-tab-dimmer-and-beam-control).
+- **Marker select** — `0` uses the fixture's configured marker; a non-zero value is used directly as the PSN marker ID to follow.
 
-Select **Open DMX** and choose the FTDI virtual serial port — on Windows a `COMx` port, on macOS a `/dev/cu.usbserial-*`-style device. For multiple adapters, enter a mapping such as `COM3=0, COM4=1` (or the macOS equivalent device paths) in **Open DMX adapters**. Open DMX adapters have no universe concept of their own, so FART maps each USB adapter to a software universe and sends that universe's 512-channel frame to that adapter; leave the mapping blank to use the single selected serial port for the default universe. Open DMX is unbuffered, so the OS must generate the DMX break and all slots continuously — this has only been verified on Windows so far. Prefer Art-Net, sACN, or a buffered interface for anything critical, especially on macOS until Open DMX timing is confirmed there.
+Reassigning a fixture's marker live, or returning it from full passthrough to auto, forces a fresh snap to the new target and a brief configurable blackout (**Marker-change blackout**, default 0.5 s) instead of sweeping across the space while lit.
 
-### Art-Net
-
-Art-Net universe numbering starts at `0`. Unicast to the receiving node or visualiser where possible. FART sends one ArtDMX stream for every enabled fixture universe.
-
-### sACN
-
-sACN uses multicast, and universe numbering starts at `1` (valid range `1–63999`). FART activates and transmits every enabled fixture universe.
-
-## Zoom, iris, and focus
-
-The Operator tab includes live controls for zoom, iris, and focus, each with a channel value of `0` disabling that attribute for a given light. Zoom and focus support an optional fine channel for 16-bit output; iris is 8-bit only.
-
-Zoom runs in one of two modes:
-
-- **Manual** — the shared 0–100% zoom slider is sent to every enabled light with a zoom channel.
-- **Auto beam size** — FART calculates a per-fixture zoom value so the beam is roughly the requested diameter at the marker. If zoom reaches its tightest beam and the fixture's GDTF/manual iris model provides physical aperture values, FART then closes the iris just enough to approximate the remaining size reduction. This mode is greyed out until at least one enabled fixture has zoom beam-angle data.
-
-For example, for a MAC Quantum Profile in Extended mode patched at address `1.182`, use iris `194`, zoom `195/196`, and focus `197/198`.
-
-## Live console control (optional)
-
-FART can hand a fixture to a lighting console for direct control during a show, or let the console reassign which PSN marker a fixture follows — instead of that fixture always being fully computed by FART. This is the intended way to use FART alongside a console that doesn't do 3D tracking natively (for example Onyx): the console still owns the show, and can reclaim a tracked fixture whenever it needs to.
-
-> This feature is unit-tested but has not been verified against a real console, real Art-Net network, or physical fixtures. Test thoroughly with shutters closed before relying on it in a show.
-
-### Patch scheme
-
-1. Dedicate one output universe to FART, and route the console's own output for that universe to FART instead of straight to the node — FART both receives it (Art-Net input, listening on UDP 6454) and re-sends it.
-2. Patch the real fixture's own personality on that universe as usual.
-3. Patch a small companion "FART control" fixture immediately after it, exposing just two channels:
-   - **Mode** — below `128` is manual passthrough; `128` and above is auto-follow.
-   - **Marker select** — `0` uses the fixture's configured default marker; a nonzero value is used directly as the PSN marker ID to follow.
-4. On the fixture's DMX channels sub-tab, under **Live console control**, set the **Mode channel** and **Marker-select channel** fields to that control fixture's two addresses. Leaving the mode channel at `0` disables this entirely — the fixture then behaves exactly as it does without this feature.
-
-### Behaviour by mode
-
-- **Manual** (`< 128`): full passthrough. FART does not touch that fixture's DMX at all — pan, tilt, dimmer, colour, gobo, and any effects pass straight through from the console's own frame.
-- **Auto-follow** (`>= 128`): FART computes pan/tilt as usual (and zoom/iris, unless [Auto beam size](#zoom-iris-and-focus) applies to that fixture), while dimmer and every other channel keep passing through from the console. The companion control fixture needs no intensity channel of its own — intensity always comes from the real fixture's own dimmer channel.
-
-Reassigning a fixture's marker live, or returning it from manual to auto-follow, always forces a fresh snap to the new target and a brief configurable blackout (**Marker-change blackout**, default 0.5&nbsp;s) instead of sweeping across the space while lit.
+If a fixture is in full passthrough but outputs nothing, the overview table's State column says why: the shadow patch isn't enabled, the footprint is 0, or FART is still waiting for the feed.
 
 ## Safety behaviour reference
 
-FART's dimmer output is governed by several independent safety conditions, evaluated per fixture every cycle. Any one of them forces dimmer to `0` (and shutter closed, if configured) regardless of the others:
+FART's dimmer output is governed by several independent safety conditions, evaluated per fixture every cycle. Any one of them forces the dimmer to `0` (and the shutter closed, if configured) regardless of the others — including when the dimmer is being passed through from the console:
 
 | Condition | Configured | Default behaviour |
 |---|---|---|
-| Output not armed | **Arm all light dimmers** checkbox, Operator tab | Blackout |
-| PSN tracking lost (no fresh position within the tracking timeout) | Per-fixture **On tracking loss** | Blackout — set to *Keep current intensity* to leave dimmer alone while pan/tilt freezes at the last known position |
+| PSN tracking lost (no fresh position within the tracking timeout) | Per-fixture **On tracking loss** | Blackout — set to *Keep current intensity* to leave the dimmer alone while pan/tilt freezes at the last known position |
 | Calculated pan/tilt exceeds a fixture's mechanical limits | Per-fixture **Blackout on limit**, with optional zoom/iris-to-100% | Off by default (opt in per fixture) |
-| Console signal lost, for fixtures using [live console control](#live-console-control-optional) | Per-fixture **On console signal loss** | Blackout — *Keep tracking, force dimmer off* also keeps aiming from live PSN so the fixture is already correct once the console returns; *Keep tracking, hold last dimmer* is an explicit opt-in that can leave a light lit indefinitely if the console signal never returns |
+| Console signal lost: the mode channel goes quiet, or a passed-through dimmer's shadow feed does | Per-fixture **On console signal loss**, and the **Input timeout** on the DMX In tab | Blackout — *Keep tracking, force dimmer off* also keeps aiming from live PSN so the fixture is already right when the console returns; *Keep tracking, hold last dimmer* is an explicit opt-in that can leave a light lit indefinitely if the console never returns |
 | Live marker reassignment or mode change | Per-fixture **Marker-change blackout** (seconds) | Forces a brief blackout while the fixture swings to its new target |
+| Start | — | The manual dimmer fader always starts at 0 |
 
-Stopping FART, or its output loop erroring, always sends one blank (all-zero) frame per universe before closing the output connection.
-
-## Multi-light overview and 3D preview
-
-The Operator tab's **Light overview** sub-tab shows a live row for every enabled light: its assigned marker, marker XYZ, calculated pan/tilt, distance, and tracking state.
-
-The **3D preview** sub-tab is intentionally lightweight and uses only Tkinter. It displays fixture positions, assigned PSN markers, and the calculated beam line between them. Drag with the left mouse button to orbit, use the mouse wheel to zoom, and use **Reset view** to return to the default camera. It is a diagnostic reference, not a photometric or fixture-body simulation.
+Stopping FART, or its output loop erroring, always sends one blank (all-zero) frame per universe before closing the output.
 
 ## Configuration files
 
-FART stores its local settings at `%APPDATA%\FART.json`. When first launched after upgrading from the old "OpenFollow Followspot" name, it automatically imports `%APPDATA%\OpenFollowFollowspot.json` if present and leaves the old file untouched.
+FART saves its settings to `FART2.fart` in your home folder (the `2` is historical and kept so existing settings are never orphaned). A `.fart` file is a zip archive containing the settings as JSON plus one copy of each GDTF file your fixture types use, so a saved file is fully self-contained. Settings are saved when you close the app.
 
-An example four-fixture MAC Quantum Profile configuration is included at [examples/four_mac_quantum_profiles.json](examples/four_mac_quantum_profiles.json). Replace the illustrative XYZ positions and calibrate every fixture before use.
+Your GDTF Share login lives in your OS keychain, and a cache of the catalogue listing is kept in `FART2_gdtf_share_cache.json` in your home folder.
+
+## Coming from v1
+
+v1 was a different (Tkinter) application that this version replaces; it remains available in the git history and under the `v1.x` tags. To bring v1 settings across, copy your v1 `FART.json` to `FART2.json` in your home folder before first launching FART: it is imported once and then saved in the new format. What carries over: PSN settings, DMX output, and each fixture's position, calibration and channel map (each v1 fixture becomes its own type plus a fixture). What doesn't: OSC and Art-Net intensity-fader input (the dimmer is now the fader, or per-fixture passthrough), and the old arming step (removed; see [the Operator tab](#the-operator-tab-dimmer-and-beam-control)). A v1 fixture that used live console control keeps working, with its shadow patch and mode/marker control switched on.
 
 ## Testing against grandMA3 onPC
 
@@ -249,17 +226,22 @@ See **[docs/GRANDMA3_TESTING.md](docs/GRANDMA3_TESTING.md)** for a complete exam
 
 ## Development
 
-Run the tests (`py -3` on Windows, `python3` on macOS):
+Run the tests (`py -3` on Windows, `python3` on macOS/Linux):
 
-```powershell
-py -3 -m unittest discover -s tests -v
+```bash
+python3 -m pip install -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
 
-The included [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build-windows.yml) tests the application and builds both `FART.exe` (Windows) and `FART.app` (macOS, Apple Silicon) as workflow artifacts on every push and pull request. Pushing a tag beginning with `v` also creates or updates a GitHub release with both builds attached (see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the full release process).
+(`pytest` also works.) The tests include real-socket tests for every protocol plugin and an end-to-end test that wires real PSN, real Art-Net/sACN in and out through the actual runner.
+
+The [GitHub Actions workflow](https://github.com/bfulham/fart/actions/workflows/build.yml) tests the application and builds `FART.exe` (Windows) and `FART.app` (macOS, Apple Silicon) as workflow artifacts on every push and pull request. Pushing a tag beginning with `v` also creates or updates a GitHub pre-release with both builds attached (see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)).
+
+For how the code is organised — the engine, the plugins, the runner and the UI — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ### Testing without OpenFollow or a fixture
 
-[tools/fart_test_tool.py](tools/fart_test_tool.py) is a standalone script that sends synthetic OpenFollow-style PSN positions and decodes FART's own Art-Net output, so tracking (and [live console control](#live-console-control-optional)) can be exercised end to end without OpenFollow, a real console, or a physical fixture. See [tools/README.md](tools/README.md).
+[tools/fart_test_tool.py](tools/fart_test_tool.py) is a standalone script that sends synthetic OpenFollow-style PSN positions and decodes FART's own Art-Net output, so tracking (and console control) can be exercised end to end without OpenFollow, a real console, or a physical fixture. See [tools/README.md](tools/README.md).
 
 ## Contributing and support
 

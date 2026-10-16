@@ -3,17 +3,14 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
-
-sacn_datas, sacn_binaries, sacn_hiddenimports = collect_all("sacn")
 app_version = Path("VERSION").read_text().strip()
 
 a = Analysis(
-    ["fart.py"],
+    ["run_fart.py"],
     pathex=[],
-    binaries=sacn_binaries,
-    datas=sacn_datas,
-    hiddenimports=sacn_hiddenimports,
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,7 +23,7 @@ if sys.platform == "darwin":
     # Onefile mode in combination with a macOS .app bundle is deprecated by
     # PyInstaller ("don't make sense... will become an error in v7.0"), so
     # macOS builds a onedir EXE and wraps it in BUNDLE() below. Windows (the
-    # else branch) keeps the existing single-file EXE unchanged.
+    # else branch) keeps a single-file EXE.
     exe = EXE(
         pyz,
         a.scripts,

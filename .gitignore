@@ -22,8 +22,7 @@ dist/
 Thumbs.db
 
 # Local configuration and exports
-FART.json
-fart-settings.json
+*.fart
 *.local.json
 
 # Backups and scratch files

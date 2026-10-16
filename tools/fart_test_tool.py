@@ -19,14 +19,15 @@ Three things you can do with it:
                    so that feature can be exercised without a real console.
 
 Deliberately dependency-free (standard library only, no tkinter/pyserial/
-sacn/import of fart.py) so it can run on a different, lighter machine than
+sacn/import of the fart package) so it can run on a different, lighter machine than
 FART itself — for example a laptop next to the console, testing a FART
 instance running on the actual show PC.
 
-This mirrors, but does not import, fart.py's wire formats: PSN chunk/packet
-layout (see PSNReceiver._decode / _chunks in fart.py), the Art-Net ArtDMX
-header layout (see parse_artnet_dmx() in fart.py), and the 16-bit DMX
-fraction mapping (see dmx16() / calculate_aim() in fart.py). If FART's wire
+This mirrors, but does not import, FART's wire formats: PSN chunk/packet
+layout (see PSNInPlugin._decode / _chunks in fart/plugins/psn_in.py), the
+Art-Net ArtDMX header layout (see parse_artnet_dmx() in
+fart/plugins/_artnet.py), and the 16-bit DMX fraction mapping (see dmx16() /
+calculate_aim() in fart/engine.py). If FART's wire
 format ever changes, this file needs updating to match by hand.
 """
 from __future__ import annotations
@@ -62,7 +63,7 @@ PSN_DATA_TRACKER_POS = 0x0000
 # ---------------------------------------------------------------------------
 
 def psn_chunk(chunk_id, payload, sub=False):
-    """Build one PSN chunk header + payload. Mirrors _chunks() in fart.py."""
+    """Build one PSN chunk header + payload. Mirrors _chunks() in fart/plugins/psn_in.py."""
     raw = (chunk_id & 0xFFFF) | ((len(payload) & 0x7FFF) << 16)
     if sub:
         raw |= 0x80000000
@@ -72,7 +73,7 @@ def psn_chunk(chunk_id, payload, sub=False):
 def build_psn_packet(markers):
     """markers: iterable of (marker_id, x, y, z). Returns one PSN data packet.
 
-    Matches what OpenFollow/pypsn sends and what fart.py's PSNReceiver
+    Matches what OpenFollow/pypsn sends and what FART's PSNInPlugin
     decodes: a DATA_PACKET containing one DATA_TRACKER_LIST, containing one
     chunk per tracker (keyed by marker id), each containing a 12-byte
     DATA_TRACKER_POS leaf with the marker's float32 XYZ.
@@ -87,7 +88,7 @@ def build_psn_packet(markers):
 
 def parse_artnet_dmx(data):
     """Parse an Art-Net ArtDMX UDP packet. Returns (universe, dmx_bytes) or
-    None. Mirrors parse_artnet_dmx() in fart.py exactly."""
+    None. Mirrors parse_artnet_dmx() in fart/plugins/_artnet.py exactly."""
     if len(data) < 18 or data[:8] != b"Art-Net\x00":
         return None
     if struct.unpack_from("<H", data, 8)[0] != 0x5000:
@@ -100,7 +101,7 @@ def parse_artnet_dmx(data):
 
 
 def build_artnet_dmx(universe, dmx_bytes):
-    """Build one ArtDMX packet. Mirrors ArtNet.send() in fart.py."""
+    """Build one ArtDMX packet. Mirrors ArtNetOutPlugin.send() in fart/plugins/artnet_out.py."""
     frame = bytes(dmx_bytes) + bytes(512 - len(dmx_bytes))
     header = (
         b"Art-Net\x00" + struct.pack("<H", 0x5000) + struct.pack(">H", 14)
@@ -150,7 +151,7 @@ def add_psn_network_args(parser):
 
 
 def add_fixture_args(parser):
-    """Defaults exactly match FixtureConfig's own defaults in fart.py, so a
+    """Defaults exactly match FixtureConfig's and FixtureType's own defaults in fart/config.py, so a
     freshly-added, uncalibrated FART light can be tested with no flags."""
     parser.add_argument("--fixture-x", type=float, default=0.0)
     parser.add_argument("--fixture-y", type=float, default=-8.0)
@@ -176,7 +177,7 @@ def expected_pan_tilt(marker_xyz, args):
     multi-turn tie-break, which needs FART's own running state) closely
     enough to sanity-check FART's output: independently computes what pan/
     tilt a fixture with this calibration should produce for this marker
-    position. See calculate_aim() in fart.py for the authoritative version.
+    position. See calculate_aim() in fart/engine.py for the authoritative version.
     """
     dx = marker_xyz[0] - args.fixture_x
     dy = marker_xyz[1] - args.fixture_y
