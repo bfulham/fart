@@ -4,12 +4,12 @@
 
 - **v2 is now the whole project.** The v1 Tkinter app (`fart.py`) and its tests, packaging and CI are removed from `main`; v2 moves from `v2/` to the repository root. v1 stays available in the git history and under the `v1.x` tags. Release builds are named `FART.exe` / `FART.app` (`FART-Windows-x64.zip` / `FART-macOS-arm64.zip`) rather than `FART2`, which only existed so v2 could sit beside v1; settings files keep their `FART2.fart` name so nothing is orphaned.
 - New root README, contributing guide, release checklist, and issue and PR templates for v2; the code walkthrough moves to `docs/ARCHITECTURE.md`.
-- DMX In tab: the DMX-in input timeout (added in 2.2.0) now has a field.
-- Operator tab: the PSN packet counters line is now filled in.
 
 ## 2.2.1
 
 - **Shadow patch and console mode/marker control now have explicit tickboxes** (Fixtures tab) instead of "universe 0 = off" / "mode channel 0 = disabled". Universe 0 is a real Art-Net universe, so a shadow feed or console block on universe 0 could not be enabled before. Existing files and patches keep working: an unset switch is inferred once from the old values (shadow universe > 0, a mode or marker channel set), and from then on the saved tickbox is what counts. Console control needs at least one of the mode and marker channels; 0 means that channel is not used. sACN has no universe 0, so use a universe of 1 or more there.
+- DMX In tab: the **Input timeout** (`dmx_in.timeout_s`, added in 2.2.0 but only editable in the settings file) now has a field.
+- Operator tab: the PSN packet counters line, which was never filled in, now shows packets, data packets and positions with the age of the last packet.
 - Full passthrough (mode < 128) says why it is outputting nothing in the Operator table's State column (shadow patch not enabled, footprint 0, still waiting for the feed), and Start logs a warning for a fixture with console control but no shadow patch.
 
 ## 2.2.0
@@ -35,8 +35,8 @@ Changes from field testing. Breaking changes first.
   shadow feed; tracking-loss, console-loss and marker-change blackouts still
   force it to 0. Fixtures with no shadow feed fall back to the faders.
 - Every fader with no effect is greyed out.
-- DMX in has its own timeout (`dmx_in.timeout_s`, default 3 s) instead of
-  reusing PSN's 0.5 s tracking timeout. A console sending under 1 fps used
+- DMX in has its own timeout (`dmx_in.timeout_s`, default 3 s, editable on the
+  DMX In tab from 2.2.1) instead of reusing PSN's 0.5 s tracking timeout. A console sending under 1 fps used
   to read as lost most cycles and made the dimmer and mode/marker channels
   flicker.
 - sACN in locks onto the highest-priority source per universe (first seen
