@@ -26,7 +26,8 @@ avoided by convention -- it's not a state the system can be in.
 - `fart/bus.py` -- the three thread-safe stores (`TrackerBank`, `FaderState`,
   `ExternalInputBus`) that connect input plugins to the engine.
 - `fart/config.py` -- the nested `Settings` schema (grouped by concern:
-  `psn_in`, `dmx_in`, `dmx_out`, `fader`, `fixture_types`, `fixtures`), plus
+  `psn_in`, `dmx_in`, `dmx_out`, `fixture_types`, `fixtures`, plus the global
+  `use_dmx_in` / `dimmer_mode` / `beam_mode` control-model switches), plus
   `migrate_v1()` that maps a pre-v3 config (v1's flat `FART.json`, or v2's
   earlier flat-fixture `FART2.json`) onto the current shape.
 
@@ -62,12 +63,28 @@ avoided by convention -- it's not a state the system can be in.
   `copy_shadow_into_output()` copies that fixture's *entire* footprint
   (e.g. all 35 channels of a real fixture, not just the handful FART
   understands) from the console's shadow feed into its slice of the output
-  frame every cycle, before FART overwrites the channels it actually owns
-  (pan/tilt always; dimmer always in auto mode; zoom/iris only when
-  auto-beam-size is on). Everything else -- color, gobo, prism, or zoom/
-  iris/focus when FART isn't actively driving them -- passes through
-  untouched. Manual mode (via the console mode channel) skips FART's
-  writes entirely, so the shadow copy alone *is* the full passthrough.
+  frame every cycle, before FART overwrites only the channels it owns.
+  The mode and marker channels are not part of the footprint, so they
+  never reach the light.
+
+  **Control model.** Per fixture, the console's mode channel picks *full
+  passthrough* (mode < 128: FART writes nothing, so the shadow copy alone
+  carries dimmer, pan, tilt, beam, everything) or *auto* (>= 128: FART
+  drives pan and tilt). In auto, two global switches on the Operator tab
+  decide the rest:
+  - **Dimmer mode**: `Manual` (the dimmer fader) or `DMX in` (the
+    fixture's own dimmer passes through the shadow feed).
+  - **Beam mode**: `Manual` (zoom/iris/focus faders), `Auto size` (FART
+    computes zoom/iris for the spot diameter), or `DMX passthrough`.
+  - **Use DMX in**: unticked behaves exactly as if every fixture's DMX-in
+    addresses were 0 -- FART-only control. Live toggle, saved in the file.
+
+  A light with no shadow feed falls back to the faders for any DMX-in mode
+  (shown in the overview table). A passed-through dimmer is still forced to
+  0 by tracking loss, console loss and marker-change blackouts. There is no
+  arm step: Start is the only gate, and the dimmer fader always starts at 0.
+  DMX in has its own loss timeout (`dmx_in.timeout_s`, default 3 s), since
+  a console can legitimately send far slower than a tracker.
 - `fart/runner.py` -- headless orchestration: wires whichever plugins
   `Settings` names to the engine and runs the cycle loop. No UI dependency;
   a future Qt UI (or a test, or a script) drives this same class.
@@ -101,9 +118,14 @@ avoided by convention -- it's not a state the system can be in.
     Setup tabs stay usable while running (no lockout) -- edits apply on the
     next output cycle, though switching DMX in/out protocol still needs a
     stop/start to actually reconnect the plugin sockets.
-  - `operator_tab.py` -- Start/Stop, arm, manual fader, zoom/iris/focus beam
-    sliders, live per-light overview table, log view.
-  - `psn_in_tab.py`, `dmx_in_tab.py`, `dmx_out_tab.py`, `fixtures_tab.py`,
+  - `operator_tab.py` -- Start/Stop, Use DMX in, Dimmer and Beam mode
+    selectors, dimmer/zoom/iris/focus faders (greyed out whenever they have
+    no effect), DMX-in packet rate/age, live per-light overview table, log
+    view.
+  - `psn_in_tab.py` -- PSN settings plus a live table of every tracker
+    received (position, speed sent and derived, orientation, acceleration,
+    target, status, rate, age, which fixtures use it), used or not.
+  - `dmx_in_tab.py`, `dmx_out_tab.py`, `fixtures_tab.py`,
     `calibration_tab.py` + `calibration_wizard.py` -- one tab per concern,
     matching the layout described in "Why" below.
   - `fixtures_tab.py` -- a Fixture Types library (add/duplicate/remove/
