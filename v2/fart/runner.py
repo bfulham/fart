@@ -9,7 +9,10 @@ import threading
 import time
 
 from .bus import ExternalInputBus, FaderState, TrackerBank
-from .engine import CycleState, blank_frames_for_settings, dmx_in_is_needed, dmx_in_universes_needed, run_cycle
+from .engine import (
+    CycleState, blank_frames_for_settings, dmx_in_is_needed, dmx_in_universes_needed, fixture_has_console_relay,
+    fixture_has_shadow, run_cycle,
+)
 from .plugins import CONTROL_INPUT_PLUGINS, OUTPUT_PLUGINS, PSNInPlugin
 
 
@@ -62,9 +65,9 @@ class Runner:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         for fixture in settings.fixtures:
-            if fixture.enabled and int(fixture.console_mode_channel) > 0 and int(fixture.shadow_universe) <= 0:
-                self.log(f"WARNING: {fixture.name} has a console mode channel but no shadow universe -- "
-                         "in full passthrough (mode < 128) it will output nothing")
+            if fixture.enabled and fixture_has_console_relay(fixture) and not fixture_has_shadow(fixture):
+                self.log(f"WARNING: {fixture.name} has console mode/marker control but its shadow patch is "
+                         "not enabled -- in full passthrough (mode < 128) it will output nothing")
         self.log(f"Started: PSN in, DMX in ({settings.dmx_in.active}), DMX out ({settings.dmx_out.active})")
 
     def _loop(self):

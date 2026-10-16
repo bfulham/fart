@@ -1,5 +1,10 @@
 # FART v2 changelog
 
+## 2.2.1
+
+- **Shadow patch and console mode/marker control now have explicit tickboxes** (Fixtures tab) instead of "universe 0 = off" / "mode channel 0 = disabled". Universe 0 is a real Art-Net universe, so a shadow feed or console block on universe 0 could not be enabled before. Existing files and patches keep working: an unset switch is inferred once from the old values (shadow universe > 0, a mode or marker channel set), and from then on the saved tickbox is what counts. Console control needs at least one of the mode and marker channels; 0 means that channel is not used. sACN has no universe 0, so use a universe of 1 or more there.
+- Full passthrough (mode < 128) says why it is outputting nothing in the Operator table's State column (shadow patch not enabled, footprint 0, still waiting for the feed), and Start logs a warning for a fixture with console control but no shadow patch.
+
 ## 2.2.0
 
 Changes from field testing. Breaking changes first.

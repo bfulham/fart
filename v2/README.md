@@ -59,7 +59,7 @@ avoided by convention -- it's not a state the system can be in.
   channel numbers) -- the shape `calculate_aim`/`write_fixture_to_frame`
   actually consume, built fresh each cycle.
 
-  **Console shadow patch**: for a fixture with `shadow_universe` set,
+  **Console shadow patch**: for a fixture with the shadow patch ticked on (a tickbox, not "universe 0 = off" -- 0 is a real Art-Net universe),
   `copy_shadow_into_output()` copies that fixture's *entire* footprint
   (e.g. all 35 channels of a real fixture, not just the handful FART
   understands) from the console's shadow feed into its slice of the output

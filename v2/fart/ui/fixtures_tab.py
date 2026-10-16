@@ -259,25 +259,36 @@ class FixturesTab(QWidget):
         form.addRow("Output start address", bind_int(QLineEdit(), fixture, "output_start_address", lo=1, hi=512))
         self.editor_layout.addWidget(output_patch)
 
-        shadow_patch = QGroupBox("Console shadow patch (optional -- live copy of this fixture's full "
-                                  "real channel footprint, for passthrough of anything FART doesn't own)")
+        shadow_patch = QGroupBox("Enable console shadow patch (live copy of this fixture's full real "
+                                  "channel footprint, for passthrough of anything FART doesn't own)")
+        self._bind_group_switch(shadow_patch, fixture, "shadow_enabled")
         form = QFormLayout(shadow_patch)
-        form.addRow("Shadow universe (0 = none)", bind_int(QLineEdit(), fixture, "shadow_universe", lo=0))
+        form.addRow("Shadow universe", bind_int(QLineEdit(), fixture, "shadow_universe", lo=0))
         form.addRow("Shadow start address", bind_int(QLineEdit(), fixture, "shadow_start_address", lo=1, hi=512))
         self.editor_layout.addWidget(shadow_patch)
 
-        console_patch = QGroupBox("Console mode/marker control (optional -- independent of the shadow patch, "
+        console_patch = QGroupBox("Enable console mode/marker control (independent of the shadow patch, "
                                    "can be anywhere)")
+        self._bind_group_switch(console_patch, fixture, "console_enabled")
         form = QFormLayout(console_patch)
         form.addRow("Console universe", bind_int(QLineEdit(), fixture, "console_universe", lo=0))
-        form.addRow("Mode channel (0 = disabled)", bind_int(QLineEdit(), fixture, "console_mode_channel", lo=0, hi=512))
-        form.addRow("Marker-select channel", bind_int(QLineEdit(), fixture, "console_marker_channel", lo=0, hi=512))
+        form.addRow("Mode channel (0 = none: always auto)", bind_int(QLineEdit(), fixture, "console_mode_channel", lo=0, hi=512))
+        form.addRow("Marker-select channel (0 = none)", bind_int(QLineEdit(), fixture, "console_marker_channel", lo=0, hi=512))
         form.addRow("On tracking loss", bind_combo(QComboBox(), fixture, "on_tracking_loss", ON_TRACKING_LOSS_OPTIONS))
         form.addRow("On console signal loss", bind_combo(QComboBox(), fixture, "on_console_loss", ON_CONSOLE_LOSS_OPTIONS))
         form.addRow("Marker-change blackout (s)", bind_float(QLineEdit(), fixture, "marker_change_blackout_s", lo=0))
         self.editor_layout.addWidget(console_patch)
 
         self.editor_layout.addStretch(1)
+
+    @staticmethod
+    def _bind_group_switch(group, fixture, attr):
+        """Make a patch group box a tickbox bound to a fixture switch; its
+        fields grey out while unticked. An explicit switch rather than
+        "universe 0 = off", since 0 is a real Art-Net universe."""
+        group.setCheckable(True)
+        group.setChecked(bool(getattr(fixture, attr)))
+        group.toggled.connect(lambda checked: setattr(fixture, attr, bool(checked)))
 
     def _type_combo(self, fixture):
         combo = QComboBox()

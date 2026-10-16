@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fart.bus import ExternalInputBus, TrackerBank
 from fart.config import FixtureConfig, FixtureType, Settings
 from fart.engine import (
-    CycleState, calculate_aim, dmx_in_is_needed, effective_fixture_type, resolve_console_mode,
+    CycleState, calculate_aim, dmx_in_is_needed, dmx_in_universes_needed, effective_fixture_type,
+    fixture_has_console_relay, resolve_console_mode,
     resolve_fixture, resolve_live_marker_id, run_cycle, write_fixture_to_frame,
 )
 
@@ -212,12 +213,44 @@ class RunCycleTests(unittest.TestCase):
         return statuses[0]["error"]
 
     def test_manual_passthrough_says_why_when_there_is_nothing_to_pass(self):
-        self.assertIn("no shadow universe", self._manual_passthrough_status(shadow_universe=0))
+        self.assertIn("shadow patch is not enabled", self._manual_passthrough_status(shadow_universe=0))
         self.assertIn("waiting for shadow feed on universe 2",
                       self._manual_passthrough_status(shadow_universe=2, publish_shadow=False))
         self.assertIn("footprint is 0", self._manual_passthrough_status(
             shadow_universe=2, footprint=0, dimmer=0, pan_coarse=0, pan_fine=0, tilt_coarse=0, tilt_fine=0,
             dimmer_fine=0, shutter=0, zoom=0, zoom_fine=0, iris=0, focus=0, focus_fine=0))
+
+    def test_shadow_and_console_on_art_net_universe_zero_work_when_enabled(self):
+        # 0 is a real Art-Net universe: enabling must not depend on it being > 0.
+        settings = self._settings(
+            type_overrides={"dimmer": 5, "pan_coarse": 1, "footprint": 10},
+            shadow_enabled=True, shadow_universe=0, shadow_start_address=1,
+            console_enabled=True, console_universe=0, console_mode_channel=20,
+        )
+        trackers = TrackerBank()
+        trackers.update(1, 5.0, 0.0, 5.0)
+        bus = ExternalInputBus()
+        frame0 = bytearray(512)
+        frame0[0], frame0[4] = 77, 200   # shadow copy of channels 1 and 5
+        frame0[19] = 0                   # mode channel 20 < 128 -> full passthrough
+        bus.update(0, frame0)
+        frames, statuses = run_cycle(settings, trackers, bus, 1.0, 0.5, 1.0, 0.5, time.monotonic(), CycleState())
+        self.assertEqual(statuses[0]["error"], "MANUAL (console)")
+        self.assertEqual((frames[0][0], frames[0][4]), (77, 200))
+        self.assertEqual(dmx_in_universes_needed(settings), {0})
+
+    def test_unticked_switches_disable_even_with_a_universe_and_channels_set(self):
+        settings = self._settings(
+            type_overrides={"dimmer": 5}, shadow_enabled=False, shadow_universe=2,
+            console_enabled=False, console_universe=1, console_mode_channel=10,
+        )
+        self.assertFalse(dmx_in_is_needed(settings))
+        self.assertEqual(dmx_in_universes_needed(settings), set())
+
+    def test_console_control_needs_at_least_one_channel(self):
+        self.assertFalse(fixture_has_console_relay(FixtureConfig(console_enabled=True)))
+        self.assertTrue(fixture_has_console_relay(FixtureConfig(console_enabled=True, console_marker_channel=3)))
+        self.assertTrue(fixture_has_console_relay(FixtureConfig(console_enabled=True, console_mode_channel=3)))
 
     def test_manual_passthrough_with_a_working_feed_has_no_complaint(self):
         self.assertEqual(self._manual_passthrough_status(shadow_universe=2), "MANUAL (console)")

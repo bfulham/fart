@@ -186,6 +186,19 @@ def blank_frames_for_settings(settings):
     return {int(u): bytearray(512) for u in enabled_output_universes(settings)}
 
 
+def fixture_has_shadow(fixture: FixtureConfig) -> bool:
+    """Shadow patch switched on (an explicit switch -- universe 0 is a real
+    Art-Net universe, so 0 cannot mean off)."""
+    return bool(fixture.shadow_enabled)
+
+
+def fixture_has_console_relay(fixture: FixtureConfig) -> bool:
+    """Console mode/marker control switched on, with at least one channel to
+    read."""
+    return bool(fixture.console_enabled) and (
+        int(fixture.console_mode_channel) > 0 or int(fixture.console_marker_channel) > 0)
+
+
 def dmx_in_is_needed(settings):
     """Whether any enabled fixture has a DMX-in patch (console mode/marker
     channels or a shadow feed) to read. The control-input plugin binds a
@@ -194,7 +207,7 @@ def dmx_in_is_needed(settings):
     settings.use_dmx_in: that tickbox is a live toggle, so the plugin keeps
     running while it is unticked and data is simply ignored.
     """
-    return any(f.enabled and (int(f.console_mode_channel) > 0 or int(f.shadow_universe) > 0)
+    return any(f.enabled and (fixture_has_console_relay(f) or fixture_has_shadow(f))
                for f in settings.fixtures)
 
 
@@ -212,9 +225,9 @@ def dmx_in_universes_needed(settings):
     for f in settings.fixtures:
         if not f.enabled:
             continue
-        if int(f.console_mode_channel) > 0:
+        if fixture_has_console_relay(f):
             universes.add(int(f.console_universe))
-        if int(f.shadow_universe) > 0:
+        if fixture_has_shadow(f):
             universes.add(int(f.shadow_universe))
     return universes
 
@@ -439,8 +452,6 @@ class CycleState:
         self.marker_change_until = {}
 
 
-def fixture_has_shadow(fixture: FixtureConfig) -> bool:
-    return int(fixture.shadow_universe) > 0
 
 
 def passthrough_problem(fixture: FixtureConfig, footprint: int, shadow_frame) -> str:
@@ -449,7 +460,7 @@ def passthrough_problem(fixture: FixtureConfig, footprint: int, shadow_frame) ->
     passthrough FART writes nothing itself, so with no usable shadow feed the
     light silently gets all zeros -- this makes that visible instead."""
     if not fixture_has_shadow(fixture):
-        return " -- NOTHING TO PASS: no shadow universe patched on this fixture"
+        return " -- NOTHING TO PASS: shadow patch is not enabled on this fixture"
     if footprint <= 0:
         return " -- NOTHING TO PASS: fixture footprint is 0 (pick a GDTF mode or set the type's footprint)"
     if shadow_frame is None:
@@ -506,7 +517,7 @@ def run_cycle(settings, trackers, bus, fader, zoom_value, iris_value, focus_valu
         universe = int(fixture.output_universe)
         frame = frames.setdefault(universe, bytearray(512))
 
-        console_relay = use_dmx_in and int(fixture.console_mode_channel) > 0
+        console_relay = use_dmx_in and fixture_has_console_relay(fixture)
         has_shadow = use_dmx_in and fixture_has_shadow(fixture)
         console_frame, console_ts = bus.get(fixture.console_universe) if console_relay else (None, 0.0)
         console_stale = console_frame is None or (cycle_start - console_ts) > dmx_timeout_s

@@ -447,6 +447,7 @@ class OperatorControlModelTests(WindowTestCase):
 
     def _give_every_light_a_shadow_feed(self):
         for fixture in self.window.settings.fixtures:
+            fixture.shadow_enabled = True
             fixture.shadow_universe = 2
         self.window.operator_tab._update_enabled_states()
 
@@ -555,6 +556,7 @@ class DMXMonitorTests(WindowTestCase):
         # A console-relay fixture forces the control-input plugin to start -- otherwise
         # nothing is listening and the grid would stay all-zero regardless
         # of whether the widget itself works.
+        settings.fixtures[0].console_enabled = True
         settings.fixtures[0].console_mode_channel = 10
         settings.dmx_out.active = "artnet"
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
@@ -638,6 +640,7 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         settings.dmx_out.artnet.target_ip = "127.0.0.1"
         settings.fixtures[0].marker_id = 1
         settings.fixtures[0].output_universe = 0
+        settings.fixtures[0].console_enabled = True
         settings.fixtures[0].console_mode_channel = 10
         settings.fixtures[0].console_marker_channel = 11
 
@@ -708,6 +711,49 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         sock.close()
 
         self.assertTrue(seen, "overview table should show '—' for DMX In Mode/Marker when no console relay is configured")
+
+
+class PatchSwitchUITests(WindowTestCase):
+    """Shadow patch and console mode/marker control are explicit tickboxes,
+    not "universe 0 = off" (0 is a real Art-Net universe)."""
+
+    def _group(self, title_start):
+        from PySide6.QtWidgets import QGroupBox
+        tab = self.window.fixtures_tab
+        tab._load_fixture(0)
+        for box in tab.findChildren(QGroupBox):
+            if box.title().startswith(title_start):
+                return box
+        self.fail(f"no group box starting with {title_start!r}")
+
+    def test_both_patches_are_tickboxes_bound_to_the_fixture_and_off_by_default(self):
+        fixture = self.window.settings.fixtures[0]
+        shadow = self._group("Enable console shadow patch")
+        console = self._group("Enable console mode/marker control")
+        for box in (shadow, console):
+            self.assertTrue(box.isCheckable())
+            self.assertFalse(box.isChecked())
+        shadow.setChecked(True)
+        console.setChecked(True)
+        self.assertTrue(fixture.shadow_enabled)
+        self.assertTrue(fixture.console_enabled)
+        shadow.setChecked(False)
+        self.assertFalse(fixture.shadow_enabled)
+
+    def test_universe_zero_is_accepted_with_the_tickbox_on(self):
+        fixture = self.window.settings.fixtures[0]
+        fixture.shadow_universe = 0
+        shadow = self._group("Enable console shadow patch")
+        shadow.setChecked(True)
+        self.assertTrue(fixture.shadow_enabled)
+        self.assertEqual(fixture.shadow_universe, 0)
+
+    def test_the_tickbox_state_is_shown_when_the_fixture_is_reloaded(self):
+        fixture = self.window.settings.fixtures[0]
+        fixture.shadow_enabled = True
+        fixture.console_enabled = False
+        self.assertTrue(self._group("Enable console shadow patch").isChecked())
+        self.assertFalse(self._group("Enable console mode/marker control").isChecked())
 
 
 class PSNInTableTests(WindowTestCase):

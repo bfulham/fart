@@ -205,13 +205,20 @@ class FixtureConfig:
 
     # Where a live console feed of this fixture's *entire* real channel
     # footprint can be read from, at the same offsets as output_start_address
-    # (per fixture_type) but on the console's own patch -- 0 = no shadow feed,
-    # this fixture always uses FART's own manual/master beam values instead.
+    # (per fixture_type) but on the console's own patch. Off (the default)
+    # means no shadow feed: this fixture always uses FART's own manual/master
+    # beam and dimmer values instead. An explicit switch, not "universe 0",
+    # because 0 is a real Art-Net universe.
+    shadow_enabled: bool | None = None
     shadow_universe: int = 0
     shadow_start_address: int = 1
 
     # A small mode/marker control block for live relay-mode switching --
-    # independent of the shadow feed above, and can be anywhere.
+    # independent of the shadow feed above, and can be anywhere. Active when
+    # enabled and at least one of the two channels is set (0 = no such
+    # channel: no mode channel means always auto, no marker channel means the
+    # configured marker).
+    console_enabled: bool | None = None
     console_universe: int = 0
     console_mode_channel: int = 0
     console_marker_channel: int = 0
@@ -222,6 +229,17 @@ class FixtureConfig:
     on_tracking_loss: str = "Blackout"  # "Blackout" | "Keep current intensity"
     on_console_loss: str = "Blackout"   # "Blackout" | "Keep tracking, force dimmer off" | "Keep tracking, hold last dimmer"
     marker_change_blackout_s: float = 0.5
+
+    def __post_init__(self):
+        # Files and callers from before the explicit switches existed meant
+        # "off" by shadow_universe == 0 / no console channels set; carry that
+        # forward once, so nothing changes for an existing patch. After this
+        # the switches are plain booleans and always saved, so universe 0 can
+        # be a real universe.
+        if self.shadow_enabled is None:
+            self.shadow_enabled = int(self.shadow_universe) > 0
+        if self.console_enabled is None:
+            self.console_enabled = int(self.console_mode_channel) > 0 or int(self.console_marker_channel) > 0
 
 
 @dataclass
@@ -307,7 +325,9 @@ def _split_legacy_fixture(data: dict, index: int) -> tuple[FixtureType, FixtureC
         # that forward as the starting point rather than silently
         # disabling relay/shadow on migration -- the user can now split
         # them apart since that's exactly the conflict being fixed.
+        shadow_enabled=console_mode_channel > 0,
         shadow_universe=old_universe if console_mode_channel > 0 else 0, shadow_start_address=1,
+        console_enabled=console_mode_channel > 0,
         console_universe=old_universe if console_mode_channel > 0 else 0,
         console_mode_channel=console_mode_channel,
         console_marker_channel=int(data.get("console_marker_channel", 0)),

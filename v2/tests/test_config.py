@@ -109,6 +109,42 @@ class ControlModelSettingsTests(unittest.TestCase):
         self.assertEqual(loaded.dmx_in.timeout_s, 3.0)
 
 
+class PatchSwitchTests(unittest.TestCase):
+    def test_legacy_zero_means_off_is_carried_forward_once(self):
+        self.assertFalse(FixtureConfig().shadow_enabled)
+        self.assertFalse(FixtureConfig().console_enabled)
+        self.assertTrue(FixtureConfig(shadow_universe=3).shadow_enabled)
+        self.assertTrue(FixtureConfig(console_mode_channel=5).console_enabled)
+        self.assertTrue(FixtureConfig(console_marker_channel=5).console_enabled)
+
+    def test_explicit_switch_wins_and_universe_zero_can_be_on(self):
+        self.assertTrue(FixtureConfig(shadow_enabled=True, shadow_universe=0).shadow_enabled)
+        self.assertFalse(FixtureConfig(shadow_enabled=False, shadow_universe=7).shadow_enabled)
+
+    def test_switches_round_trip_and_old_files_infer_them(self):
+        settings = Settings()
+        settings.fixtures = [FixtureConfig(shadow_enabled=True, shadow_universe=0, console_enabled=False,
+                                           console_universe=4, console_mode_channel=9)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "FART.fart"
+            save_settings(path, settings)
+            loaded = load_settings(path).fixtures[0]
+            self.assertTrue(loaded.shadow_enabled, "universe 0 stays enabled across save/load")
+            self.assertFalse(loaded.console_enabled, "an explicit off survives even with channels set")
+
+            old = asdict(Settings())
+            old["fixture_types"] = [{k: v for k, v in t.items() if k != "gdtf_data"} for t in old["fixture_types"]]
+            fixture = old["fixtures"][0]
+            for key in ("shadow_enabled", "console_enabled"):
+                fixture.pop(key)
+            fixture.update(shadow_universe=5, console_mode_channel=12)
+            old_path = Path(tmp) / "old.json"
+            old_path.write_text(json.dumps(old))
+            migrated = load_settings(old_path).fixtures[0]
+            self.assertTrue(migrated.shadow_enabled)
+            self.assertTrue(migrated.console_enabled)
+
+
 class LoadSaveRoundTripTests(unittest.TestCase):
     def test_save_then_load_preserves_both_dmx_in_protocols(self):
         settings = Settings()
