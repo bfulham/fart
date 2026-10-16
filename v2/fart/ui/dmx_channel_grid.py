@@ -2,7 +2,9 @@
 (channel 1 at top-left, increasing left-to-right then top-to-bottom) --
 the same at-a-glance layout hardware DMX monitors like Artnetominator use,
 so it's fast to scan for "is anything live/moving" without hunting for a
-specific channel number.
+specific channel number. Hovering any cell names its channel outright
+("Channel 37 = 128") so nobody has to count cells to find which one is
+misbehaving.
 """
 from __future__ import annotations
 
@@ -14,6 +16,11 @@ COLUMNS = 32
 ROWS = 16
 DARK_BG = QColor(35, 35, 38)
 DARK_FG = QColor(110, 110, 115)
+
+
+def channel_tooltip(channel, value):
+    """1-based DMX channel number and its current value."""
+    return f"Channel {channel} = {value}"
 
 
 class DmxChannelGrid(QTableWidget):
@@ -35,10 +42,10 @@ class DmxChannelGrid(QTableWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setBackground(DARK_BG)
                 item.setForeground(DARK_FG)
+                item.setToolTip(channel_tooltip(row * COLUMNS + col + 1, 0))
                 self.setItem(row, col, item)
                 self._items[row][col] = item
         self._last_values = [0] * (ROWS * COLUMNS)
-        self.setToolTip("Channel N is at row N // 32, column N % 32 (channel 1 = top-left)")
 
     def set_frame(self, frame):
         """frame: a 512-byte DMX frame, or None/shorter to show all zero."""
@@ -49,6 +56,7 @@ class DmxChannelGrid(QTableWidget):
             self._last_values[i] = value
             item = self._items[i // COLUMNS][i % COLUMNS]
             item.setText(str(value))
+            item.setToolTip(channel_tooltip(i + 1, value))
             if value:
                 green = 60 + int((value / 255) * 160)
                 item.setBackground(QColor(30, green, 60))

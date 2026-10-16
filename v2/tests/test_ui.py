@@ -710,6 +710,64 @@ class OperatorOverviewDMXInColumnsTests(WindowTestCase):
         self.assertTrue(seen, "overview table should show '—' for DMX In Mode/Marker when no console relay is configured")
 
 
+class PSNInTableTests(WindowTestCase):
+    def test_table_lists_every_tracker_seen_and_who_uses_it(self):
+        tab = self.window.psn_in_tab
+        settings = self.window.settings
+        settings.fixtures[0].name = "Front"
+        settings.fixtures[0].marker_id = 1
+        trackers = self.window.runner.trackers
+        trackers.update(1, 1.0, 2.0, 3.0)
+        trackers.update_extras(1, speed=(3.0, 4.0, 0.0), status=0.9)
+        trackers.set_name(1, "Lead")
+        trackers.update(2, -1.0, 0.0, 0.5)  # a marker no fixture uses
+        tab.refresh()
+        self.assertEqual(tab.table.rowCount(), 2, "unused markers are listed too")
+        columns = [tab.table.horizontalHeaderItem(c).text() for c in range(tab.table.columnCount())]
+        row = {name: tab.table.item(0, i).text() for i, name in enumerate(columns)}
+        self.assertEqual(row["ID"], "1")
+        self.assertEqual(row["Name"], "Lead")
+        self.assertEqual(row["Position (m)"], "1.00, 2.00, 3.00")
+        self.assertTrue(row["Speed (sent)"].startswith("5.00 m/s"))
+        self.assertEqual(row["Status"], "0.90")
+        self.assertEqual(row["Used by"], "Front")
+        unused = {name: tab.table.item(1, i).text() for i, name in enumerate(columns)}
+        self.assertEqual(unused["ID"], "2")
+        self.assertEqual(unused["Used by"], "—")
+        self.assertEqual(unused["Speed (sent)"], "—", "fields the sender never sent show a dash")
+
+    def test_clear_button_empties_the_table(self):
+        tab = self.window.psn_in_tab
+        self.window.runner.trackers.update(1, 0.0, 0.0, 0.0)
+        tab.refresh()
+        self.assertEqual(tab.table.rowCount(), 1)
+        tab._on_clear_clicked()
+        self.assertEqual(tab.table.rowCount(), 0)
+
+    def test_real_psn_packets_fill_the_table_including_unused_markers(self):
+        settings = self.window.settings
+        settings.psn_in.multicast, settings.psn_in.port = "236.10.10.14", 56578
+        settings.dmx_out.active = "artnet"
+        settings.dmx_out.artnet.target_ip = "127.0.0.1"
+        settings.fixtures[0].marker_id = 1
+        QTest.mouseClick(self.window.operator_tab.start_button, Qt.MouseButton.LeftButton)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        packets = [build_psn_packet(1, 5.0, 0.0, 4.0), build_psn_packet(6, 1.0, 1.0, 1.0)]
+        ids = set()
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and ids != {"1", "6"}:
+            for packet in packets:
+                multicast_sendto(sock, packet, (settings.psn_in.multicast, settings.psn_in.port))
+            self.window._on_ui_tick()
+            tab = self.window.psn_in_tab
+            ids = {tab.table.item(r, 0).text() for r in range(tab.table.rowCount())}
+            time.sleep(0.05)
+        sock.close()
+        self.assertEqual(ids, {"1", "6"})
+        self.assertIn("Receiving", self.window.psn_in_tab.summary_label.text())
+
+
 class CalibrationTabTests(WindowTestCase):
     def test_refresh_list_preserves_multi_selection(self):
         """Real user report: selecting multiple fixtures and opening the

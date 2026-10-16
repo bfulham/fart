@@ -14,12 +14,23 @@ from collections import deque
 
 
 class TrackerBank:
-    """Latest position and velocity for every PSN tracker ID."""
+    """Latest position and velocity for every PSN tracker ID, plus whatever
+    else the sender includes (speed, orientation, acceleration, target
+    position, status, timestamp, name) and per-tracker receive rate. The
+    extras are display-only -- nothing in the engine reads them -- so the PSN
+    In tab can show everything being received even for markers no fixture
+    uses."""
+
+    RATE_WINDOW_S = 10.0
 
     def __init__(self):
         self.lock = threading.Lock()
         self.xyz = {}
         self.vel = {}
+        self.extras = {}    # marker_id -> {"speed": (x, y, z), "orientation": ..., ...}
+        self.names = {}     # marker_id -> str, from PSN info packets
+        self.arrivals = {}  # marker_id -> deque of recent data-packet times
+        self.system_name = ""
 
     def update(self, marker_id, x, y, z):
         marker_id = int(marker_id)
@@ -46,6 +57,57 @@ class TrackerBank:
     def snapshot(self):
         with self.lock:
             return dict(self.xyz)
+
+    def update_extras(self, marker_id, **fields):
+        """Record one data packet's worth of display-only fields for this
+        tracker (any subset of speed, orientation, accel, target, status,
+        psn_time) and count the packet toward its receive rate."""
+        marker_id = int(marker_id)
+        now = time.monotonic()
+        with self.lock:
+            self.extras.setdefault(marker_id, {}).update(fields)
+            self.arrivals.setdefault(marker_id, deque(maxlen=64)).append(now)
+
+    def set_name(self, marker_id, name):
+        with self.lock:
+            self.names[int(marker_id)] = str(name)
+
+    def clear(self):
+        """Forget every tracker. Live ones reappear on their next packet."""
+        with self.lock:
+            self.xyz.clear()
+            self.vel.clear()
+            self.extras.clear()
+            self.names.clear()
+            self.arrivals.clear()
+
+    def snapshot_detail(self):
+        """{marker_id: dict} of everything known about each tracker seen --
+        position, derived speed (from consecutive positions), anything the
+        sender included itself, name, receive rate (packets/s over the last
+        RATE_WINDOW_S) and age of the last packet. Safe to read without the
+        lock afterwards."""
+        now = time.monotonic()
+        detail = {}
+        with self.lock:
+            ids = set(self.xyz) | set(self.extras) | set(self.names) | set(self.arrivals)
+            for marker_id in ids:
+                x, y, z, t = self.xyz.get(marker_id, (0.0, 0.0, 0.0, 0.0))
+                times = self.arrivals.get(marker_id)
+                recent = [a for a in times if now - a <= self.RATE_WINDOW_S] if times else []
+                rate = ((len(recent) - 1) / (recent[-1] - recent[0])
+                        if len(recent) >= 2 and recent[-1] > recent[0] else 0.0)
+                last = max(t, times[-1] if times else 0.0)
+                entry = {
+                    "position": (x, y, z) if t else None,
+                    "derived_velocity": self.vel.get(marker_id),
+                    "name": self.names.get(marker_id, ""),
+                    "rate": rate,
+                    "age": (now - last) if last else None,
+                }
+                entry.update(self.extras.get(marker_id, {}))
+                detail[marker_id] = entry
+        return detail
 
 
 class FaderState:

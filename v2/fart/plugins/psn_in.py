@@ -8,8 +8,30 @@ import threading
 import time
 
 DATA_PACKET = 0x6755
+INFO_PACKET = 0x6756
 DATA_TRACKER_LIST = 0x0001
 DATA_TRACKER_POS = 0x0000
+DATA_TRACKER_SPEED = 0x0001
+DATA_TRACKER_ORI = 0x0002
+DATA_TRACKER_STATUS = 0x0003
+DATA_TRACKER_ACCEL = 0x0004
+DATA_TRACKER_TRGTPOS = 0x0005
+DATA_TRACKER_TIMESTAMP = 0x0006
+INFO_SYSTEM_NAME = 0x0001
+INFO_TRACKER_LIST = 0x0002
+INFO_TRACKER_NAME = 0x0000
+
+# Vector fields a tracker can carry besides position, by PSN field id.
+_VECTOR_FIELDS = {
+    DATA_TRACKER_SPEED: "speed",
+    DATA_TRACKER_ORI: "orientation",
+    DATA_TRACKER_ACCEL: "accel",
+    DATA_TRACKER_TRGTPOS: "target",
+}
+
+
+def _text(data, start, length):
+    return bytes(data[start:start + length]).split(b"\x00", 1)[0].decode("utf-8", errors="replace")
 
 
 def _chunks(data, start, length):
@@ -78,6 +100,9 @@ class PSNInPlugin:
         raw = struct.unpack_from("<I", data, 0)[0]
         root_id = raw & 0xFFFF
         root_len = (raw >> 16) & 0x7FFF
+        if root_id == INFO_PACKET:
+            self._decode_info(data, root_len)
+            return
         if root_id != DATA_PACKET:
             return
         self.data_packet_count += 1
@@ -91,17 +116,39 @@ class PSNInPlugin:
                     self.discovered.add(tracker_id)
                     if self.on_discovered:
                         self.on_discovered(tracker_id)
+                extras = {}
                 for field_id, _field_sub, f_body, f_len in _chunks(data, t_body, t_len):
                     # OpenFollow (via pypsn) sets the high sub-chunk flag bit
                     # on leaf chunks too, including the 12-byte position
-                    # chunk -- don't reject position merely because that
+                    # chunk -- don't reject a field merely because that
                     # flag is set.
                     if field_id == DATA_TRACKER_POS and f_len >= 12:
                         x, y, z = struct.unpack_from("<fff", data, f_body)
                         self._positions.update(tracker_id, x, y, z)
                         self.position_count += 1
                         self.last_position_time = time.monotonic()
-                        break
+                    elif field_id in _VECTOR_FIELDS and f_len >= 12:
+                        extras[_VECTOR_FIELDS[field_id]] = struct.unpack_from("<fff", data, f_body)
+                    elif field_id == DATA_TRACKER_STATUS and f_len >= 4:
+                        extras["status"] = struct.unpack_from("<f", data, f_body)[0]
+                    elif field_id == DATA_TRACKER_TIMESTAMP and f_len >= 8:
+                        extras["psn_time"] = struct.unpack_from("<Q", data, f_body)[0]
+                # Always recorded, even with no extra fields, so the
+                # tracker's receive rate counts every packet it appears in.
+                self._positions.update_extras(tracker_id, **extras)
+
+    def _decode_info(self, data, root_len):
+        """PSN info packet: system name and per-tracker names. Display-only."""
+        for cid, sub, body, length in _chunks(data, 4, root_len):
+            if cid == INFO_SYSTEM_NAME:
+                self._positions.system_name = _text(data, body, length)
+            elif cid == INFO_TRACKER_LIST and sub:
+                for tracker_id, tracker_sub, t_body, t_len in _chunks(data, body, length):
+                    if not tracker_sub:
+                        continue
+                    for field_id, _field_sub, f_body, f_len in _chunks(data, t_body, t_len):
+                        if field_id == INFO_TRACKER_NAME:
+                            self._positions.set_name(tracker_id, _text(data, f_body, f_len))
 
     def stats(self):
         return {

@@ -85,3 +85,47 @@ class ExternalInputBusRateTests(unittest.TestCase):
     def test_unseen_universe_is_absent(self):
         self.assertNotIn(7, ExternalInputBus().rates())
 
+
+class TrackerBankDetailTests(unittest.TestCase):
+    def test_detail_combines_position_derived_speed_extras_name_and_age(self):
+        bank = TrackerBank()
+        bank.update(4, 1.0, 2.0, 3.0)
+        bank.update_extras(4, speed=(1.0, 0.0, 0.0), status=1.0)
+        bank.set_name(4, "Lead")
+        detail = bank.snapshot_detail()[4]
+        self.assertEqual(detail["position"], (1.0, 2.0, 3.0))
+        self.assertEqual(detail["speed"], (1.0, 0.0, 0.0))
+        self.assertEqual(detail["status"], 1.0)
+        self.assertEqual(detail["name"], "Lead")
+        self.assertLess(detail["age"], 1.0)
+
+    def test_derived_velocity_comes_from_consecutive_positions(self):
+        bank = TrackerBank()
+        bank.xyz[1] = (0.0, 0.0, 0.0, 100.0)
+        bank.update(1, 1.0, 0.0, 0.0)
+        self.assertIsNotNone(bank.snapshot_detail()[1]["derived_velocity"])
+
+    def test_rate_over_a_window(self):
+        import collections
+        import time
+        bank = TrackerBank()
+        now = time.monotonic()
+        bank.arrivals[2] = collections.deque([now - 4.0, now - 3.0, now - 2.0, now - 1.0, now])
+        self.assertAlmostEqual(bank.snapshot_detail()[2]["rate"], 1.0, delta=0.01)
+
+    def test_clear_forgets_everything(self):
+        bank = TrackerBank()
+        bank.update(1, 0, 0, 0)
+        bank.update_extras(1, speed=(0, 0, 0))
+        bank.set_name(1, "x")
+        bank.clear()
+        self.assertEqual(bank.snapshot_detail(), {})
+        self.assertEqual(bank.get(1), (0.0, 0.0, 0.0, 0.0))
+
+    def test_existing_snapshot_is_unchanged(self):
+        bank = TrackerBank()
+        bank.update(1, 1.0, 2.0, 3.0)
+        bank.update_extras(1, speed=(1, 1, 1))
+        self.assertEqual(list(bank.snapshot()), [1])
+        self.assertEqual(len(bank.snapshot()[1]), 4)
+

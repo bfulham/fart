@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
             self.operator_tab.append_log(message)
             drained = True
         self.operator_tab.refresh_status(self.runner.live)
+        self.psn_in_tab.refresh()
         self.dmx_in_tab.refresh()
         self.dmx_out_tab.refresh()
         if drained and not self.runner.running and self._pending_crash():

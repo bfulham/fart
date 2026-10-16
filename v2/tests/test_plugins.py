@@ -90,6 +90,97 @@ class SACNWireTests(unittest.TestCase):
         self.assertIsNone(parse_sacn_dmx(junk))
 
 
+def _psn_chunk(chunk_id, payload, sub=False):
+    raw = (chunk_id & 0xFFFF) | ((len(payload) & 0x7FFF) << 16) | (0x80000000 if sub else 0)
+    return struct.pack("<I", raw) + payload
+
+
+def _psn_data_packet(trackers):
+    """trackers: {id: [(field_id, payload_bytes), ...]} -> a PSN data packet."""
+    tracker_chunks = b"".join(
+        _psn_chunk(tid, b"".join(_psn_chunk(fid, payload, sub=True) for fid, payload in fields), sub=True)
+        for tid, fields in trackers.items()
+    )
+    return _psn_chunk(0x6755, _psn_chunk(0x0001, tracker_chunks, sub=True), sub=True)
+
+
+def _psn_info_packet(system_name, names):
+    tracker_chunks = b"".join(
+        _psn_chunk(tid, _psn_chunk(0x0000, name.encode() + b"\x00", sub=True), sub=True)
+        for tid, name in names.items()
+    )
+    return _psn_chunk(0x6756, _psn_chunk(0x0001, system_name.encode(), sub=True)
+                      + _psn_chunk(0x0002, tracker_chunks, sub=True), sub=True)
+
+
+class PSNExtraFieldsTests(unittest.TestCase):
+    """Everything a PSN sender includes is recorded for the PSN In tab, not
+    just the position FART tracks with."""
+
+    def setUp(self):
+        self.bank = TrackerBank()
+        self.plugin = PSNInPlugin()
+        self.plugin._positions = self.bank
+
+    def test_speed_orientation_accel_target_status_and_timestamp_are_all_decoded(self):
+        f3 = lambda *v: struct.pack("<fff", *v)  # noqa: E731
+        self.plugin._decode(_psn_data_packet({7: [
+            (0x0000, f3(1.0, 2.0, 3.0)),
+            (0x0001, f3(0.5, 0.0, 0.0)),
+            (0x0002, f3(10.0, 20.0, 30.0)),
+            (0x0003, struct.pack("<f", 0.75)),
+            (0x0004, f3(0.0, 0.1, 0.0)),
+            (0x0005, f3(9.0, 8.0, 7.0)),
+            (0x0006, struct.pack("<Q", 123456789)),
+        ]}))
+        detail = self.bank.snapshot_detail()[7]
+        self.assertEqual(detail["position"], (1.0, 2.0, 3.0))
+        self.assertEqual(detail["speed"], (0.5, 0.0, 0.0))
+        self.assertEqual(detail["orientation"], (10.0, 20.0, 30.0))
+        self.assertAlmostEqual(detail["status"], 0.75)
+        self.assertEqual(detail["accel"][1], struct.unpack("<f", struct.pack("<f", 0.1))[0])
+        self.assertEqual(detail["target"], (9.0, 8.0, 7.0))
+        self.assertEqual(detail["psn_time"], 123456789)
+
+    def test_position_is_still_decoded_when_it_is_not_the_last_field(self):
+        # The old decoder stopped at the position chunk and dropped the rest;
+        # fields *after* it, or position *after* other fields, must both work.
+        self.plugin._decode(_psn_data_packet({3: [
+            (0x0001, struct.pack("<fff", 1.0, 1.0, 1.0)),
+            (0x0000, struct.pack("<fff", 4.0, 5.0, 6.0)),
+        ]}))
+        self.assertEqual(self.bank.get(3)[:3], (4.0, 5.0, 6.0))
+        self.assertEqual(self.bank.snapshot_detail()[3]["speed"], (1.0, 1.0, 1.0))
+
+    def test_a_marker_with_no_position_chunk_still_shows_up(self):
+        self.plugin._decode(_psn_data_packet({9: [(0x0003, struct.pack("<f", 1.0))]}))
+        detail = self.bank.snapshot_detail()
+        self.assertIn(9, detail)
+        self.assertIsNone(detail[9]["position"])
+
+    def test_short_or_unknown_fields_are_skipped_not_fatal(self):
+        self.plugin._decode(_psn_data_packet({5: [
+            (0x0001, b"\x00\x00"),                    # speed chunk too short
+            (0x0042, struct.pack("<fff", 1, 2, 3)),    # unknown field id
+            (0x0000, struct.pack("<fff", 1, 2, 3)),
+        ]}))
+        detail = self.bank.snapshot_detail()[5]
+        self.assertNotIn("speed", detail)
+        self.assertEqual(detail["position"], (1.0, 2.0, 3.0))
+
+    def test_info_packet_supplies_system_and_tracker_names(self):
+        self.plugin._decode(_psn_info_packet("Stage Tracker", {7: "Lead", 8: "Backup"}))
+        self.assertEqual(self.bank.system_name, "Stage Tracker")
+        detail = self.bank.snapshot_detail()
+        self.assertEqual(detail[7]["name"], "Lead")
+        self.assertEqual(detail[8]["name"], "Backup")
+
+    def test_every_data_packet_counts_toward_the_trackers_receive_rate(self):
+        for _ in range(3):
+            self.plugin._decode(_psn_data_packet({1: [(0x0000, struct.pack("<fff", 0, 0, 0))]}))
+        self.assertEqual(len(self.bank.arrivals[1]), 3)
+
+
 class SACNPacketParsingTests(unittest.TestCase):
     def test_parse_packet_exposes_source_priority_and_sequence(self):
         cid = bytes(range(16))
